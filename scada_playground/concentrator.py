@@ -54,8 +54,14 @@ class CopperConcentrator:
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
             "concentrate_grade_pct": 25.0, "p80_microns": 150.0,
             "ore_hardness_kwh_t": 17.0, "ore_hardness_factor": 1.0,
-            "water_makeup_m3h": 260.0, "water_specific_m3_t": 0.30,
-            "water_available_fraction": 1.0, "water_recovery_pct": 74.0,
+            "water_makeup_m3h": 452.0, "gross_process_water_m3h": 783.0,
+            "concentrator_reclaim_m3h": 331.0, "tailings_reclaim_water_m3h": 326.0,
+            "concentrate_thickener_overflow_m3h": 5.0, "filter_press_filtrate_m3h": 0.0,
+            "filter_press_batch_filtrate_inventory_m3": 0.0,
+            "tailings_water_feed_m3h": 765.0, "tailings_underflow_solids_pct": 68.0,
+            "concentrate_water_feed_m3h": 18.0, "water_specific_m3_t": 0.90,
+            "water_model_revision": 2,
+            "water_available_fraction": 1.0, "water_recovery_pct": 42.0,
             "fresh_water_shortage_m3h": 0.0,
             "sag_power_mw": 15.0, "ball_power_mw": 8.7, "crusher_power_mw": 2.2,
             "flotation_air_nm3_min": 540.0, "reagent_l_h": 245.0,
@@ -91,12 +97,47 @@ class CopperConcentrator:
                     "concentrate_thickener_motor_running", "filter_press_motor_running",
                     "filter_press_feed_tph", "filter_press_cake_tph",
                     "concentrate_shipped_tph", "tailings_thickener_feed_tph",
-                    "concentrate_condition")
-        if all(key in state for key in keys):
+                    "concentrate_condition", "gross_process_water_m3h",
+                    "concentrator_reclaim_m3h", "tailings_reclaim_water_m3h",
+                    "filter_press_filtrate_m3h", "filter_press_batch_filtrate_inventory_m3",
+                    "concentrate_thickener_overflow_m3h", "tailings_water_feed_m3h",
+                    "tailings_underflow_solids_pct", "concentrate_water_feed_m3h",
+                    "water_model_revision")
+        if all(key in state for key in keys) and state.get("water_model_revision", 0) >= 2:
             return
+        previous_water_revision = state.get("water_model_revision", 0)
         defaults = self.initialize()
         for key in keys:
             state.setdefault(key, defaults[key])
+        if previous_water_revision < 2:
+            feed_tph = max(0.0, state.get("plant_feed_tph", 0.0))
+            concentrate_tph = max(0.0, state.get("concentrate_tph", 0.0))
+            tailings_tph = max(0.0, feed_tph - concentrate_tph)
+            gross = feed_tph * 0.90
+            tailings_fraction = tailings_tph / feed_tph if feed_tph > 1e-9 else 0.0
+            tails_water_feed = gross * tailings_fraction
+            concentrate_water_feed = gross - tails_water_feed
+            underflow_solids = 68.0
+            tails_underflow_water = tailings_tph * (100.0 - underflow_solids) / underflow_solids
+            tails_return = max(0.0, tails_water_feed - tails_underflow_water) * 0.92
+            concentrate_underflow_water = concentrate_tph * (1.0 / 0.60 - 1.0)
+            concentrate_overflow = max(0.0, concentrate_water_feed - concentrate_underflow_water) * 0.92
+            if state.get("tailings_thickener_motor_running", 1.0) < 0.5:
+                tails_return = 0.0
+            if state.get("concentrate_thickener_motor_running", 1.0) < 0.5:
+                concentrate_overflow = 0.0
+            recovered = min(gross, tails_return + concentrate_overflow)
+            state.update(water_specific_m3_t=0.90, gross_process_water_m3h=gross,
+                         tailings_water_feed_m3h=tails_water_feed,
+                         tailings_underflow_solids_pct=underflow_solids,
+                         concentrate_water_feed_m3h=concentrate_water_feed,
+                         tailings_reclaim_water_m3h=tails_return,
+                         concentrate_thickener_overflow_m3h=concentrate_overflow,
+                         filter_press_filtrate_m3h=0.0,
+                         concentrator_reclaim_m3h=recovered,
+                         water_makeup_m3h=max(0.0, gross - recovered),
+                         water_recovery_pct=(100.0 * recovered / gross if gross > 1e-9 else 0.0),
+                         water_model_revision=2)
 
     @staticmethod
     def _severity(events: list[dict], name: str, areas: tuple[str, ...]) -> float:
@@ -126,6 +167,9 @@ class CopperConcentrator:
         upset = self._severity(events, "Process upset", ("Grinding and flotation", "Whole factory"))
         utility = self._severity(events, "Utility loss", ("Mine power network", "Grinding and flotation"))
         measurement = self._severity(events, "Signal drift", ("Grinding and flotation",))
+        # Fresh ore carries a gross process-water ratio; thickening and pressing
+        # determine what returns. Water shortage constrains throughput separately.
+        state["water_specific_m3_t"] = 0.90
 
         # Ore competency changes slowly: harder ore requires more energy per tonne.
         state["ore_hardness_factor"] = min(1.42, max(0.78,
@@ -250,6 +294,7 @@ class CopperConcentrator:
         # adds cake, squeezing pauses feed, and cake discharge is a short pulse.
         state["filter_press_feed_tph"] = 0.0
         state["filter_press_cake_tph"] = 0.0
+        state["filter_press_filtrate_m3h"] = 0.0
         press_ready = (equipment_available.get("filter_press", True)
                        and equipment_available.get("concentrate_thickener", True))
         if press_ready:
@@ -267,6 +312,11 @@ class CopperConcentrator:
                     state["filter_press_phase"] = "SQUEEZING"
                     state["filter_press_cycle_s"] = 0
             elif state["filter_press_phase"] == "SQUEEZING":
+                squeeze_seconds_remaining = max(1, 90 - state["filter_press_cycle_s"])
+                filtrate_flow = state["filter_press_batch_filtrate_inventory_m3"] * 3_600.0 / squeeze_seconds_remaining
+                state["filter_press_filtrate_m3h"] = filtrate_flow
+                state["filter_press_batch_filtrate_inventory_m3"] = max(
+                    0.0, state["filter_press_batch_filtrate_inventory_m3"] - filtrate_flow * dt_h)
                 state["filter_press_cycle_s"] += 1
                 if state["filter_press_cycle_s"] >= 90:
                     state["filter_press_phase"] = "DISCHARGING"
@@ -286,6 +336,12 @@ class CopperConcentrator:
                     state["filter_press_cycle_count"] += 1
 
         press_feed = state["filter_press_feed_tph"]
+        # Filter-cake moisture is 15% by mass. Water above that retained amount
+        # accumulates with the batch and leaves only during the squeeze phase.
+        press_feed_water_m3h = press_feed * (1.0 / 0.60 - 1.0)
+        cake_retained_water_m3h = press_feed * (1.0 / 0.85 - 1.0)
+        state["filter_press_batch_filtrate_inventory_m3"] += max(
+            0.0, press_feed_water_m3h - cake_retained_water_m3h) * dt_h
         state["concentrate_thickener_inventory_t"] = min(concentrate_capacity_t, max(0.0,
             state["concentrate_thickener_inventory_t"] + (concentrate - press_feed) * dt_h))
         concentrate_shipped = min(26.0,
@@ -326,11 +382,37 @@ class CopperConcentrator:
         state["sag_power_mw"] = self._smooth(state["sag_power_mw"], sag_power, 15)
         state["ball_power_mw"] = self._smooth(state["ball_power_mw"], ball_power, 15)
         state["crusher_power_mw"] = self._smooth(state["crusher_power_mw"], 2.2 * (crushed_rate / 1_200), 10)
-        state["water_specific_m3_t"] = 0.30 + 0.05 * max(0.0, 1.0 - state["water_recovery_pct"] / 80.0)
-        state["water_makeup_m3h"] = cyclone_overflow * state["water_specific_m3_t"]
+        gross_process_water = cyclone_overflow * state["water_specific_m3_t"]
+        total_solids = tailings + concentrate
+        tails_fraction = tailings / total_solids if total_solids > 1e-9 else 0.0
+        tailings_water_feed = gross_process_water * tails_fraction
+        concentrate_water_feed = gross_process_water - tailings_water_feed
+        tailings_underflow_solids = min(70.0, max(55.0, 68.0 - upset * 10.0))
+        tails_underflow_water = tailings * (100.0 - tailings_underflow_solids) / tailings_underflow_solids
+        tailings_overflow_water = max(0.0, tailings_water_feed - tails_underflow_water)
+        tailings_return = (tailings_overflow_water * max(0.0, 0.92 - upset * 0.24)
+                           if equipment_available.get("tailings_thickener", True) else 0.0)
+        concentrate_underflow_water = concentrate * (1.0 / 0.60 - 1.0)
+        concentrate_overflow = max(0.0, concentrate_water_feed - concentrate_underflow_water)
+        concentrate_thickener_return = (concentrate_overflow * 0.92
+                                        if equipment_available.get("concentrate_thickener", True) else 0.0)
+        filtrate_return = (state["filter_press_filtrate_m3h"]
+                           if equipment_available.get("filter_press", True) else 0.0)
+        recovered_water = min(gross_process_water,
+                              tailings_return + concentrate_thickener_return + filtrate_return)
+        state["gross_process_water_m3h"] = gross_process_water
+        state["tailings_reclaim_water_m3h"] = tailings_return
+        state["tailings_water_feed_m3h"] = tailings_water_feed
+        state["tailings_underflow_solids_pct"] = tailings_underflow_solids
+        state["concentrate_water_feed_m3h"] = concentrate_water_feed
+        state["concentrate_thickener_overflow_m3h"] = concentrate_thickener_return
+        state["filter_press_filtrate_m3h"] = filtrate_return
+        state["concentrator_reclaim_m3h"] = recovered_water
+        state["water_makeup_m3h"] = max(0.0, gross_process_water - recovered_water)
         state["fresh_water_shortage_m3h"] = max(0.0, water_shortage_m3h)
         state["water_available_fraction"] = water_factor
-        state["water_recovery_pct"] = min(82.0, max(58.0, 74.0 - upset * 12.0 - water_shortage_m3h / 100.0))
+        state["water_recovery_pct"] = (100.0 * recovered_water / gross_process_water
+                                       if gross_process_water > 1e-9 else 0.0)
         state["flotation_air_nm3_min"] = flotation_air
         state["reagent_l_h"] = reagent
 
@@ -365,6 +447,7 @@ class CopperConcentrator:
                 "concentrate_thickener_inventory_t": state["concentrate_thickener_inventory_t"],
                 "concentrate_cake_inventory_t": state["concentrate_cake_inventory_t"],
                 "water_makeup_m3h": state["water_makeup_m3h"],
+                "concentrator_reclaim_m3h": state["concentrator_reclaim_m3h"],
                 "power_mw": state["sag_power_mw"] + state["ball_power_mw"] + state["crusher_power_mw"]})
             state["history"] = state["history"][-1_440:]
 
@@ -465,12 +548,28 @@ class CopperConcentrator:
                         "value": round(min(high, max(low, value)), 3), "quality": "GOOD", "low": low,
                         "high": high, "base": (low + high) / 2, "phase": 0.0,
                         "last_change": "Dynamic concentrator process model"})
-        rows.extend([
-            {"tag": "water_supply_network.concentrator_process.water_demand", "area": "Water supply network",
-             "unit": "Concentrator process", "sensor": "water_demand", "units": "m³/h",
-             "value": round(state["water_makeup_m3h"], 2), "quality": "GOOD", "low": 0, "high": 700,
-             "base": 350, "phase": 0.0, "last_change": "Concentrator make-up water requirement"},
-        ])
+        for sensor, value, units, limit, description in (
+                ("water_demand", state["gross_process_water_m3h"], "m³/h", 1_200,
+                 "Concentrator gross process-water draw"),
+                ("water_makeup", state["water_makeup_m3h"], "m³/h", 1_200,
+                 "Fresh make-up after process-water recovery"),
+                ("water_reclaim_return", state["concentrator_reclaim_m3h"], "m³/h", 1_200,
+                 "Recovered water returned to the process tank"),
+                ("tailings_reclaim_return", state["tailings_reclaim_water_m3h"], "m³/h", 1_200,
+                 "Thickener overflow after underflow water retention"),
+                ("concentrate_thickener_overflow", state["concentrate_thickener_overflow_m3h"], "m³/h", 100,
+                 "Concentrate thickener overflow to reclaim"),
+                ("filter_press_filtrate", state["filter_press_filtrate_m3h"], "m³/h", 100,
+                 "Batch filtrate released during the squeeze phase"),
+                ("tailings_underflow_solids", state["tailings_underflow_solids_pct"], "%", 100,
+                 "Tailings thickener underflow solids target"),
+                ("water_recovery", state["water_recovery_pct"], "%", 100,
+                 "Measured process-water recovery")):
+            rows.append({"tag": f"water_supply_network.concentrator_process.{sensor}",
+                         "area": "Water supply network", "unit": "Concentrator process",
+                         "sensor": sensor, "units": units, "value": round(value, 2),
+                         "quality": "GOOD", "low": 0, "high": limit, "base": limit / 2,
+                         "phase": 0.0, "last_change": description})
         return rows
 
 

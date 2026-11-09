@@ -11,7 +11,7 @@ from collections import deque
 
 
 class MineWaterNetwork:
-    """Five storage nodes and four delayed links, advanced at one-second steps."""
+    """Mine-water storage and delayed links, advanced at one-second steps."""
 
     AREA = "Water supply network"
     NODES = {
@@ -25,17 +25,23 @@ class MineWaterNetwork:
                          "area_m2": 800.0, "elevation_m": 92.0, "initial_m3": 3_800.0},
         "treated_tank": {"label": "Treated water tank", "capacity_m3": 1_000.0,
                          "area_m2": 100.0, "elevation_m": 145.0, "initial_m3": 680.0},
+        "concentrator_reclaim_sump": {"label": "Concentrator reclaim sump", "capacity_m3": 300.0,
+                                      "area_m2": 30.0, "elevation_m": 118.0, "initial_m3": 0.0},
     }
     PUMPS = {
         "Intake pump": {"shutoff_head_m": 175.0, "rated_flow_m3h": 760.0,
                         "motor_efficiency": 0.91, "hydraulic_efficiency": 0.76,
                         "ramp_pct_per_s": 0.35, "controlled_node": "raw_tank", "setpoint_pct": 55.0},
-        "Process feed pump": {"shutoff_head_m": 120.0, "rated_flow_m3h": 560.0,
+        "Process feed pump": {"shutoff_head_m": 120.0, "rated_flow_m3h": 760.0,
                               "motor_efficiency": 0.92, "hydraulic_efficiency": 0.78,
                               "ramp_pct_per_s": 0.50, "controlled_node": "process_tank", "setpoint_pct": 60.0},
         "Reclaim pump": {"shutoff_head_m": 190.0, "rated_flow_m3h": 440.0,
                          "motor_efficiency": 0.90, "hydraulic_efficiency": 0.73,
                          "ramp_pct_per_s": 0.30, "controlled_node": "treated_tank", "setpoint_pct": 68.0},
+        "Concentrator reclaim pump": {"shutoff_head_m": 95.0, "rated_flow_m3h": 360.0,
+                                      "motor_efficiency": 0.91, "hydraulic_efficiency": 0.74,
+                                      "ramp_pct_per_s": 0.45, "controlled_node": "concentrator_reclaim_sump",
+                                      "setpoint_pct": 45.0},
     }
     LINKS = {
         "raw_transfer": {"label": "Reservoir → raw tank", "from": "north_reservoir", "to": "raw_tank",
@@ -44,7 +50,7 @@ class MineWaterNetwork:
                          "pump": "Intake pump", "valve": "Raw transfer valve"},
         "process_feed": {"label": "Raw tank → process", "from": "raw_tank", "to": "process_tank",
                          "length_m": 480.0, "diameter_m": 0.40, "roughness_m": 0.00015,
-                         "minor_loss_k": 16.0, "valve_loss_k": 1.8, "max_flow_m3h": 540.0,
+                         "minor_loss_k": 16.0, "valve_loss_k": 1.8, "max_flow_m3h": 720.0,
                          "pump": "Process feed pump", "valve": "Process feed valve"},
         "reclaim_return": {"label": "Process → reclaim", "from": "process_tank", "to": "reclaim_pond",
                             "length_m": 360.0, "diameter_m": 0.30, "roughness_m": 0.00015,
@@ -54,6 +60,11 @@ class MineWaterNetwork:
                              "length_m": 520.0, "diameter_m": 0.35, "roughness_m": 0.00015,
                              "minor_loss_k": 14.0, "valve_loss_k": 1.8, "max_flow_m3h": 420.0,
                              "pump": "Reclaim pump", "valve": "Reclaim transfer valve"},
+        "concentrator_reclaim": {"label": "Concentrator reclaim → process tank",
+                                 "from": "concentrator_reclaim_sump", "to": "process_tank",
+                                 "length_m": 380.0, "diameter_m": 0.35, "roughness_m": 0.00015,
+                                 "minor_loss_k": 18.0, "valve_loss_k": 1.8, "max_flow_m3h": 340.0,
+                                 "pump": "Concentrator reclaim pump", "valve": "Concentrator reclaim valve"},
     }
 
     def initialize(self) -> dict:
@@ -73,7 +84,8 @@ class MineWaterNetwork:
                            "power_kw": 0.0, "pump_head_m": 0.0, "vibration_mm_s": 1.2}
             gains = {"Intake pump": (1.0, 0.0003),
                      "Process feed pump": (1.2, 0.0010),
-                     "Reclaim pump": (1.2, 0.0010)}
+                     "Reclaim pump": (1.2, 0.0010),
+                     "Concentrator reclaim pump": (1.2, 0.0010)}
             kp, ki = gains[name]
             controllers[name] = {"mode": "AUTO", "setpoint_pct": spec["setpoint_pct"],
                                  "bias_pct": initial_speed, "kp": kp, "ki": ki,
@@ -81,22 +93,29 @@ class MineWaterNetwork:
         state = {"nodes": nodes,
                 "pumps": pumps, "controllers": controllers,
                 "valves": {name: 92.0 for name in ("Raw transfer valve", "Process feed valve",
-                                                      "Reclaim return valve", "Reclaim transfer valve")},
+                                                      "Reclaim return valve", "Reclaim transfer valve",
+                                                      "Concentrator reclaim valve")},
                 "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True}
                           for key in self.LINKS},
                 "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
+                "concentrator_reclaim_m3h": 0.0,
                 "treated_demand_m3h": 96.0,
                 "unmet_demand_m3h": 0.0, "unmet_treated_demand_m3h": 0.0,
-                "water_recovery_pct": 68.0,
+                "water_recovery_pct": 68.0, "concentrator_recovery_pct": 0.0,
                 "history": [], "total_spilled_m3": 0.0, "cumulative_source_withdrawal_m3": 0.0,
                 "cumulative_process_consumption_m3": 0.0, "cumulative_treated_delivery_m3": 0.0,
+                "cumulative_concentrator_return_m3": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {}}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
             if key == "reclaim_return":
                 flow = min(flow, state["demand_m3h"] * state["water_recovery_pct"] / 100.0)
+            if key == "concentrator_reclaim":
+                flow = 0.0
             pipe_volume = math.pi * spec["diameter_m"]**2 / 4 * spec["length_m"]
-            delay = max(1, math.ceil(pipe_volume / max(flow / 3600.0, 1e-6)))
+            design_flow = (self.PUMPS[spec["pump"]]["rated_flow_m3h"] * 0.6
+                           if key == "concentrator_reclaim" else flow)
+            delay = max(1, math.ceil(pipe_volume / max(design_flow / 3600.0, 1e-6)))
             delay = min(delay, 21_600)
             state["links"][key].update(flow_m3h=flow, inlet_flow_m3h=flow, outlet_flow_m3h=flow,
                                         pressure_kpa=pressure, available=flow > 0.1,
@@ -110,6 +129,22 @@ class MineWaterNetwork:
             pump["power_kw"] = electrical_kw
             pump["current_a"] = electrical_kw * 1000.0 / (math.sqrt(3) * 690.0 * 0.86)
         return state
+
+    def migrate(self, state: dict) -> None:
+        """Add the concentrator reclaim circuit to sessions created by older builds."""
+        defaults = self.initialize()
+        for key in ("nodes", "pumps", "controllers", "valves", "links"):
+            state.setdefault(key, {})
+            for item, value in defaults[key].items():
+                state[key].setdefault(item, value)
+        for key, value in defaults.items():
+            if key not in {"nodes", "pumps", "controllers", "valves", "links"}:
+                state.setdefault(key, value)
+        for sample in state["history"]:
+            sample.setdefault("concentrator_reclaim_sump_level_pct", 0.0)
+            sample.setdefault("concentrator_gross_demand_m3h", 0.0)
+            sample.setdefault("concentrator_reclaim_m3h", 0.0)
+            sample.setdefault("concentrator_makeup_m3h", 0.0)
 
     @staticmethod
     def _level(node: dict) -> float:
@@ -188,14 +223,19 @@ class MineWaterNetwork:
         return flow_m3h, pressure_drop_kpa
 
     def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17,
-                concentrator_demand_m3h: float = 0.0,
+                concentrator_demand_m3h: float = 0.0, concentrator_reclaim_m3h: float = 0.0,
                 power_available_fraction: float | None = None) -> None:
         """Advance one second with PI level controls, hydraulic links and delayed transport."""
+        self.migrate(state)
         state["sim_seconds"] = sim_seconds
         state["sensor_rng_seed"] = seed
         stress = max(({"Small": 1.2, "Medium": 1.6, "Large": 2.1}[e["severity"]]
                       for e in active_events if e["name"] == "Process upset"), default=1.0)
         state["concentrator_demand_m3h"] = max(0.0, concentrator_demand_m3h)
+        state["concentrator_reclaim_m3h"] = max(0.0, concentrator_reclaim_m3h)
+        state["concentrator_recovery_pct"] = (100.0 * state["concentrator_reclaim_m3h"] /
+                                                state["concentrator_demand_m3h"]
+                                                if state["concentrator_demand_m3h"] > 1e-9 else 0.0)
         state["base_demand_m3h"] = 240.0 * stress * (1 + 0.08 * math.sin(sim_seconds / 95.0))
         state["demand_m3h"] = state["base_demand_m3h"] + state["concentrator_demand_m3h"]
         state["treated_demand_m3h"] = 96.0 * (1 + 0.12 * math.sin(sim_seconds / 137.0 + 1.2))
@@ -254,6 +294,10 @@ class MineWaterNetwork:
         transfer("raw_transfer", volumes["north_reservoir"])
         raw_available = volumes["raw_tank"] + outlet["raw_transfer"] / 3600.0
         transfer("process_feed", raw_available)
+        reclaim_sump_available = volumes["concentrator_reclaim_sump"] + state["concentrator_reclaim_m3h"] / 3600.0
+        requested["concentrator_reclaim"] = min(requested["concentrator_reclaim"],
+                                                 reclaim_sump_available * 3600.0)
+        transfer("concentrator_reclaim", reclaim_sump_available)
         process_available_m3 = volumes["process_tank"] + outlet["process_feed"] / 3600.0
         served = min(state["demand_m3h"], process_available_m3 * 3600.0)
         state["unmet_demand_m3h"] = state["demand_m3h"] - served
@@ -271,6 +315,7 @@ class MineWaterNetwork:
         state["unmet_treated_demand_m3h"] = state["treated_demand_m3h"] - treated_served
 
         net_m3h = {key: 0.0 for key in self.NODES}
+        net_m3h["concentrator_reclaim_sump"] += state["concentrator_reclaim_m3h"]
         for link_key, link in self.LINKS.items():
             net_m3h[link["from"]] -= inlet[link_key]
             net_m3h[link["to"]] += outlet[link_key]
@@ -302,6 +347,7 @@ class MineWaterNetwork:
         state["cumulative_source_withdrawal_m3"] += inlet["raw_transfer"] / 3600.0
         state["cumulative_process_consumption_m3"] += process_consumption / 3600.0
         state["cumulative_treated_delivery_m3"] += treated_served / 3600.0
+        state["cumulative_concentrator_return_m3"] += state["concentrator_reclaim_m3h"] / 3600.0
 
         # Derive shaft load and current from the operating point, then add a small
         # repeatable transmitter noise when tags are published.
@@ -320,10 +366,16 @@ class MineWaterNetwork:
                                      "process_tank_level_pct": state["nodes"]["process_tank"]["level_pct"],
                                      "reclaim_pond_level_pct": state["nodes"]["reclaim_pond"]["level_pct"],
                                      "treated_tank_level_pct": state["nodes"]["treated_tank"]["level_pct"],
+                                     "concentrator_reclaim_sump_level_pct": state["nodes"]["concentrator_reclaim_sump"]["level_pct"],
                                      "intake_flow_m3h": inlet["raw_transfer"],
                                      "intake_arrival_m3h": outlet["raw_transfer"],
                                      "process_feed_m3h": outlet["process_feed"],
                                      "process_demand_m3h": state["demand_m3h"],
+                                     "concentrator_gross_demand_m3h": state["concentrator_demand_m3h"],
+                                     "concentrator_reclaim_m3h": state["concentrator_reclaim_m3h"],
+                                     "concentrator_makeup_m3h": max(
+                                         0.0, state["concentrator_demand_m3h"]
+                                         - state["concentrator_reclaim_m3h"]),
                                      "treated_demand_m3h": state["treated_demand_m3h"],
                                      "intake_pump_speed_pct": state["pumps"]["Intake pump"]["speed_pct"],
                                      "process_pump_speed_pct": state["pumps"]["Process feed pump"]["speed_pct"]})
@@ -380,6 +432,8 @@ class MineWaterNetwork:
         add("process_demand", "water_demand", state["demand_m3h"], "m³/h", 0, 1_200, 0.005)
         add("process_demand", "unmet_demand", state["unmet_demand_m3h"], "m³/h", 0, 600, 0.005)
         add("process_demand", "water_recovery", state["water_recovery_pct"], "%", 0, 100, 0.002)
+        add("process_demand", "concentrator_recovery", state["concentrator_recovery_pct"], "%", 0, 100, 0.002)
+        add("process_demand", "concentrator_return", state["concentrator_reclaim_m3h"], "m³/h", 0, 700, 0.005)
         add("process_demand", "treated_water_demand", state["treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         add("process_demand", "unmet_treated_water_demand", state["unmet_treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         nodes = [{"id": key, "label": spec["label"], "level_pct": state["nodes"][key]["level_pct"],
@@ -407,6 +461,7 @@ class MineWaterNetwork:
                        "treated_demand_m3h": state["treated_demand_m3h"],
                        "electrical_load_kw": sum(pump["power_kw"] for pump in state["pumps"].values()),
                        "unmet_treated_demand_m3h": state["unmet_treated_demand_m3h"],
+                       "concentrator_recovery_pct": state["concentrator_recovery_pct"],
                        "pipe_inventory_m3": self.pipe_inventory_m3(state),
                        "total_inventory_m3": self.total_inventory_m3(state),
                        "total_spilled_m3": state["total_spilled_m3"]}]

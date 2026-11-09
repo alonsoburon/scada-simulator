@@ -228,6 +228,11 @@ def initialize(seed: int = 17) -> None:
             tag["dynamic_model"] = True
         tags.extend(modeled_tags)
         water_state = WATER_MODEL.initialize()
+        water_state["concentrator_demand_m3h"] = concentrator_state["gross_process_water_m3h"]
+        water_state["concentrator_reclaim_m3h"] = concentrator_state["concentrator_reclaim_m3h"]
+        water_state["concentrator_recovery_pct"] = concentrator_state["water_recovery_pct"]
+        water_state["demand_m3h"] = (water_state["base_demand_m3h"]
+                                     + water_state["concentrator_demand_m3h"])
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
@@ -282,6 +287,18 @@ def initialize(seed: int = 17) -> None:
             sim["water_network"] = WATER_MODEL.initialize()
             water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
             sim["tags"].extend(water_tags)
+        WATER_MODEL.migrate(sim["water_network"])
+        sim["water_network"]["concentrator_demand_m3h"] = sim["concentrator"]["gross_process_water_m3h"]
+        sim["water_network"]["concentrator_reclaim_m3h"] = sim["concentrator"]["concentrator_reclaim_m3h"]
+        sim["water_network"]["concentrator_recovery_pct"] = sim["concentrator"]["water_recovery_pct"]
+        sim["water_network"]["demand_m3h"] = (sim["water_network"]["base_demand_m3h"]
+                                                + sim["water_network"]["concentrator_demand_m3h"])
+        sim["tags"] = [tag for tag in sim["tags"]
+                       if not tag["tag"].startswith("water_supply_network.")]
+        water_tags, _water_diagram = WATER_MODEL.telemetry(sim["water_network"])
+        for tag in water_tags:
+            tag["dynamic_model"] = True
+            sim["tags"].append(tag)
         if "power_network" not in sim:
             sim["power_network"] = POWER_MODEL.initialize()
             process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
@@ -512,14 +529,15 @@ def advance(force: bool = False) -> None:
     mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
                                              sim["concentrator"]["rom_stockpile_t"])
     prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
-    concentrator_share = sim["concentrator"]["water_makeup_m3h"] / max(sim["water_network"].get("demand_m3h", 1), 1)
+    concentrator_share = sim["concentrator"].get("gross_process_water_m3h", 0.0) / max(sim["water_network"].get("demand_m3h", 1), 1)
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
                                water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
                                seed=sim["seed"], mine_delivery_t=mine_delivery_t,
                                power_available_fraction=sim["power_network"]["process_power_fraction"],
                                equipment_available=equipment_available)
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
-                        concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"],
+                        concentrator_demand_m3h=sim["concentrator"]["gross_process_water_m3h"],
+                        concentrator_reclaim_m3h=sim["concentrator"]["concentrator_reclaim_m3h"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
     water = sim["water_network"]
     conditions = {
@@ -658,7 +676,7 @@ initialize()
 sim = st.session_state.sim
 publish_snapshot()
 st.title("🏭 Factory SCADA Playground")
-st.caption(f"Synthetic multi-industry training world · {len(AREAS)} systems · {len({(t['area'], t['unit']) for t in sim['tags']})} equipment units · {len(sim['tags'])} tags · local simulation only")
+st.caption(f"Synthetic multi-industry training world · {len(AREAS)} areas · {len({(t['area'], t['unit']) for t in sim['tags']})} equipment units · {len(sim['tags'])} tags · local simulation only")
 
 with st.sidebar:
     st.header("Factory controls")
@@ -770,15 +788,19 @@ def render_dashboard():
         diagram = published_snapshot["water_network"]
         st.markdown("### Mine water circuit · hydraulic network and level control")
         st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow packets, so a pump trip can leave downstream flow running until the line empties.")
-        metric_cols = st.columns(5)
-        for col, label, value in zip(metric_cols, ["Process demand", "Treated demand", "Water recovery", "Water in transit", "Unmet demand"],
-                                     [f"{water['demand_m3h']:.0f} m³/h", f"{water['treated_demand_m3h']:.0f} m³/h",
+        metric_cols = st.columns(6)
+        for col, label, value in zip(metric_cols, ["Total water demand", "Concentrator make-up", "Concentrator return",
+                                                   "Background reclaim loop", "Water in transit", "Unmet demand"],
+                                     [f"{water['base_demand_m3h'] + sim['concentrator']['gross_process_water_m3h']:.0f} m³/h",
+                                      f"{sim['concentrator']['water_makeup_m3h']:.0f} m³/h",
+                                      f"{sim['concentrator']['concentrator_reclaim_m3h']:.0f} m³/h",
                                       f"{water['water_recovery_pct']:.0f}%", f"{diagram['pipe_inventory_m3']:.0f} m³",
                                       f"{water.get('unmet_demand_m3h', 0) + water.get('unmet_treated_demand_m3h', 0):.1f} m³/h"]):
             col.metric(label, value)
-        st.caption(f"Cumulative spill: {water['total_spilled_m3']:.2f} m³ · total water inventory (tanks + pipes): {diagram['total_inventory_m3']:.0f} m³")
+        st.caption(f"Concentrator gross draw: {sim['concentrator']['gross_process_water_m3h']:.0f} m³/h · "
+                   f"cumulative spill: {water['total_spilled_m3']:.2f} m³ · total water inventory (tanks + pipes): {diagram['total_inventory_m3']:.0f} m³")
         with st.expander("Operator controls · simulated equipment only"):
-            pump_cols = st.columns(3)
+            pump_cols = st.columns(4)
             for col, (pump_name, pump) in zip(pump_cols, water["pumps"].items()):
                 with col:
                     ui_key = sim["simulation_id"]
@@ -796,12 +818,13 @@ def render_dashboard():
                                                               int(pump["manual_speed_pct"]),
                                                               key=f"water_manual_speed_{ui_key}_{pump_name}")
                     col.caption(f"VFD feedback {pump['speed_pct']:.1f}% · {pump['current_a']:.1f} A · {pump['power_kw']:.1f} kW")
-            valve_cols = st.columns(4)
+            valve_cols = st.columns(5)
             for col, (valve_name, opening) in zip(valve_cols, list(water["valves"].items())):
                 with col:
                     water["valves"][valve_name] = st.slider(f"{valve_name} (%)", 0, 100, int(opening), key=f"water_valve_{valve_name}")
-        positions = {"north_reservoir": (0.08, .72), "raw_tank": (.34, .72),
-                     "process_tank": (.62, .72), "reclaim_pond": (.62, .23), "treated_tank": (.9, .23)}
+        positions = {"north_reservoir": (0.06, .74), "raw_tank": (.28, .74),
+                     "process_tank": (.56, .74), "concentrator_reclaim_sump": (.56, .23),
+                     "reclaim_pond": (.79, .23), "treated_tank": (.94, .23)}
         node_x, node_y, node_text = [], [], []
         for node in diagram["nodes"]:
             x, y = positions[node["id"]]
@@ -818,7 +841,7 @@ def render_dashboard():
                                               hovertemplate=f"{link['label']} · {link['flow_m3h']:.1f} m³/h<extra></extra>",
                                               showlegend=False))
         network_fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers+text",
-                                          marker={"size": 24, "color": ["#4c78a8", "#72a0c1", "#f2a541", "#43aa8b", "#277da1"],
+                                          marker={"size": 24, "color": ["#4c78a8", "#72a0c1", "#f2a541", "#9b5de5", "#43aa8b", "#277da1"],
                                                   "line": {"color": "white", "width": 2}},
                                           text=node_text, textposition="top center", textfont={"size": 11, "color": "#243746"},
                                           hovertemplate="%{text}<extra></extra>", showlegend=False))
@@ -839,7 +862,7 @@ def render_dashboard():
         if not hist.empty:
             left, right = st.columns(2)
             with left:
-                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "reclaim_pond_level_pct", "treated_tank_level_pct"],
+                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "concentrator_reclaim_sump_level_pct", "reclaim_pond_level_pct", "treated_tank_level_pct"],
                             labels={"time": "Simulated seconds", "value": "Tank level (%)", "variable": "Tank"},
                             color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b", "#9b5de5"])
                 f.update_layout(uirevision="water-level-trend")
@@ -851,6 +874,13 @@ def render_dashboard():
                             color_discrete_sequence=["#277da1", "#4cc9f0", "#f2a541", "#43aa8b", "#9b5de5"])
                 f.update_layout(uirevision="water-flow-trend")
                 st.plotly_chart(f, width="stretch")
+            st.markdown("**Concentrator water balance · simulated flow rates**")
+            f = px.line(hist, x="time", y=["concentrator_gross_demand_m3h", "concentrator_makeup_m3h",
+                                             "concentrator_reclaim_m3h"],
+                        labels={"time": "Simulated seconds", "value": "Flow (m³/h)", "variable": "Water stream"},
+                        color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+            f.update_layout(uirevision="concentrator-water-balance-trend")
+            st.plotly_chart(f, width="stretch")
         else:
             st.info("Start or single-step the factory to build level and flow trends.")
         st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")

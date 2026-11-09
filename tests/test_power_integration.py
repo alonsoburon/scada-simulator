@@ -6,6 +6,22 @@ from scada_playground.water_network import MineWaterNetwork
 
 
 class MinePowerIntegrationTests(unittest.TestCase):
+    def test_normal_concentrator_and_water_network_hold_a_coupled_balance(self):
+        water_model = MineWaterNetwork()
+        concentrator_model = CopperConcentrator()
+        water = water_model.initialize()
+        concentrator = concentrator_model.initialize()
+        for tick in range(1, 3_601):
+            concentrator_model.advance(concentrator, tick, [],
+                                       water_shortage_m3h=water["unmet_demand_m3h"])
+            water_model.advance(water, tick, [],
+                                concentrator_demand_m3h=concentrator["gross_process_water_m3h"],
+                                concentrator_reclaim_m3h=concentrator["concentrator_reclaim_m3h"])
+        self.assertLess(water["unmet_demand_m3h"], 1.0)
+        self.assertGreater(water["nodes"]["process_tank"]["level_pct"], 20.0)
+        self.assertGreater(concentrator["water_makeup_m3h"], 0.0)
+        self.assertGreater(concentrator["concentrator_reclaim_m3h"], 0.0)
+
     def test_grid_outage_curbs_mill_and_pumps_then_process_recovers(self):
         grid = MinePowerNetwork()
         water_model = MineWaterNetwork()
@@ -28,7 +44,8 @@ class MinePowerIntegrationTests(unittest.TestCase):
                          water_load_mw=water_request, seed=17)
             concentrator_model.advance(concentrator, tick, events, power_available_fraction=power["process_power_fraction"])
             water_model.advance(water, tick, events,
-                                concentrator_demand_m3h=concentrator["water_makeup_m3h"],
+                                concentrator_demand_m3h=concentrator["gross_process_water_m3h"],
+                                concentrator_reclaim_m3h=concentrator["concentrator_reclaim_m3h"],
                                 power_available_fraction=power["water_power_fraction"])
             if 120 <= tick < 720:
                 process_fraction_during_outage = min(process_fraction_during_outage,

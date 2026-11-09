@@ -53,6 +53,64 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertLess(self.state["plant_feed_tph"], normal * 0.2)
         self.assertEqual(self.state["fresh_water_shortage_m3h"], 250)
 
+    def test_process_water_balance_uses_solids_and_underflow_moisture(self):
+        self.advance(1_200)
+        state = self.state
+        self.assertAlmostEqual(state["water_specific_m3_t"], 0.90)
+        self.assertAlmostEqual(state["gross_process_water_m3h"],
+                               state["plant_feed_tph"] * state["water_specific_m3_t"], delta=2)
+        self.assertAlmostEqual(state["gross_process_water_m3h"],
+                               state["water_makeup_m3h"] + state["concentrator_reclaim_m3h"], places=6)
+        self.assertAlmostEqual(state["gross_process_water_m3h"],
+                               state["tailings_water_feed_m3h"] + state["concentrate_water_feed_m3h"], places=6)
+        self.assertAlmostEqual(state["concentrator_reclaim_m3h"],
+                               state["tailings_reclaim_water_m3h"]
+                               + state["concentrate_thickener_overflow_m3h"]
+                               + state["filter_press_filtrate_m3h"], places=6)
+        self.assertGreater(state["water_recovery_pct"], 35)
+        self.assertLess(state["water_recovery_pct"], 65)
+
+    def test_legacy_state_recalculates_water_metrics_for_new_model_revision(self):
+        legacy = self.model.initialize()
+        legacy["water_model_revision"] = 1
+        legacy.update(water_specific_m3_t=0.30, gross_process_water_m3h=261.0,
+                      concentrator_reclaim_m3h=193.0, water_makeup_m3h=68.0,
+                      water_recovery_pct=74.0)
+        self.model.migrate(legacy)
+        self.assertEqual(legacy["water_model_revision"], 2)
+        self.assertAlmostEqual(legacy["water_specific_m3_t"], 0.90)
+        self.assertAlmostEqual(legacy["gross_process_water_m3h"],
+                               legacy["plant_feed_tph"] * 0.90)
+        self.assertAlmostEqual(legacy["water_makeup_m3h"] + legacy["concentrator_reclaim_m3h"],
+                               legacy["gross_process_water_m3h"])
+
+    def test_tailings_thickener_trip_removes_its_reclaim_stream(self):
+        self.advance(600)
+        normal_return = self.state["concentrator_reclaim_m3h"]
+        unavailable = {name: True for name in (
+            "crusher", "conveyors", "sag_mill", "ball_mill", "flotation", "tailings_pump",
+            "tailings_thickener", "concentrate_thickener", "filter_press")}
+        unavailable["tailings_thickener"] = False
+        self.advance(3, equipment_available=unavailable)
+        self.assertEqual(self.state["tailings_reclaim_water_m3h"], 0.0)
+        self.assertLess(self.state["concentrator_reclaim_m3h"], normal_return * 0.2)
+        self.assertGreater(self.state["water_makeup_m3h"], normal_return)
+
+    def test_press_filtrate_is_a_squeeze_phase_batch_release(self):
+        peak_filtrate_m3h = 0.0
+        squeeze_observed = False
+        for tick in range(1, 1_601):
+            self.model.advance(self.state, tick, [])
+            if self.state["filter_press_phase"] == "SQUEEZING":
+                squeeze_observed = True
+                peak_filtrate_m3h = max(peak_filtrate_m3h, self.state["filter_press_filtrate_m3h"])
+        self.assertGreater(self.state["filter_press_cycle_count"], 0)
+        self.assertTrue(squeeze_observed)
+        self.assertGreater(peak_filtrate_m3h, 0.0)
+        if self.state["filter_press_phase"] != "SQUEEZING":
+            self.assertEqual(self.state["filter_press_filtrate_m3h"], 0.0)
+        self.assertGreaterEqual(self.state["filter_press_batch_filtrate_inventory_m3"], 0.0)
+
     def test_telemetry_ids_are_unique_and_seeded(self):
         first = self.model.telemetry(self.state)
         second = self.model.telemetry(self.state)

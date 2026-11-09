@@ -16,7 +16,8 @@ class MineWaterNetworkTests(unittest.TestCase):
         initial_storage = self.model.total_inventory_m3(self.state)
         self.step(900)
         final_storage = self.model.total_inventory_m3(self.state)
-        expected = (initial_storage - self.state["cumulative_process_consumption_m3"]
+        expected = (initial_storage + self.state["cumulative_concentrator_return_m3"]
+                    - self.state["cumulative_process_consumption_m3"]
                     - self.state["cumulative_treated_delivery_m3"]
                     - self.state["total_spilled_m3"])
         self.assertAlmostEqual(final_storage, expected, places=6)
@@ -47,12 +48,45 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertGreater(self.state["demand_m3h"], baseline)
         self.assertLess(self.state["water_recovery_pct"], 68)
 
-    def test_concentrator_makeup_is_added_as_fresh_demand_not_recycled(self):
-        self.model.advance(self.state, 1, [], concentrator_demand_m3h=260)
+    def test_concentrator_gross_demand_and_reclaim_are_separate_network_flows(self):
+        self.model.advance(self.state, 1, [], concentrator_demand_m3h=260,
+                           concentrator_reclaim_m3h=190)
         self.assertAlmostEqual(self.state["demand_m3h"], self.state["base_demand_m3h"] + 260)
         self.assertEqual(self.state["concentrator_demand_m3h"], 260)
+        self.assertEqual(self.state["concentrator_reclaim_m3h"], 190)
+        self.assertAlmostEqual(self.state["concentrator_recovery_pct"], 190 / 260 * 100)
         self.assertLess(self.state["links"]["reclaim_return"]["inlet_flow_m3h"],
                         self.state["base_demand_m3h"] * self.state["water_recovery_pct"] / 100 + 1)
+
+    def test_concentrator_reclaim_enters_sump_then_returns_through_delayed_pump(self):
+        pump = self.state["pumps"]["Concentrator reclaim pump"]
+        pump["enabled"] = False
+        for second in range(1, 121):
+            self.model.advance(self.state, second, [], concentrator_demand_m3h=260,
+                               concentrator_reclaim_m3h=180)
+        sump = self.state["nodes"]["concentrator_reclaim_sump"]
+        self.assertAlmostEqual(sump["volume_m3"], 6.0, places=5)
+        self.assertEqual(self.state["links"]["concentrator_reclaim"]["inlet_flow_m3h"], 0)
+        pump["enabled"] = True
+        start_volume = sump["volume_m3"]
+        return_was_delivered = False
+        for second in range(121, 2_000):
+            self.model.advance(self.state, second, [], concentrator_demand_m3h=260,
+                               concentrator_reclaim_m3h=0)
+            return_was_delivered |= self.state["links"]["concentrator_reclaim"]["outlet_flow_m3h"] > 0
+        self.assertLess(sump["volume_m3"], start_volume)
+        self.assertTrue(return_was_delivered)
+
+    def test_reclaim_return_preserves_network_mass_balance(self):
+        initial_storage = self.model.total_inventory_m3(self.state)
+        for second in range(1, 3_601):
+            self.model.advance(self.state, second, [], concentrator_demand_m3h=260,
+                               concentrator_reclaim_m3h=190)
+        expected = (initial_storage + self.state["cumulative_concentrator_return_m3"]
+                    - self.state["cumulative_process_consumption_m3"]
+                    - self.state["cumulative_treated_delivery_m3"]
+                    - self.state["total_spilled_m3"])
+        self.assertAlmostEqual(self.model.total_inventory_m3(self.state), expected, places=5)
 
     def test_telemetry_includes_flow_and_storage_in_engineering_units(self):
         tags, diagram = self.model.telemetry(self.state)
@@ -61,8 +95,8 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(by_id["water_supply_network.raw_tank.stored_volume"]["units"], "m³")
         self.assertIn("water_supply_network.intake_pump.pump_running", by_id)
         self.assertIn("water_supply_network.raw_transfer_valve.valve_position", by_id)
-        self.assertEqual(len(diagram[0]["nodes"]), 5)
-        self.assertEqual(len(diagram[0]["links"]), 4)
+        self.assertEqual(len(diagram[0]["nodes"]), 6)
+        self.assertEqual(len(diagram[0]["links"]), 5)
         self.assertGreater(diagram[0]["electrical_load_kw"], 0)
 
     def test_pump_affinity_and_pipe_transport_delay_are_observable(self):
@@ -87,6 +121,18 @@ class MineWaterNetworkTests(unittest.TestCase):
         tag = "water_supply_network.raw_tank.tank_level"
         self.assertNotEqual(next(t["value"] for t in first if t["tag"] == tag),
                             next(t["value"] for t in third if t["tag"] == tag))
+
+    def test_older_session_state_migrates_to_reclaim_circuit(self):
+        legacy = self.model.initialize()
+        del legacy["nodes"]["concentrator_reclaim_sump"]
+        del legacy["pumps"]["Concentrator reclaim pump"]
+        del legacy["controllers"]["Concentrator reclaim pump"]
+        del legacy["valves"]["Concentrator reclaim valve"]
+        del legacy["links"]["concentrator_reclaim"]
+        self.model.migrate(legacy)
+        self.assertEqual(legacy["nodes"]["concentrator_reclaim_sump"]["volume_m3"], 0)
+        self.assertTrue(legacy["pumps"]["Concentrator reclaim pump"]["enabled"])
+        self.assertIn("concentrator_reclaim", legacy["links"])
 
     def test_level_pi_loops_hold_the_process_tank_near_its_setpoint(self):
         self.step(10_000)
