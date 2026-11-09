@@ -28,6 +28,25 @@ class ScenarioDefinition:
 
 
 SCENARIOS = {
+    "haulage-crusher-buffer": ScenarioDefinition(
+        scenario_id="haulage-crusher-buffer",
+        name="Haul truck cycles and crusher stoppage",
+        description="Finite truck payloads feed ROM while a crusher conveyor trip forces inventory buffers and dispatch holds to respond.",
+        duration_seconds=46_800,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Conveyor jam", "severity": "Large",
+                                             "target_area": "Crushing and screening", "duration_seconds": 21_600}),
+            ScenarioStep(900, "incident", {"incident_name": "Mechanical degradation", "severity": "Medium",
+                                             "target_area": "Mobile fleet", "duration_seconds": 2_400}),
+        ),
+        expected_observations=(
+            "Haul trucks deliver finite payloads after loading and loaded trips; return trips carry no ore.",
+            "The crusher conveyor trip stops ROM discharge, so incoming truckloads raise the ROM stockpile while downstream buffers continue feeding the concentrator.",
+            "During the long stoppage, ROM reaches the dispatch hold limit; trucks wait at the shovel while downstream buffers feed the plant.",
+            "After crushing restarts, ROM inventory declines through the resume threshold and loading dispatch resumes with hysteresis.",
+            "Mobile-fleet degradation slows travel progress and extends the haul cycle without jumping GPS positions.",
+        ),
+    ),
     "concentrator-mill-degradation": ScenarioDefinition(
         scenario_id="concentrator-mill-degradation",
         name="Hard ore and grinding circuit degradation",

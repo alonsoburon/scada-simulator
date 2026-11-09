@@ -71,6 +71,16 @@ class CopperConcentratorTests(unittest.TestCase):
             self.model.advance(second, tick, [], seed=123)
         self.assertEqual(first, second)
 
+    def test_discrete_truck_payloads_preserve_rom_inventory_mass_balance(self):
+        initial = self.state["rom_stockpile_t"]
+        for tick in range(1, 901):
+            payload = 205.0 if tick in (210, 510, 810) else 0.0
+            self.model.advance(self.state, tick, [], mine_delivery_t=payload)
+        expected = (initial + self.state["cumulative_rom_received_t"]
+                    - self.state["cumulative_rom_discharge_t"])
+        self.assertAlmostEqual(self.state["rom_stockpile_t"], expected, places=6)
+        self.assertGreater(self.state["rom_feed_tph"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

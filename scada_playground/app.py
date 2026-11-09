@@ -20,6 +20,7 @@ from protocol_faults import FAULT_MODES, PROTOCOLS, ProtocolFaultInjector
 from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
 from water_network import MineWaterNetwork
 from concentrator import CopperConcentrator
+from haulage import HaulTruckFleet
 
 
 AREAS = {
@@ -172,6 +173,7 @@ def fleet_motion(unit: str, sim_seconds: int) -> tuple[float, float, float, floa
 PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
 WATER_MODEL = MineWaterNetwork()
 CONCENTRATOR_MODEL = CopperConcentrator()
+HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -211,12 +213,14 @@ def initialize(seed: int = 17) -> None:
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
         concentrator_state = CONCENTRATOR_MODEL.initialize()
+        haulage_state = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
-        concentrator_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state)
-        for tag in concentrator_tags:
+        modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
+        for tag in modeled_tags:
             tag["dynamic_model"] = True
-        tags.extend(concentrator_tags)
+        tags.extend(modeled_tags)
         water_state = WATER_MODEL.initialize()
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         tags.extend(water_tags)
@@ -229,9 +233,11 @@ def initialize(seed: int = 17) -> None:
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
                                 "concentrator": concentrator_state,
+                                "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
                                 "concentrator_alarm_states": {},
+                                "haulage_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
                                 "protocol_faults": [], "next_fault_id": 1, "scenario_run": None,
                                 "last_tick": time.time(), "factory_on": False}
@@ -244,9 +250,13 @@ def initialize(seed: int = 17) -> None:
         sim.setdefault("scenario_run", None)
         if "concentrator" not in sim:
             sim["concentrator"] = CONCENTRATOR_MODEL.initialize()
+        if "haulage" not in sim:
+            sim["haulage"] = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
-        for tag in CONCENTRATOR_MODEL.telemetry(sim["concentrator"]):
+        modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
+        for tag in modeled_tags:
             tag["dynamic_model"] = True
             sim["tags"].append(tag)
         if "water_network" not in sim:
@@ -261,7 +271,9 @@ def publish_snapshot() -> dict:
     fleet_units = sorted({t["unit"] for t in sim["tags"] if t["area"] == "Mobile fleet"})
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
-    concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags}
+    haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
+    haulage_frames = {frame["unit"]: frame for frame in HAULAGE_MODEL.positions(sim["haulage"])}
+    concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags + haulage_tags}
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
@@ -290,11 +302,13 @@ def publish_snapshot() -> dict:
         "protocol_faults": sim["protocol_faults"],
         "water_network": water_diagram[0],
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
+        "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
                   "value": t["value"], "units": t["units"], "quality": t["quality"],
                   "low": t["low"], "high": t["high"], "last_change": t["last_change"]} for t in sim["tags"]],
         "alarms": sim["alarms"],
-        "fleet": [{"unit": unit, "vehicle_type": unit.rsplit(" ", 1)[0],
+        "fleet": [haulage_frames[unit] if unit in haulage_frames else {
+                   "unit": unit, "vehicle_type": unit.rsplit(" ", 1)[0],
                    "latitude": fleet_motion(unit, sim["tick"])[0],
                    "longitude": fleet_motion(unit, sim["tick"])[1],
                    "speed_kmh": fleet_motion(unit, sim["tick"])[2],
@@ -425,11 +439,13 @@ def advance(force: bool = False) -> None:
     water_events = [event.__dict__ for event in sim["events"]
                     if event.area in ("Water supply network", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
+    mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
+                                             sim["concentrator"]["rom_stockpile_t"])
     prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
     concentrator_share = sim["concentrator"]["water_makeup_m3h"] / max(sim["water_network"].get("demand_m3h", 1), 1)
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
                                water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
-                               seed=sim["seed"])
+                               seed=sim["seed"], mine_delivery_t=mine_delivery_t)
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
                         concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"])
     water = sim["water_network"]
@@ -461,8 +477,8 @@ def advance(force: bool = False) -> None:
     concentrator_conditions = {
         "low_crushed_inventory": (plant["crushed_stockpile_t"] < 500,
             plant["crushed_stockpile_t"] > 800, "Crushed-ore stockpile low; mill feed buffer is being depleted", "HIGH"),
-        "rom_stockpile_high": (plant["rom_stockpile_t"] > 42_000,
-            plant["rom_stockpile_t"] < 39_000, "ROM stockpile is near capacity; mine feed is being curtailed", "HIGH"),
+        "rom_stockpile_high": (plant["rom_stockpile_t"] > 40_000,
+            plant["rom_stockpile_t"] < 34_000, "ROM stockpile high; haul dispatch is waiting at the shovel", "HIGH"),
         "sag_bin_high": (plant["sag_bin_t"] > 820, plant["sag_bin_t"] < 720,
             "SAG feed bin high; upstream feeder should reduce rate", "HIGH"),
         "coarse_grind_product": (plant["p80_microns"] > 200, plant["p80_microns"] < 180,
@@ -485,9 +501,28 @@ def advance(force: bool = False) -> None:
             sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
                 "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
             concentration_states[alarm_key] = False
+    haulage_alarm_states = sim.setdefault("haulage_alarm_states", {})
+    for tag in sim["tags"]:
+        if tag["area"] != "Mobile fleet" or tag["sensor"] != "fuel_level":
+            continue
+        alarm_key = f"low_fuel:{tag['unit']}"
+        low_fuel = tag["value"] < 18
+        recovered = tag["value"] > 30
+        was_active = haulage_alarm_states.get(alarm_key, False)
+        message = f"{tag['unit']} fuel reserve low; refuel at shovel queue"
+        if low_fuel and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
+                "severity": "HIGH", "message": message, "state": "ACTIVE / UNACK"})
+            haulage_alarm_states[alarm_key] = True
+        elif was_active and recovered:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+            haulage_alarm_states[alarm_key] = False
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
-    concentrator_by_tag = {tag["tag"]: tag for tag in CONCENTRATOR_MODEL.telemetry(sim["concentrator"])}
+    concentrator_by_tag = {tag["tag"]: tag for tag in
+                           CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+                           + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])

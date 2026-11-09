@@ -28,7 +28,12 @@ class CopperConcentrator:
     def initialize(self) -> dict:
         return {
             "sim_seconds": 0, "rom_stockpile_t": 18_000.0, "rom_feed_curtailed_t": 0.0,
+            "initial_rom_stockpile_t": 18_000.0, "cumulative_rom_received_t": 0.0,
+            "cumulative_rom_discharge_t": 0.0, "initial_crushed_stockpile_t": 3_200.0,
+            "cumulative_crushed_ore_t": 0.0, "cumulative_sag_feeder_t": 0.0,
+            "initial_sag_bin_t": 410.0, "cumulative_sag_processed_t": 0.0,
             "rom_feed_curtailed_tph": 0.0,
+            "rom_delivery_window_t": [], "rom_curtailed_window_t": [],
             "crushed_stockpile_t": 3_200.0,
             "sag_bin_t": 410.0, "tailings_thickener_inventory_t": 1_100.0,
             "rom_feed_tph": 1_180.0, "crusher_feed_tph": 1_080.0, "crushed_ore_tph": 1_030.0,
@@ -62,7 +67,8 @@ class CopperConcentrator:
         return old + (requested - old) / max(seconds, 1)
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
-                water_shortage_m3h: float = 0.0, seed: int = 17) -> None:
+                water_shortage_m3h: float = 0.0, seed: int = 17,
+                mine_delivery_t: float | None = None) -> None:
         """Advance coupled ore, comminution, flotation, water and power balances."""
         state["sim_seconds"] = sim_seconds
         state["noise_seed"] = seed
@@ -83,10 +89,11 @@ class CopperConcentrator:
         state["flotation_condition"] = 1.0 - mechanical * 0.28
         state["tailings_condition"] = 1.0 - mechanical * 0.65
 
-        # ROM receiving is finite storage. The mine sends variable truck/shovel feed;
-        # a crusher/conveyor jam blocks discharge while stockpiles absorb the lag.
-        rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
-        crusher_capacity = 1_460.0 * state["crusher_condition"] * (1.0 - jam)
+        # ROM receiving is finite storage. Integrated runs receive discrete truck
+        # payloads; standalone model experiments retain a smooth mine-source input.
+        scheduled_rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
+        jam_factor = 0.0 if jam >= 0.78 else 1.0 - jam
+        crusher_capacity = 1_460.0 * state["crusher_condition"] * jam_factor
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
         power_factor = max(0.0, 1.0 - utility * 0.82)
@@ -102,7 +109,26 @@ class CopperConcentrator:
 
         rom_discharge = min(state["rom_stockpile_t"] * 3600.0, crusher_capacity, 1_250.0)
         crushed_rate = min(rom_discharge, crusher_capacity) if jam < 0.95 else 0.0
-        rom_received = min(rom_feed, max(0.0, 45_000.0 - state["rom_stockpile_t"]) * 3600.0)
+        dt_h = 1.0 / 3600.0
+        rom_space_t = max(0.0, 45_000.0 - state["rom_stockpile_t"])
+        if mine_delivery_t is None:
+            rom_feed = scheduled_rom_feed
+            rom_received = min(rom_feed, rom_space_t * 3600.0) / 3600.0
+            curtailed_t = max(0.0, rom_feed * dt_h - rom_received)
+            state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_received * 3600.0, 30)
+            state["rom_feed_curtailed_tph"] = curtailed_t * 3600.0
+        else:
+            mine_delivery_t = max(0.0, mine_delivery_t)
+            rom_received = min(mine_delivery_t, rom_space_t)
+            curtailed_t = mine_delivery_t - rom_received
+            state["rom_delivery_window_t"].append(rom_received)
+            state["rom_curtailed_window_t"].append(curtailed_t)
+            state["rom_delivery_window_t"] = state["rom_delivery_window_t"][-600:]
+            state["rom_curtailed_window_t"] = state["rom_curtailed_window_t"][-600:]
+            rom_feed = sum(state["rom_delivery_window_t"]) * 6.0
+            state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_feed, 30)
+            state["rom_feed_curtailed_tph"] = (sum(state["rom_curtailed_window_t"])
+                                                * 3_600.0 / max(1, len(state["rom_curtailed_window_t"])))
         sag_feeder_rate = min(900.0, state["crushed_stockpile_t"] * 3600.0,
                               max(0.0, 900.0 - state["sag_bin_t"]) * 3600.0)
         sag_available_t = state["sag_bin_t"] + sag_feeder_rate / 3600.0
@@ -110,11 +136,14 @@ class CopperConcentrator:
         ball_rate = min(sag_rate * cyclone_recirculating_load, ball_power_cap * 1_000.0 / max(8.6 * state["ore_hardness_factor"], 1))
         cyclone_overflow = min(sag_rate, ball_rate / cyclone_recirculating_load, flotation_capacity)
 
-        dt_h = 1.0 / 3600.0
-        state["rom_feed_curtailed_t"] += (rom_feed - rom_received) * dt_h
-        state["rom_feed_curtailed_tph"] = rom_feed - rom_received
+        state["rom_feed_curtailed_t"] += curtailed_t
+        state["cumulative_rom_received_t"] += rom_received
+        state["cumulative_rom_discharge_t"] += rom_discharge * dt_h
+        state["cumulative_crushed_ore_t"] += crushed_rate * dt_h
+        state["cumulative_sag_feeder_t"] += sag_feeder_rate * dt_h
+        state["cumulative_sag_processed_t"] += sag_rate * dt_h
         state["rom_stockpile_t"] = min(45_000.0, max(0.0,
-            state["rom_stockpile_t"] + (rom_received - rom_discharge) * dt_h))
+            state["rom_stockpile_t"] + rom_received - rom_discharge * dt_h))
         state["crushed_stockpile_t"] = min(8_000.0, max(0.0,
             state["crushed_stockpile_t"] + (crushed_rate - sag_feeder_rate) * dt_h))
         state["sag_bin_t"] = min(900.0, max(0.0,
@@ -142,7 +171,6 @@ class CopperConcentrator:
         state["tailings_thickener_inventory_t"] = min(3_000.0, max(0.0,
             state["tailings_thickener_inventory_t"] + (thickener_input - tailings_pumped) * dt_h))
 
-        state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_received, 30)
         state["crusher_feed_tph"] = self._smooth(state["crusher_feed_tph"], crushed_rate, 45)
         state["crushed_ore_tph"] = state["crusher_feed_tph"]
         state["plant_feed_tph"] = self._smooth(state["plant_feed_tph"], cyclone_overflow, 75)

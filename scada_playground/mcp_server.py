@@ -170,6 +170,21 @@ def get_fleet_positions(vehicle_type: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_haulage_state() -> dict[str, Any]:
+    """Read truck-cycle states, ROM delivery rate, payloads, fuel, and fleet quality tags."""
+    data = snapshot()
+    haulage = data.get("haulage")
+    if not haulage:
+        raise RuntimeError("Haulage model is absent; restart the playground to load its current snapshot schema")
+    fleet = [vehicle for vehicle in data["fleet"] if vehicle["vehicle_type"] == "Haul truck"]
+    readings = [tag_record(tag, data["timestamp"]) for tag in data["tags"]
+                if tag["area"] == "Mobile fleet" and tag["asset"].startswith("Haul truck")]
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"],
+            **haulage, "trucks": fleet, "readings": readings}
+
+
+@mcp.tool()
 def get_water_network_state() -> dict[str, Any]:
     """Read mine-water tank inventories, link flows/pressure, and process demand."""
     data = snapshot()
