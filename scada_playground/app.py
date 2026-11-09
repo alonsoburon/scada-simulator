@@ -210,6 +210,12 @@ def initialize(seed: int = 17) -> None:
         water_state = WATER_MODEL.initialize()
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         tags.extend(water_tags)
+        tags.append({"tag": "mine_power_network.water_pump_station.pump_load", "area": "Mine power network",
+                     "unit": "Water pump station", "sensor": "active_power", "units": "MW",
+                     "low": 0.0, "high": 2.0, "base": 0.1,
+                     "value": round(sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0, 3),
+                     "quality": "GOOD", "unit_no": 6, "phase": 0.0,
+                     "last_change": "Water pump electrical load"})
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
                                 "simulation_id": uuid.uuid4().hex,
@@ -239,6 +245,9 @@ def publish_snapshot() -> dict:
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
+        elif tag["tag"] == "mine_power_network.water_pump_station.pump_load":
+            tag.update(value=round(sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0, 3),
+                       quality="GOOD", last_change="Water pump electrical load changed")
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sim_seconds": sim["tick"],
@@ -385,15 +394,19 @@ def advance(force: bool = False) -> None:
     PROCESS_MODEL.advance(sim, force=force)
     water_events = [event.__dict__ for event in sim["events"]
                     if event.area in ("Water supply network", "Whole factory")]
-    WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events)
+    WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"])
     water = sim["water_network"]
     conditions = {
         "process_tank_low": (water["nodes"]["process_tank"]["level_pct"] < 25,
                               "Process water tank low level", "HIGH"),
         "unmet_process_demand": (water["unmet_demand_m3h"] > 1,
                                   "Process water demand is not being met", "CRITICAL"),
+        "unmet_treated_water_demand": (water["unmet_treated_demand_m3h"] > 1,
+                                        "Treated water distribution demand is not being met", "HIGH"),
         "raw_tank_high": (water["nodes"]["raw_tank"]["level_pct"] > 90,
                            "Raw water tank high level", "HIGH"),
+        "tank_spill": (any(node["overflow_m3"] > 0 for node in water["nodes"].values()),
+                       "Water tank overflow detected", "HIGH"),
     }
     prior_states = sim.setdefault("water_alarm_states", {})
     for alarm_key, (active, message, severity) in conditions.items():
@@ -421,7 +434,7 @@ initialize()
 sim = st.session_state.sim
 publish_snapshot()
 st.title("🏭 Factory SCADA Playground")
-st.caption(f"Synthetic multi-industry training world · {len(AREAS)} systems · {sum(map(len, AREAS.values()))} equipment units · {len(st.session_state.sim['tags'])} tags · local simulation only")
+st.caption(f"Synthetic multi-industry training world · {len(AREAS)} systems · {len({(t['area'], t['unit']) for t in sim['tags']})} equipment units · {len(sim['tags'])} tags · local simulation only")
 
 with st.sidebar:
     st.header("Factory controls")
@@ -530,20 +543,35 @@ def render_dashboard():
             st.dataframe(overview[["area", "tags", "stale", "health"]].sort_values("area"), hide_index=True, width="stretch", height=560)
     with tabs[1]:
         water = sim["water_network"]
-        diagram = publish_snapshot()["water_network"]
-        st.markdown("### Mine water circuit · lumped mass-balance model")
-        st.caption("One simulated second per step. Tank storage changes by (inflow − outflow) × time; pump head, elevation, valve opening, demand, and recovery set link flows. Values are simulated training data, not a hydraulic design model.")
-        metric_cols = st.columns(4)
-        for col, label, value in zip(metric_cols, ["Process demand", "Water recovery", "Spilled water", "Unmet demand"],
-                                     [f"{water['demand_m3h']:.0f} m³/h", f"{water['water_recovery_pct']:.0f}%",
-                                      f"{water['total_spilled_m3']:.2f} m³", f"{water.get('unmet_demand_m3h', 0):.1f} m³/h"]):
+        diagram = published_snapshot["water_network"]
+        st.markdown("### Mine water circuit · hydraulic network and level control")
+        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow packets, so a pump trip can leave downstream flow running until the line empties.")
+        metric_cols = st.columns(5)
+        for col, label, value in zip(metric_cols, ["Process demand", "Treated demand", "Water recovery", "Water in transit", "Unmet demand"],
+                                     [f"{water['demand_m3h']:.0f} m³/h", f"{water['treated_demand_m3h']:.0f} m³/h",
+                                      f"{water['water_recovery_pct']:.0f}%", f"{diagram['pipe_inventory_m3']:.0f} m³",
+                                      f"{water.get('unmet_demand_m3h', 0) + water.get('unmet_treated_demand_m3h', 0):.1f} m³/h"]):
             col.metric(label, value)
+        st.caption(f"Cumulative spill: {water['total_spilled_m3']:.2f} m³ · total water inventory (tanks + pipes): {diagram['total_inventory_m3']:.0f} m³")
         with st.expander("Operator controls · simulated equipment only"):
             pump_cols = st.columns(3)
             for col, (pump_name, pump) in zip(pump_cols, water["pumps"].items()):
                 with col:
-                    pump["running"] = st.toggle(f"{pump_name} running", value=pump["running"], key=f"water_pump_{pump_name}")
-                    pump["speed_pct"] = st.slider(f"{pump_name} speed (%)", 0, 100, int(pump["speed_pct"]), key=f"water_speed_{pump_name}")
+                    ui_key = sim["simulation_id"]
+                    pump["enabled"] = st.toggle(f"{pump_name} enabled", value=pump["enabled"], key=f"water_pump_{ui_key}_{pump_name}")
+                    controller = water["controllers"][pump_name]
+                    controller["mode"] = st.radio(f"{pump_name} mode", ["AUTO", "MANUAL"],
+                                                   index=0 if controller["mode"] == "AUTO" else 1,
+                                                   horizontal=True, key=f"water_mode_{ui_key}_{pump_name}")
+                    if controller["mode"] == "AUTO":
+                        controller["setpoint_pct"] = st.slider(f"{pump['controlled_node'].replace('_', ' ').title()} target (%)",
+                                                                 10, 90, int(controller["setpoint_pct"]),
+                                                                 key=f"water_setpoint_{ui_key}_{pump_name}")
+                    else:
+                        pump["manual_speed_pct"] = st.slider(f"{pump_name} speed command (%)", 0, 100,
+                                                              int(pump["manual_speed_pct"]),
+                                                              key=f"water_manual_speed_{ui_key}_{pump_name}")
+                    col.caption(f"VFD feedback {pump['speed_pct']:.1f}% · {pump['current_a']:.1f} A · {pump['power_kw']:.1f} kW")
             valve_cols = st.columns(4)
             for col, (valve_name, opening) in zip(valve_cols, list(water["valves"].items())):
                 with col:
@@ -576,7 +604,7 @@ def render_dashboard():
                                        showarrow=True, arrowhead=3, arrowsize=1.1, arrowwidth=2,
                                        arrowcolor="#277da1" if link["flow_m3h"] > 1 else "#d1495b")
             network_fig.add_annotation(x=(x0+x1)/2, y=(y0+y1)/2 + .06,
-                                       text=f"{link['label']}<br>{link['flow_m3h']:.0f} m³/h · {link['pressure_kpa']:.0f} kPa",
+                                       text=f"{link['label']}<br>in {link['inlet_flow_m3h']:.0f} → out {link['flow_m3h']:.0f} m³/h · {link['transport_delay_s']//60} min · ΔP {link['pressure_kpa']:.0f} kPa",
                                        showarrow=False, font={"size": 10, "color": "#243746"}, bgcolor="rgba(255,255,255,.88)")
         network_fig.update_layout(height=420, margin={"l": 10, "r": 10, "t": 10, "b": 10},
                                   xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},
@@ -587,15 +615,16 @@ def render_dashboard():
         if not hist.empty:
             left, right = st.columns(2)
             with left:
-                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "reclaim_pond_level_pct"],
+                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "reclaim_pond_level_pct", "treated_tank_level_pct"],
                             labels={"time": "Simulated seconds", "value": "Tank level (%)", "variable": "Tank"},
-                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b", "#9b5de5"])
                 f.update_layout(uirevision="water-level-trend")
                 st.plotly_chart(f, width="stretch")
             with right:
-                f = px.line(hist, x="time", y=["intake_flow_m3h", "process_feed_m3h", "demand_m3h"],
+                f = px.line(hist, x="time", y=["intake_flow_m3h", "intake_arrival_m3h", "process_feed_m3h",
+                                                 "process_demand_m3h", "treated_demand_m3h"],
                             labels={"time": "Simulated seconds", "value": "Flow (m³/h)", "variable": "Flow"},
-                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+                            color_discrete_sequence=["#277da1", "#4cc9f0", "#f2a541", "#43aa8b", "#9b5de5"])
                 f.update_layout(uirevision="water-flow-trend")
                 st.plotly_chart(f, width="stretch")
         else:
