@@ -21,6 +21,7 @@ from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
 from water_network import MineWaterNetwork
 from concentrator import CopperConcentrator
 from haulage import HaulTruckFleet
+from power_network import MinePowerNetwork
 
 
 AREAS = {
@@ -174,6 +175,7 @@ PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
 WATER_MODEL = MineWaterNetwork()
 CONCENTRATOR_MODEL = CopperConcentrator()
 HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
+POWER_MODEL = MinePowerNetwork()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -224,14 +226,21 @@ def initialize(seed: int = 17) -> None:
         water_state = WATER_MODEL.initialize()
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         tags.extend(water_tags)
-        tags.append({"tag": "mine_power_network.water_pump_station.pump_load", "area": "Mine power network",
-                     "unit": "Water pump station", "sensor": "active_power", "units": "MW",
-                     "low": 0.0, "high": 2.0, "base": 0.1,
-                     "value": round(sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0, 3),
-                     "quality": "GOOD", "unit_no": 6, "phase": 0.0,
-                     "last_change": "Water pump electrical load"})
+        power_state = POWER_MODEL.initialize()
+        initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
+                                     + concentrator_state["crusher_power_mw"] + 1.0)
+        initial_water_power_mw = sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0
+        POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
+                            water_load_mw=initial_water_power_mw, seed=seed)
+        power_tags = POWER_MODEL.telemetry(power_state)
+        power_assets = {(area, asset) for area, assets in POWER_MODEL.AREA_ASSETS.items() for asset in assets}
+        tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in power_assets]
+        for tag in power_tags:
+            tag["dynamic_model"] = True
+        tags.extend(power_tags)
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
+                                "power_network": power_state,
                                 "concentrator": concentrator_state,
                                 "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
@@ -263,6 +272,18 @@ def initialize(seed: int = 17) -> None:
             sim["water_network"] = WATER_MODEL.initialize()
             water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
             sim["tags"].extend(water_tags)
+        if "power_network" not in sim:
+            sim["power_network"] = POWER_MODEL.initialize()
+            process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
+                               + sim["concentrator"]["crusher_power_mw"] + 1.0)
+            water_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
+            POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
+                                water_load_mw=water_load_mw, seed=sim["seed"])
+        power_assets = {(area, asset) for area, assets in POWER_MODEL.AREA_ASSETS.items() for asset in assets}
+        sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in power_assets]
+        for tag in POWER_MODEL.telemetry(sim["power_network"]):
+            tag["dynamic_model"] = True
+            sim["tags"].append(tag)
 
 
 def publish_snapshot() -> dict:
@@ -271,13 +292,17 @@ def publish_snapshot() -> dict:
     fleet_units = sorted({t["unit"] for t in sim["tags"] if t["area"] == "Mobile fleet"})
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+    power_tags = POWER_MODEL.telemetry(sim["power_network"])
     haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
     haulage_frames = {frame["unit"]: frame for frame in HAULAGE_MODEL.positions(sim["haulage"])}
     concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags + haulage_tags}
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
+    power_by_tag = {tag["tag"]: tag for tag in power_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
+        elif tag["tag"] in power_by_tag:
+            tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
         comms_fault = next((event for event in sim["events"]
@@ -286,9 +311,6 @@ def publish_snapshot() -> dict:
         if comms_fault:
             tag["quality"] = "STALE"
             tag["last_change"] = "Network partition"
-        elif tag["tag"] == "mine_power_network.water_pump_station.pump_load":
-            tag.update(value=round(sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0, 3),
-                       quality="GOOD", last_change="Water pump electrical load changed")
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sim_seconds": sim["tick"],
@@ -301,6 +323,7 @@ def publish_snapshot() -> dict:
         "scenario_run": sim["scenario_run"],
         "protocol_faults": sim["protocol_faults"],
         "water_network": water_diagram[0],
+        "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
@@ -439,15 +462,23 @@ def advance(force: bool = False) -> None:
     water_events = [event.__dict__ for event in sim["events"]
                     if event.area in ("Water supply network", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
+    process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
+                             + sim["concentrator"]["crusher_power_mw"] + 1.0)
+    water_power_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
+    POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
+                        process_load_mw=process_power_load_mw,
+                        water_load_mw=water_power_load_mw, seed=sim["seed"])
     mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
                                              sim["concentrator"]["rom_stockpile_t"])
     prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
     concentrator_share = sim["concentrator"]["water_makeup_m3h"] / max(sim["water_network"].get("demand_m3h", 1), 1)
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
                                water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
-                               seed=sim["seed"], mine_delivery_t=mine_delivery_t)
+                               seed=sim["seed"], mine_delivery_t=mine_delivery_t,
+                               power_available_fraction=sim["power_network"]["process_power_fraction"])
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
-                        concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"])
+                        concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"],
+                        power_available_fraction=sim["power_network"]["water_power_fraction"])
     water = sim["water_network"]
     conditions = {
         "process_tank_low": (water["nodes"]["process_tank"]["level_pct"] < 25,
@@ -518,14 +549,48 @@ def advance(force: bool = False) -> None:
             sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
                 "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
             haulage_alarm_states[alarm_key] = False
+    power_alarm_states = sim.setdefault("power_alarm_states", {})
+    power_state = sim["power_network"]
+    power_conditions = {
+        "underfrequency": (power_state["frequency_hz"] < 49.5, power_state["frequency_hz"] > 49.8,
+                            "Mine bus frequency below operating band", "CRITICAL"),
+        "low_voltage": (power_state["voltage_pu"] < 0.92, power_state["voltage_pu"] > 0.96,
+                         "Mine bus voltage depressed", "HIGH"),
+        "load_shed": (power_state["load_shed_mw"] > 0.1, power_state["load_shed_mw"] < 0.05,
+                      "Automatic site auxiliary load shedding active", "HIGH"),
+        "process_feeder_limited": (power_state["process_power_fraction"] < 0.95,
+                                   power_state["process_power_fraction"] > 0.98,
+                                   "Concentrator electrical supply is feeder- or source-limited", "HIGH"),
+        "water_feeder_limited": (power_state["water_power_fraction"] < 0.95,
+                                 power_state["water_power_fraction"] > 0.98,
+                                 "Water pumping electrical supply is feeder- or source-limited", "HIGH"),
+        "battery_reserve": (power_state["battery_soc_pct"] < 20, power_state["battery_soc_pct"] > 30,
+                            "Grid support battery reserve low", "HIGH"),
+    }
+    for key, (active, cleared, message, severity) in power_conditions.items():
+        was_active = power_alarm_states.get(key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mine power network",
+                                     "severity": severity, "message": message,
+                                     "state": "ACTIVE / UNACK"})
+            power_alarm_states[key] = True
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mine power network",
+                                     "severity": "INFO", "message": f"{message} cleared",
+                                     "state": "CLEARED"})
+            power_alarm_states[key] = False
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
+    power_tags = POWER_MODEL.telemetry(sim["power_network"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
+    power_by_tag = {tag["tag"]: tag for tag in power_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
                            + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
+        elif tag["tag"] in power_by_tag:
+            tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     if sim["tick"] % 15 == 0:
@@ -630,7 +695,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -843,6 +908,76 @@ def render_dashboard():
                 sim["alarms"] = [{**a, "state": "ACTIVE / ACK" if a["state"] == "ACTIVE / UNACK" else a["state"]} for a in sim["alarms"]]
                 st.rerun(scope="fragment")
     with tabs[7]:
+        power = sim["power_network"]
+        st.subheader("Mine electrical network · dispatch and load response")
+        st.caption("Grid import, solar, diesel reserve, and battery storage supply site auxiliaries, water pumps, and the concentrator. Transmission, transformer, and feeder limits constrain delivery; this is a supervisory balance model, not an AC load-flow study.")
+        metrics = st.columns(6)
+        for col, label, value in zip(metrics,
+            ["Mine bus frequency", "Bus voltage", "Grid import", "Diesel generation", "Battery reserve", "Process power available"],
+            [f"{power['frequency_hz']:.2f} Hz", f"{power['voltage_pu']:.3f} pu", f"{power['grid_import_mw']:.1f} MW",
+             f"{power['diesel_mw']:.1f} MW", f"{power['battery_soc_pct']:.1f}%", f"{power['process_power_fraction']*100:.0f}%"]):
+            col.metric(label, value)
+        st.caption(f"Solar {power['solar_mw']:.1f} MW · battery {power['battery_power_mw']:+.1f} MW (positive = discharging) · requested/served plant load {power['requested_load_mw']:.1f}/{power['served_load_mw']:.1f} MW · shed {power['load_shed_mw']:.1f} MW · process/water feeder limits {power['process_feeder_capacity_mw']:.1f}/{power['water_feeder_capacity_mw']:.1f} MW")
+
+        nodes = {
+            "grid": (.08, .78, f"Transmission import<br>{power['grid_import_mw']:.1f} / {power['tie_capacity_mw']:.1f} MW"),
+            "solar": (.08, .55, f"Solar<br>{power['solar_mw']:.1f} MW"),
+            "diesel": (.08, .32, f"Diesel reserve<br>{power['diesel_mw']:.1f} / {power['diesel_available_mw']:.1f} MW"),
+            "battery": (.08, .09, f"Battery<br>{power['battery_power_mw']:+.1f} MW · {power['battery_soc_pct']:.0f}%"),
+            "bus": (.50, .48, f"Mine bus<br>{power['frequency_hz']:.2f} Hz · {power['voltage_pu']:.3f} pu"),
+            "site": (.91, .78, f"Site auxiliaries<br>{power['site_load_mw']:.1f} MW"),
+            "water": (.91, .50, f"Water pumps<br>{power['water_load_mw']:.2f} MW · {power['water_power_fraction']*100:.0f}%"),
+            "process": (.91, .20, f"Concentrator<br>{power['process_load_mw']:.1f} MW · {power['process_power_fraction']*100:.0f}%"),
+        }
+        fig = go.Figure()
+        source_colors = {"grid": "#277da1", "solar": "#f2a541", "diesel": "#e07a5f", "battery": "#9b5de5"}
+        source_mw = {"grid": power["grid_import_mw"], "solar": power["solar_mw"],
+                     "diesel": power["diesel_mw"], "battery": max(0.0, power["battery_power_mw"])}
+        for key, amount in source_mw.items():
+            if amount <= 0.02:
+                continue
+            x0, y0, _ = nodes[key]; x1, y1, _ = nodes["bus"]
+            fig.add_trace(go.Scatter(x=[x0+.11, x1-.08], y=[y0, y1], mode="lines",
+                line={"color": source_colors[key], "width": 1.5 + min(10, amount / 4)},
+                hovertemplate=f"{key.title()} → mine bus · {amount:.2f} MW<extra></extra>", showlegend=False))
+        for key, amount, color in [
+            ("site", power["site_load_mw"], "#4c78a8"),
+            ("water", power["water_load_mw"], "#43aa8b"),
+            ("process", power["process_load_mw"], "#e07a5f")]:
+            x0, y0, _ = nodes["bus"]
+            x1, y1, _ = nodes[key]
+            fig.add_trace(go.Scatter(x=[x0+.08, x1-.13], y=[y0, y1], mode="lines",
+                line={"color": color, "width": 1.5 + min(10, amount / 4)},
+                hovertemplate=f"Mine bus → {key.title()} · {amount:.2f} MW<extra></extra>", showlegend=False))
+        for key, (x, y, label) in nodes.items():
+            fig.add_annotation(x=x, y=y, text=label, showarrow=False, align="center",
+                bgcolor="white", bordercolor="#aab7c4", borderwidth=1, borderpad=7,
+                font={"size": 11, "color": "#243746"})
+        fig.update_layout(height=390, margin={"l": 8, "r": 8, "t": 8, "b": 8},
+            xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},
+            plot_bgcolor="white", paper_bgcolor="white", uirevision="electrical-network")
+        st.plotly_chart(fig, width="stretch")
+        history = pd.DataFrame(power["history"])
+        if not history.empty:
+            left, right = st.columns(2)
+            with left:
+                trend = px.line(history, x="sim_seconds", y=["frequency_hz"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Frequency (Hz)"},
+                    color_discrete_sequence=["#277da1"])
+                trend.add_hline(y=49.5, line_dash="dash", line_color="#d1495b", annotation_text="Underfrequency alarm")
+                trend.update_layout(uirevision="power-frequency-trend")
+                st.plotly_chart(trend, width="stretch")
+            with right:
+                trend = px.line(history, x="sim_seconds", y=["grid_import_mw", "solar_mw", "diesel_mw", "battery_soc_pct"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "MW / battery %", "variable": "Source"},
+                    color_discrete_sequence=["#277da1", "#f2a541", "#e07a5f", "#9b5de5"])
+                trend.update_layout(uirevision="power-dispatch-trend")
+                st.plotly_chart(trend, width="stretch")
+        else:
+            st.info("Start the factory or run the grid disturbance scenario to build dispatch trends.")
+        st.markdown("**Fault drills:** run `mine-grid-support-and-recovery`; compare battery response with diesel start delay, watch import limits and process curtailment, then observe source and process recovery when the event expires.")
+
+    with tabs[8]:
         st.subheader("Investigation missions")
         st.markdown("Use these as exercises: form hypotheses, locate evidence across areas, identify first-out signals, and propose what a unified monitoring layer should show.")
         missions = [

@@ -60,7 +60,7 @@ class CopperConcentratorTests(unittest.TestCase):
         ids = [tag["tag"] for tag in first]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertIn("grinding_and_flotation.sag_mill.motor_power", ids)
-        self.assertIn("mine_power_network.concentrator_substation.active_power", ids)
+        self.assertNotIn("mine_power_network.concentrator_substation.active_power", ids)
         self.assertIn("water_supply_network.concentrator_process.water_demand", ids)
         self.assertIn("open-pit_mining.pit_sector_a.rom_stockpile", ids)
 

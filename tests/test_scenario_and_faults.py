@@ -20,6 +20,16 @@ def simulation_state() -> dict:
 
 
 class ScenarioRunnerTests(unittest.TestCase):
+    def test_mine_grid_support_scenario_has_reserve_and_recovery_evidence(self):
+        runner = ScenarioRunner()
+        definition = runner.definition("mine-grid-support-and-recovery")
+        self.assertEqual(definition.steps[0].parameters["target_area"], "Grid transmission")
+        self.assertEqual(definition.steps[0].parameters["severity"], "Large")
+        self.assertGreater(definition.duration_seconds, definition.steps[0].at_seconds
+                           + definition.steps[0].parameters["duration_seconds"])
+        self.assertTrue(any("battery" in note.lower() and "diesel" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_scenario_actions_are_dispatched_at_their_simulated_offset(self):
         runner = ScenarioRunner()
         sim = simulation_state()

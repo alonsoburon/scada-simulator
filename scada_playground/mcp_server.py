@@ -207,6 +207,17 @@ def get_concentrator_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_power_network_state() -> dict[str, Any]:
+    """Read grid import, generation, storage, frequency, voltage, and feeder capacity."""
+    data = snapshot()
+    power = data.get("power_network")
+    if not power:
+        raise RuntimeError("Power network model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **power}
+
+
+@mcp.tool()
 def list_protocol_faults() -> dict[str, Any]:
     """List active protocol-output faults and their simulation-time expiry."""
     data = snapshot()

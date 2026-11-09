@@ -188,7 +188,8 @@ class MineWaterNetwork:
         return flow_m3h, pressure_drop_kpa
 
     def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17,
-                concentrator_demand_m3h: float = 0.0) -> None:
+                concentrator_demand_m3h: float = 0.0,
+                power_available_fraction: float | None = None) -> None:
         """Advance one second with PI level controls, hydraulic links and delayed transport."""
         state["sim_seconds"] = sim_seconds
         state["sensor_rng_seed"] = seed
@@ -201,8 +202,10 @@ class MineWaterNetwork:
         state["water_recovery_pct"] = 68.0 if stress == 1.0 else max(35.0, 68.0 - (stress - 1.0) * 18)
         degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
                            for e in active_events if e["name"] == "Mechanical degradation"), default=1.0)
-        utility_factor = min(({"Small": 0.75, "Medium": 0.42, "Large": 0.0}[e["severity"]]
-                              for e in active_events if e["name"] == "Utility loss"), default=1.0)
+        utility_factor = (max(0.0, min(1.0, power_available_fraction))
+                          if power_available_fraction is not None else
+                          min(({"Small": 0.75, "Medium": 0.42, "Large": 0.0}[e["severity"]]
+                               for e in active_events if e["name"] == "Utility loss"), default=1.0))
 
         # PI loops regulate the three pumped tank inlets. Output moves through a VFD ramp limit.
         for name, pump in state["pumps"].items():

@@ -28,6 +28,22 @@ class ScenarioDefinition:
 
 
 SCENARIOS = {
+    "mine-grid-support-and-recovery": ScenarioDefinition(
+        scenario_id="mine-grid-support-and-recovery",
+        name="Mine grid disturbance and reserve dispatch",
+        description="A transmission trip islands the mine grid and exercises battery response, diesel start/ramp, process load shedding, and recovery.",
+        duration_seconds=5_400,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                             "target_area": "Grid transmission", "duration_seconds": 3_600}),
+        ),
+        expected_observations=(
+            "The Large transmission event opens the intertie; the battery responds first, then the diesel generators start and ramp onto the islanded mine bus.",
+            "When import and reserves cannot cover demand, noncritical site load sheds first and the process feeder limits concentrator power.",
+            "Mine bus frequency and voltage respond to the supply deficit; water storage temporarily buffers pump-power reductions.",
+            "After the transmission restriction clears, the tie-line recovers, the diesel units ramp down, storage recharges, and process loads recover.",
+        ),
+    ),
     "haulage-crusher-buffer": ScenarioDefinition(
         scenario_id="haulage-crusher-buffer",
         name="Haul truck cycles and crusher stoppage",

@@ -2,7 +2,7 @@
 
 A local synthetic industrial operations world for developers building, testing, and demoing SCADA monitoring integrations. One simulator publishes the same values through Modbus TCP, OPC UA, MQTT, and MCP, with a small operator UI and a separate live fleet map.
 
-It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, 197 equipment units, and about 1,600 tags**. The mine-water network, copper concentrator, and haulage fleet have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
+It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, 197 equipment units, and about 1,500 tags**. The mine electrical network, water network, copper concentrator, and haulage fleet have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
 
 > Everything here is simulated. It is not a PLC, a process engineering model, a safety system, or a connection to real equipment.
 
@@ -45,6 +45,7 @@ MCP tag reads show the canonical simulator snapshot. Protocol faults are applied
 - `get_haulage_state`: read truck cycle states, delivery rate, payload/fuel tags, and ROM dispatch holds.
 - `get_water_network_state`: read water tank inventories, pipe flows, pressure, demand, and spill.
 - `get_concentrator_state`: read ore buffers, grinding limits, product size, recovery, water use, and power.
+- `get_power_network_state`: read grid import, diesel/solar/storage dispatch, frequency, voltage, load shedding, and feeder limits.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
 - `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
 - `step_simulation`: advance a paused run by an exact number of simulated seconds.
@@ -76,6 +77,7 @@ The sidebar's **Scenario replay** panel and the MCP `run_scenario` tool run a na
 
 Built-in scenarios:
 
+- `mine-grid-support-and-recovery`: a large transmission trip islands the mine grid and exercises battery response, diesel start/ramp, frequency, load shedding, and process recovery.
 - `haulage-crusher-buffer`: a long crusher conveyor trip lets discrete truck loads fill ROM and pause dispatch; recovery draws the stockpile down until truck loading resumes.
 - `concentrator-mill-degradation`: changing ore hardness, grinding degradation, and a mine power disturbance propagate into grind size, flotation recovery, water demand, and buffered inventories.
 - `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
@@ -113,6 +115,12 @@ The **Mobile fleet** map and telemetry share a route-driven cycle for twelve hau
 
 This remains a route abstraction: it does not calculate road grade from elevation, truck traction/braking physics, tire health failure probability, collision avoidance, autonomous dispatch optimization, shovel dig cycles, or calibrated fuel maps. Truck delivery is discrete, while the crusher and downstream process retain their own capacity limits.
 
+## Mine electrical network
+
+Grid generation, two transmission paths, substations, distribution feeders, and the mine substation publish values from a shared dispatch model. It carries about 44 MW of normal import capacity, variable solar output, two diesel units with a 20-second start delay and finite ramp, and a 20 MWh battery with a 6 MW inverter. The model serves site auxiliaries, water pumps, and the concentrator subject to transformer and feeder limits. During a deficit it sheds auxiliary load first, then limits process and water power; the resulting frequency/voltage response and battery state feed alarms and regular tags. A Large `Utility loss` in Grid transmission trips the intertie and islands the mine bus; smaller events derate the import path. Targeting Grid distribution, Mine power network, or Grid generation exercises local feeder, transformer, or source constraints. Replay `mine-grid-support-and-recovery` to inspect reserves and recovery.
+
+This is a low-compute balanced network approximation. It does not solve AC power flow, voltage angles, protection curves, relay coordination, harmonic propagation, reactive-power capability, generator governors in detail, or actual island resynchronization. Frequency is a damped aggregate response, while voltage droop is a supervisory proxy. Use it to exercise SCADA source/feeder telemetry, alarms, reserve transitions, and cross-system process response, not to size equipment or validate protection settings.
+
 Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.line_voltage`. Values have explicit engineering units, limits, quality, last-change reason, and snapshot timestamp. GPS coordinates and roads are fictional and geographically positioned near Escondida only for context.
 
 ## Configuration and development
@@ -124,7 +132,7 @@ Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.lin
 - Runtime snapshots, register maps, command files, virtual environments, and secrets are ignored by Git.
 - Run the fast deterministic model/fault tests with `./.venv/bin/python -m unittest discover -s tests -v`.
 
-The runtime is split into focused modules: `process_model.py` advances unmodeled synthetic areas, `water_network.py` handles mine-water hydraulics and level controllers, `concentrator.py` models ore processing, `haulage.py` models truck cycles, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Water, haulage, and mineral processing now share explicit process and inventory connections; other areas still use generated behavioral heuristics. The project does not yet execute PLC scan logic, model a complete protection system, or provide an industrial security stack.
+The runtime is split into focused modules: `process_model.py` advances unmodeled synthetic areas, `power_network.py` dispatches the mine electrical network, `water_network.py` handles mine-water hydraulics and level controllers, `concentrator.py` models ore processing, `haulage.py` models truck cycles, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Power, water, haulage, and mineral processing share explicit operating constraints and process connections; other areas still use generated behavioral heuristics. The project does not yet execute PLC scan logic, model a complete protection system, or provide an industrial security stack.
 
 ## Safety and network scope
 

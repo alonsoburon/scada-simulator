@@ -68,7 +68,8 @@ class CopperConcentrator:
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
-                mine_delivery_t: float | None = None) -> None:
+                mine_delivery_t: float | None = None,
+                power_available_fraction: float | None = None) -> None:
         """Advance coupled ore, comminution, flotation, water and power balances."""
         state["sim_seconds"] = sim_seconds
         state["noise_seed"] = seed
@@ -96,7 +97,8 @@ class CopperConcentrator:
         crusher_capacity = 1_460.0 * state["crusher_condition"] * jam_factor
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
-        power_factor = max(0.0, 1.0 - utility * 0.82)
+        power_factor = (max(0.0, min(1.0, power_available_fraction))
+                        if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
         plant_target *= min(water_factor, power_factor)
 
         sag_power_cap = 21.0 * state["sag_condition"] * power_factor
@@ -295,13 +297,7 @@ class CopperConcentrator:
                         "value": round(min(high, max(low, value)), 3), "quality": "GOOD", "low": low,
                         "high": high, "base": (low + high) / 2, "phase": 0.0,
                         "last_change": "Dynamic concentrator process model"})
-        # Plant-wide loads and fresh-water demand are tags on shared utility systems.
-        power = state["sag_power_mw"] + state["ball_power_mw"] + state["crusher_power_mw"]
         rows.extend([
-            {"tag": "mine_power_network.concentrator_substation.active_power", "area": "Mine power network",
-             "unit": "Concentrator substation", "sensor": "active_power", "units": "MW",
-             "value": round(power, 3), "quality": "GOOD", "low": 0, "high": 50, "base": 25,
-             "phase": 0.0, "last_change": "Concentrator electrical demand"},
             {"tag": "water_supply_network.concentrator_process.water_demand", "area": "Water supply network",
              "unit": "Concentrator process", "sensor": "water_demand", "units": "m³/h",
              "value": round(state["water_makeup_m3h"], 2), "quality": "GOOD", "low": 0, "high": 700,
