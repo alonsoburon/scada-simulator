@@ -34,13 +34,18 @@ All endpoints bind to loopback (`127.0.0.1`) by default. They have no authentica
 
 The protocol gateway updates from the same atomic snapshot as the dashboard. For normal SCADA reader development, use Modbus, OPC UA, or MQTT. MCP is a companion surface for compatible agents and applications that need structured discovery, queries, or test-scenario control.
 
+MCP tag reads show the canonical simulator snapshot. Protocol faults are applied independently inside each protocol adapter, so inspect Modbus/OPC UA/MQTT to observe a protocol fault's effect.
+
 ## MCP tools
 
-- `get_plant_status`, `list_systems`, `list_scenarios`: discover the simulator and valid incident inputs.
+- `get_plant_status`, `list_systems`, `list_scenarios`: discover the simulator, valid incidents, and built-in replays.
 - `search_tags`: filter tags by substring, area, asset, or quality; paginated.
 - `read_tags`: read up to 200 exact tag IDs from one snapshot. Each sample includes units, engineering limits, quality, and timestamp.
 - `get_alarms`, `get_fleet_positions`: read alarm records and simulated vehicle locations/state.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
+- `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
+- `step_simulation`: advance a paused run by an exact number of simulated seconds.
+- `inject_protocol_fault`, `list_protocol_faults`, `clear_protocol_faults`: inject and manage per-protocol telemetry faults.
 - Resources: `scada://plant/status`, `scada://plant/systems`, `scada://plant/scenarios`.
 
 Control commands are applied by the active dashboard session and acknowledged only after its next snapshot is published. Keep at least one dashboard tab open; a command times out if no session processes it within 20 seconds. MCP cannot write to any industrial protocol endpoint or physical equipment.
@@ -62,6 +67,20 @@ For Streamable HTTP clients, use `http://127.0.0.1:8503/mcp` while the playgroun
 
 The stdio server reads the same snapshot and uses the same command mailbox. The dashboard session must be running to advance the simulation or apply control commands.
 
+## Deterministic scenarios and edge cases
+
+The sidebar's **Scenario replay** panel and the MCP `run_scenario` tool run a named scenario from a selected seed. The simulator resets first, records the seed and scenario timeline, and stops at the scenario's end. Stop to pause, use **Step +1 simulated second** (or `step_simulation`) to inspect a boundary, then run the same scenario and seed to replay it.
+
+Built-in scenarios:
+
+- `grid-comms-recovery`: simulated network partition in Grid distribution, stale quality, then recovery.
+- `frozen-signal`: freeze one signal while simulation time and other values continue.
+- `mqtt-tag-gap`: omit one tag from MQTT batches temporarily, then restore it.
+
+The protocol fault injector supports `stale`, `bad`, `freeze`, and `suppress`, targeted at an area or exact tag and scoped to Modbus TCP, OPC UA, MQTT, or all. Durations are in simulated seconds; `0` means keep the fault active until cleared. `freeze` holds the value while retaining GOOD quality, which is useful for stuck-sensor detection. `suppress` omits a tag from MQTT batches. Because Modbus register addresses and OPC UA nodes are stable, those two protocols keep the tag present and report BAD quality for a suppressed tag. Faults change protocol output only; the canonical process values remain untouched.
+
+For an edge-case drill, run `mqtt-tag-gap` with seed `17`, subscribe to the Grid distribution area topic, and confirm the selected tag disappears and later reappears. Run `frozen-signal`, compare the selected tag through all three protocols while the simulation clock advances, and confirm that clearing the fault lets its value move again.
+
 ## Scenarios and tag data
 
 The included incident types are Signal drift, Network partition, Utility loss, Mechanical degradation, Process upset, and Conveyor jam. Each has Small, Medium, and Large severity and can target a plant area or `Whole factory`. Incidents create alarm records and change synthetic values or quality. A network partition marks affected readings `STALE`; the effect clears when its simulated duration expires or the simulation is reset.
@@ -75,8 +94,9 @@ Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.lin
 - `SCADA_SNAPSHOT_PATH` can point the stdio MCP server at a snapshot in a different checkout.
 - `SCADA_COMMAND_DIR` can override the MCP command-mailbox directory.
 - Runtime snapshots, register maps, command files, virtual environments, and secrets are ignored by Git.
+- Run the fast deterministic model/fault tests with `./.venv/bin/python -m unittest discover -s tests -v`.
 
-See [the simulator implementation](scada_playground/) for the process/UI, protocol gateway, and MCP server. The simulation uses simplified heuristics rather than calibrated mass/energy models, and it does not implement a control system or industrial security stack.
+The runtime is split into focused modules: `process_model.py` advances synthetic plant state, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. The simulation uses simplified heuristics rather than calibrated mass/energy models, and it does not implement a control system or industrial security stack.
 
 ## Safety and network scope
 

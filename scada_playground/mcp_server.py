@@ -15,6 +15,9 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from protocol_faults import FAULT_MODES, PROTOCOLS
+from scenarios import SCENARIOS
+
 
 ROOT = Path(__file__).resolve().parent
 SNAPSHOT = Path(os.environ.get("SCADA_SNAPSHOT_PATH", ROOT / ".runtime" / "factory_snapshot.json"))
@@ -80,6 +83,8 @@ def get_plant_status() -> dict[str, Any]:
         "quality_counts": qualities,
         "alarm_count": len(data["alarms"]),
         "write_scope": "simulation controls only",
+        "active_scenario": data.get("scenario_run"),
+        "active_protocol_fault_count": len(data.get("protocol_faults", [])),
     }
 
 
@@ -102,7 +107,8 @@ def list_scenarios() -> dict[str, Any]:
     data = snapshot()
     return {"simulated_only": True, "incident_types": data.get("available_incidents", []),
             "severity_levels": ["Small", "Medium", "Large"],
-            "target_areas": data.get("available_areas", [])}
+            "target_areas": data.get("available_areas", []),
+            "scenarios": data.get("available_scenarios", [])}
 
 
 @mcp.tool()
@@ -163,6 +169,14 @@ def get_fleet_positions(vehicle_type: str = "") -> dict[str, Any]:
             "simulated": True, "vehicles": fleet}
 
 
+@mcp.tool()
+def list_protocol_faults() -> dict[str, Any]:
+    """List active protocol-output faults and their simulation-time expiry."""
+    data = snapshot()
+    return {"snapshot_timestamp": data["timestamp"], "sim_seconds": data["sim_seconds"],
+            "faults": data.get("protocol_faults", [])}
+
+
 def submit_command(command: dict[str, Any]) -> dict[str, Any]:
     """Submit a validated simulation-only command and await simulator response."""
     command_id = uuid.uuid4().hex
@@ -187,7 +201,7 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
-                       target_area: str = "Whole factory") -> dict[str, Any]:
+                       target_area: str = "Whole factory", duration_seconds: int = 0) -> dict[str, Any]:
     """Control only the synthetic simulator: start, stop, reset, acknowledge alarms, or inject_incident.
 
     For incident injection, pass a known incident_name, severity Small/Medium/Large,
@@ -206,8 +220,68 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
             raise ValueError("Unknown incident_name; use one of the simulator's configured incident types")
         if target_area not in data.get("available_areas", []):
             raise ValueError("Unknown target_area; use a configured plant area or Whole factory")
+        if duration_seconds < 0 or duration_seconds > 86_400:
+            raise ValueError("duration_seconds must be 0 (severity default) or between 1 and 86,400")
     return submit_command({"action": action, "incident_name": incident_name,
-                           "severity": severity, "target_area": target_area})
+                           "severity": severity, "target_area": target_area,
+                           "duration_seconds": duration_seconds})
+
+
+@mcp.tool()
+def run_scenario(scenario_id: str, seed: int = 17) -> dict[str, Any]:
+    """Reset and run a named deterministic scenario from its start; same seed replays the same timeline."""
+    if scenario_id not in SCENARIOS:
+        raise ValueError(f"scenario_id must be one of: {', '.join(SCENARIOS)}")
+    if not 0 <= seed <= 2**32 - 1:
+        raise ValueError("seed must be between 0 and 4,294,967,295")
+    return submit_command({"action": "run_scenario", "scenario_id": scenario_id, "seed": seed})
+
+
+@mcp.tool()
+def step_simulation(seconds: int = 1) -> dict[str, Any]:
+    """Advance a paused simulation by exactly 1-300 simulated seconds."""
+    if not 1 <= seconds <= 300:
+        raise ValueError("seconds must be between 1 and 300")
+    return submit_command({"action": "step", "seconds": seconds})
+
+
+@mcp.tool()
+def inject_protocol_fault(protocol: Literal["all", "Modbus TCP", "OPC UA", "MQTT"],
+                          mode: Literal["stale", "bad", "freeze", "suppress"],
+                          selector_type: Literal["area", "tag"], target: str,
+                          duration_seconds: int = 0) -> dict[str, Any]:
+    """Alter only a selected protocol's telemetry output, never simulator process state.
+
+    Modes: stale/bad override quality; freeze holds a GOOD-quality value. suppress omits
+    MQTT tags, while fixed-address Modbus and stable-node OPC UA report BAD quality.
+    Duration 0 means indefinite until cleared; other durations use simulation seconds.
+    """
+    if protocol not in PROTOCOLS or mode not in FAULT_MODES:
+        raise ValueError("Unsupported protocol or fault mode")
+    if selector_type not in {"area", "tag"}:
+        raise ValueError("selector_type must be area or tag")
+    if not 0 <= duration_seconds <= 86_400:
+        raise ValueError("duration_seconds must be 0 or between 1 and 86,400")
+    data = snapshot()
+    target_key = target.strip().casefold()
+    matches = [tag for tag in data["tags"]
+               if (tag["tag"].casefold() == target_key if selector_type == "tag"
+                   else tag["area"].casefold() == target_key)]
+    if not matches:
+        raise ValueError(f"No {selector_type} matches {target!r}")
+    return submit_command({"action": "inject_protocol_fault", "protocol": protocol, "mode": mode,
+                           "selector_type": selector_type, "target": target,
+                           "duration_seconds": duration_seconds})
+
+
+@mcp.tool()
+def clear_protocol_faults(fault_id: str = "") -> dict[str, Any]:
+    """Clear one active protocol fault by ID, or all active faults when fault_id is empty."""
+    if fault_id:
+        active = {fault["id"] for fault in snapshot().get("protocol_faults", [])}
+        if fault_id not in active:
+            raise ValueError(f"No active protocol fault has ID {fault_id}")
+    return submit_command({"action": "clear_protocol_faults", "fault_id": fault_id})
 
 
 @mcp.resource("scada://plant/status")

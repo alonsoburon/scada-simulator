@@ -18,6 +18,8 @@ from pymodbus.datastore import ModbusDeviceContext, ModbusServerContext, ModbusS
 from pymodbus.server import ModbusTcpServer
 import uvicorn
 
+from protocol_faults import ProtocolFaultInjector
+
 
 ROOT = Path(__file__).resolve().parent
 SNAPSHOT = ROOT / ".runtime" / "factory_snapshot.json"
@@ -177,6 +179,9 @@ def mqtt_publish(client: mqtt.Client, snapshot: dict) -> None:
     client.publish("scada/factory/alarms/state", json.dumps({
         "timestamp": timestamp, "alarms": snapshot["alarms"],
     }, separators=(",", ":")), qos=1, retain=True)
+    client.publish("scada/factory/faults/protocol", json.dumps({
+        "timestamp": timestamp, "faults": snapshot.get("protocol_faults", []),
+    }, separators=(",", ":")), qos=1, retain=True)
 
 
 async def main() -> None:
@@ -212,6 +217,7 @@ async def main() -> None:
     publisher.loop_start()
 
     server, opc_nodes = await build_opcua()
+    fault_injector = ProtocolFaultInjector()
     logging.info("Modbus TCP listening on 127.0.0.1:1502, unit ID 1 (FC04 input registers)")
     logging.info("OPC UA listening on opc.tcp://127.0.0.1:4840/factory/server/")
     logging.info("MQTT broker listening on 127.0.0.1:1883; publishing scada/factory/#")
@@ -222,13 +228,16 @@ async def main() -> None:
         async with server:
             while True:
                 snapshot = load_snapshot()
-                tags = snapshot["tags"]
-                write_modbus(context, tags)
-                for tag in tags:
+                fault_injector.sync(snapshot)
+                modbus_view = fault_injector.apply(snapshot, "Modbus TCP")
+                opcua_view = fault_injector.apply(snapshot, "OPC UA")
+                mqtt_view = fault_injector.apply(snapshot, "MQTT")
+                write_modbus(context, modbus_view["tags"])
+                for tag in opcua_view["tags"]:
                     value_node, quality_node, _units_node = opc_nodes[tag["tag"]]
                     await value_node.write_value(float(tag["value"]))
                     await quality_node.write_value(str(tag["quality"]))
-                mqtt_publish(publisher, snapshot)
+                mqtt_publish(publisher, mqtt_view)
                 await asyncio.sleep(1.0)
     finally:
         publisher.loop_stop()

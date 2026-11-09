@@ -5,13 +5,17 @@ import random
 import time
 import json
 import os
-from dataclasses import dataclass
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+from process_model import FactoryProcessModel
+from protocol_faults import FAULT_MODES, PROTOCOLS, ProtocolFaultInjector
+from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
 
 
 AREAS = {
@@ -161,19 +165,17 @@ def fleet_motion(unit: str, sim_seconds: int) -> tuple[float, float, float, floa
     return route[0][1], route[0][2], 0.0, 0.0, 0.0, "Stopped"
 
 
-@dataclass
-class Event:
-    name: str
-    area: str
-    severity: str
-    started: float
-    duration: float
-    event_id: int
+PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
+SCENARIO_RUNNER = ScenarioRunner()
+PROTOCOL_FAULTS = ProtocolFaultInjector()
 
 
-def initialize() -> None:
+def initialize(seed: int = 17) -> None:
     if "sim" not in st.session_state:
-        rng = random.Random(17)
+        if not 0 <= int(seed) <= 2**32 - 1:
+            raise ValueError("Seed must be between 0 and 4,294,967,295")
+        seed = int(seed)
+        rng = random.Random(seed)
         tags = []
         for area, units in AREAS.items():
             area_sensors = (MINING_SENSORS if any(k in area.lower() for k in ("mining", "crushing", "grinding", "concentrate", "tailings"))
@@ -202,8 +204,18 @@ def initialize() -> None:
                                      "low": low, "high": high, "base": gps_base, "value": gps_base,
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
-        st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "events": [], "history": [],
-                                "alarms": [], "next_event": 1, "last_tick": time.time(), "factory_on": False}
+        st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
+                                "simulation_id": uuid.uuid4().hex,
+                                "events": [], "history": [], "alarms": [], "next_event": 1,
+                                "protocol_faults": [], "next_fault_id": 1, "scenario_run": None,
+                                "last_tick": time.time(), "factory_on": False}
+    else:
+        sim = st.session_state.sim
+        sim.setdefault("seed", int(seed))
+        sim.setdefault("simulation_id", uuid.uuid4().hex)
+        sim.setdefault("protocol_faults", [])
+        sim.setdefault("next_fault_id", 1)
+        sim.setdefault("scenario_run", None)
 
 
 def publish_snapshot() -> dict:
@@ -214,8 +226,13 @@ def publish_snapshot() -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sim_seconds": sim["tick"],
         "running": sim["running"],
+        "seed": sim["seed"],
+        "simulation_id": sim["simulation_id"],
         "available_areas": ["Whole factory", *AREAS.keys()],
         "available_incidents": list(INCIDENTS),
+        "available_scenarios": SCENARIO_RUNNER.catalog(),
+        "scenario_run": sim["scenario_run"],
+        "protocol_faults": sim["protocol_faults"],
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
                   "value": t["value"], "units": t["units"], "quality": t["quality"],
                   "low": t["low"], "high": t["high"], "last_change": t["last_change"]} for t in sim["tags"]],
@@ -238,13 +255,20 @@ def publish_snapshot() -> dict:
     return payload
 
 
-def inject(name: str, area: str, severity: str) -> None:
-    sim = st.session_state.sim
-    duration = {"Small": 90, "Medium": 240, "Large": 600}[severity]
-    sim["events"].append(Event(name, area, severity, sim["tick"], duration, sim["next_event"]))
-    sim["next_event"] += 1
-    sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": severity.upper(),
-                            "message": f"{name} injected in {area}", "state": "ACTIVE / UNACK"})
+def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
+    params = step.parameters
+    if step.action == "incident":
+        PROCESS_MODEL.inject(sim, params["incident_name"], params["target_area"], params["severity"],
+                             params.get("duration_seconds"))
+    elif step.action == "protocol_fault":
+        PROTOCOL_FAULTS.add(sim, params["protocol"], params["mode"], params["selector_type"],
+                            params["target"], params["duration_seconds"])
+    else:
+        raise ValueError(f"Scenario action is not supported: {step.action}")
+
+
+def inject(name: str, area: str, severity: str, duration_seconds: int | None = None) -> None:
+    PROCESS_MODEL.inject(st.session_state.sim, name, area, severity, duration_seconds)
 
 
 def process_mcp_commands() -> list[tuple[str, dict]]:
@@ -262,27 +286,53 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
             sim = st.session_state.sim
             if action == "start":
                 sim["running"] = sim["factory_on"] = True
+                SCENARIO_RUNNER.resume(sim)
                 message = "Synthetic factory started."
             elif action == "stop":
                 sim["running"] = False
+                SCENARIO_RUNNER.pause(sim)
                 message = "Synthetic factory stopped."
             elif action == "reset":
+                PROTOCOL_FAULTS.clear(sim)
                 st.session_state.pop("sim", None)
-                initialize()
+                initialize(int(command.get("seed", 17)))
                 sim = st.session_state.sim
-                message = "Synthetic factory reset to its initial state."
+                message = f"Synthetic factory reset with seed {sim['seed']}."
+            elif action == "step":
+                seconds = int(command.get("seconds", 1))
+                if sim["running"]:
+                    raise ValueError("Pause the simulator before single-stepping")
+                if not 1 <= seconds <= 300:
+                    raise ValueError("Single-step size must be between 1 and 300 simulated seconds")
+                for _ in range(seconds):
+                    advance(force=True)
+                sim = st.session_state.sim
+                message = f"Advanced exactly {seconds} simulated seconds while paused."
+            elif action == "run_scenario":
+                scenario_id = command.get("scenario_id", "")
+                seed = int(command.get("seed", 17))
+                PROTOCOL_FAULTS.clear(sim)
+                st.session_state.pop("sim", None)
+                initialize(seed)
+                sim = st.session_state.sim
+                SCENARIO_RUNNER.start(sim, scenario_id, seed, apply_scenario_action)
+                message = f"Started/replayed scenario '{SCENARIO_RUNNER.definition(scenario_id).name}' with seed {seed}."
             elif action == "inject_incident":
                 name = command.get("incident_name", "")
                 severity = command.get("severity", "")
                 area = command.get("target_area", "")
-                if name not in INCIDENTS:
-                    raise ValueError("Unknown incident_name")
-                if severity not in ("Small", "Medium", "Large"):
-                    raise ValueError("Severity must be Small, Medium, or Large")
-                if area != "Whole factory" and area not in AREAS:
-                    raise ValueError("Unknown target_area")
-                inject(name, area, severity)
+                duration = command.get("duration_seconds")
+                inject(name, area, severity, duration)
                 message = f"{severity} {name} injected in {area}. Start the factory to evolve its simulated process effects."
+            elif action == "inject_protocol_fault":
+                fault = PROTOCOL_FAULTS.add(
+                    sim, command.get("protocol", ""), command.get("mode", ""),
+                    command.get("selector_type", ""), command.get("target", ""),
+                    int(command.get("duration_seconds", 0)))
+                message = f"Protocol fault {fault['id']} injected."
+            elif action == "clear_protocol_faults":
+                count = PROTOCOL_FAULTS.clear(sim, command.get("fault_id", ""))
+                message = f"Cleared {count} protocol fault(s)."
             elif action == "acknowledge_alarms":
                 sim["alarms"] = [{**alarm, "state": "ACTIVE / ACK" if alarm["state"] == "ACTIVE / UNACK" else alarm["state"]}
                                   for alarm in sim["alarms"]]
@@ -309,58 +359,14 @@ def publish_mcp_results(results: list[tuple[str, dict]], published_snapshot: dic
         os.replace(temporary_path, result_path)
 
 
-def advance() -> None:
+def advance(force: bool = False) -> None:
     sim = st.session_state.sim
-    if not sim["running"]:
+    if not sim["running"] and not force:
         return
-    sim["tick"] += 1
-    rng = random.Random(8000 + sim["tick"])
-    expired = [e for e in sim["events"] if sim["tick"] - e.started >= e.duration]
-    for e in expired:
-        sim["alarms"].insert(0, {"time": sim["tick"], "area": e.area, "severity": "INFO",
-                                "message": f"{e.name} cleared in {e.area}", "state": "CLEARED"})
-    live = [e for e in sim["events"] if e not in expired]
-    sim["events"] = live
-    active_by_area = {a: [e for e in live if e.area in (a, "Whole factory")] for a in AREAS}
-    for tag in sim["tags"]:
-        if tag["sensor"] in ("gps_latitude", "gps_longitude", "gps_speed", "heading", "payload"):
-            latitude, longitude, speed, heading, payload, _state = fleet_motion(tag["unit"], sim["tick"])
-            telemetry_value = {"gps_latitude": latitude, "gps_longitude": longitude,
-                               "gps_speed": speed, "heading": heading, "payload": payload}[tag["sensor"]]
-            tag["value"] = round(telemetry_value, 3)
-            tag["quality"] = "GOOD"
-            tag["last_change"] = "Moving along simulated route"
-            continue
-        base = tag["base"]
-        span = tag["high"] - tag["low"]
-        value = base + span * (0.012 * (rng.random() - .5) + .018 * __import__("math").sin(sim["tick"] / 67 + tag["phase"]))
-        issues = active_by_area[tag["area"]]
-        for event in issues:
-            intensity = {"Small": .12, "Medium": .34, "Large": .72}[event.severity]
-            kind = INCIDENTS[event.name]
-            if kind == "measurement" and tag["sensor"] in ("process_temperature", "line_pressure"):
-                value += span * intensity
-            elif kind == "mechanical" and tag["sensor"] in ("vibration_rms", "motor_current"):
-                value += span * intensity * .7
-            elif kind == "process" and tag["sensor"] in ("tank_level", "flow_rate", "process_temperature"):
-                value -= span * intensity * .45
-            elif kind == "utility" and tag["sensor"] in ("production_rate", "flow_rate", "line_pressure"):
-                value *= 1 - intensity
-            elif kind == "jam" and tag["sensor"] in ("production_rate", "motor_current", "vibration_rms"):
-                value += span * intensity * (1 if tag["sensor"] != "production_rate" else -1)
-            if kind == "comms":
-                tag["quality"] = "STALE"
-            else:
-                tag["quality"] = "GOOD"
-            tag["last_change"] = event.name
-        if not issues:
-            tag["quality"] = "GOOD"
-            tag["last_change"] = "Normal"
-        tag["value"] = round(min(tag["high"] * 1.15, max(tag["low"] - span*.1, value)), 2)
-    if sim["tick"] % 15 == 0:
-        snap = [{"time": sim["tick"], "tag": t["tag"], "value": t["value"], "quality": t["quality"]} for t in sim["tags"]]
-        sim["history"].extend(snap)
-        sim["history"] = sim["history"][-len(sim["tags"])*120:]
+    SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
+    PROCESS_MODEL.advance(sim, force=force)
+    SCENARIO_RUNNER.after_tick(sim)
+    PROTOCOL_FAULTS.expire(sim)
 
 
 st.set_page_config(page_title="Factory SCADA Playground", page_icon="🏭", layout="wide")
@@ -375,12 +381,30 @@ with st.sidebar:
     if st.button("▶ Start factory", type="primary", width="stretch"):
         sim["running"] = True
         sim["factory_on"] = True
+        SCENARIO_RUNNER.resume(sim)
     if st.button("⏸ Stop factory", width="stretch"):
         sim["running"] = False
+        SCENARIO_RUNNER.pause(sim)
     if st.button("↺ Reset simulation", width="stretch"):
+        PROTOCOL_FAULTS.clear(sim)
         del st.session_state["sim"]
         st.rerun()
+    if st.button("⏭ Step +1 simulated second", disabled=sim["running"], width="stretch"):
+        advance(force=True)
     speed = st.select_slider("Simulation speed", options=[1, 2, 5, 10, 30], value=5, format_func=lambda x: f"{x}×")
+    st.divider()
+    st.subheader("Scenario replay")
+    scenario_id = st.selectbox("Scenario", list(SCENARIOS),
+                               format_func=lambda key: SCENARIOS[key].name)
+    scenario_seed = st.number_input("Replay seed", min_value=0, max_value=2**32 - 1,
+                                    value=int(sim["seed"]), step=1)
+    if st.button("▶ Run / replay from reset", width="stretch"):
+        PROTOCOL_FAULTS.clear(sim)
+        st.session_state.pop("sim", None)
+        initialize(int(scenario_seed))
+        sim = st.session_state.sim
+        SCENARIO_RUNNER.start(sim, scenario_id, int(scenario_seed), apply_scenario_action)
+    st.caption("Same seed and scenario replay the same synthetic timeline. Stop to pause; single-step to inspect.")
     st.divider()
     st.subheader("Inject an incident")
     incident_name = st.selectbox("Incident", list(INCIDENTS))
@@ -389,6 +413,23 @@ with st.sidebar:
     if st.button("⚠ Inject incident", width="stretch"):
         inject(incident_name, target, severity)
     st.caption("Incidents change simulated sensor behavior and produce alarm events. They never connect to equipment.")
+    with st.expander("Protocol fault injector"):
+        fault_protocol = st.selectbox("Protocol", PROTOCOLS, key="fault_protocol")
+        fault_mode = st.selectbox("Fault mode", FAULT_MODES, key="fault_mode")
+        selector_type = st.selectbox("Target type", ["area", "tag"], key="fault_selector_type")
+        if selector_type == "area":
+            fault_target = st.selectbox("Target area", list(AREAS), key="fault_area_target")
+        else:
+            fault_target = st.selectbox("Exact tag", [tag["tag"] for tag in sim["tags"]], key="fault_tag_target")
+        fault_duration = st.number_input("Duration in simulated seconds (0 = until cleared)",
+                                         min_value=0, max_value=86_400, value=30, step=1)
+        if st.button("Inject protocol fault", width="stretch"):
+            PROTOCOL_FAULTS.add(sim, fault_protocol, fault_mode, selector_type,
+                                fault_target, int(fault_duration))
+        if sim["protocol_faults"]:
+            st.dataframe(pd.DataFrame(sim["protocol_faults"]), hide_index=True, width="stretch")
+            if st.button("Clear all protocol faults", width="stretch"):
+                PROTOCOL_FAULTS.clear(sim)
 
 st.subheader("Live fleet map")
 st.link_button("Open live fleet map", "http://127.0.0.1:8502/map", type="primary")
@@ -413,6 +454,14 @@ def render_dashboard():
     for col, label, value in zip(cols, ["Plant state", "Simulated time", "Tags", "Bad / stale quality", "Unacknowledged alarms"],
                                 ["RUNNING" if sim["running"] else "STOPPED", f"{sim['tick']//60:02}:{sim['tick']%60:02}", len(tags_df), bad, active_alarm_count]):
         col.metric(label, value)
+    scenario_run = sim.get("scenario_run")
+    if scenario_run:
+        elapsed = max(0, sim["tick"] - scenario_run["start_tick"])
+        progress = min(1.0, elapsed / max(1, scenario_run["duration_seconds"]))
+        st.caption(f"Scenario: **{scenario_run['name']}** · {scenario_run['status']} · seed {scenario_run['seed']} · {elapsed}/{scenario_run['duration_seconds']} simulated seconds")
+        st.progress(progress)
+    if sim["protocol_faults"]:
+        st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
     tabs = st.tabs(["Factory overview", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
     with tabs[0]:
