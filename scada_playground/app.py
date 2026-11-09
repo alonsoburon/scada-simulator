@@ -11,11 +11,13 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from process_model import FactoryProcessModel
 from protocol_faults import FAULT_MODES, PROTOCOLS, ProtocolFaultInjector
 from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
+from water_network import MineWaterNetwork
 
 
 AREAS = {
@@ -166,6 +168,7 @@ def fleet_motion(unit: str, sim_seconds: int) -> tuple[float, float, float, floa
 
 
 PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
+WATER_MODEL = MineWaterNetwork()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -204,8 +207,13 @@ def initialize(seed: int = 17) -> None:
                                      "low": low, "high": high, "base": gps_base, "value": gps_base,
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
+        water_state = WATER_MODEL.initialize()
+        water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
+        tags.extend(water_tags)
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
+                                "water_network": water_state,
                                 "simulation_id": uuid.uuid4().hex,
+                                "water_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
                                 "protocol_faults": [], "next_fault_id": 1, "scenario_run": None,
                                 "last_tick": time.time(), "factory_on": False}
@@ -216,12 +224,21 @@ def initialize(seed: int = 17) -> None:
         sim.setdefault("protocol_faults", [])
         sim.setdefault("next_fault_id", 1)
         sim.setdefault("scenario_run", None)
+        if "water_network" not in sim:
+            sim["water_network"] = WATER_MODEL.initialize()
+            water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
+            sim["tags"].extend(water_tags)
 
 
 def publish_snapshot() -> dict:
     """Publish one atomic local file snapshot for the separate protocol gateway."""
     sim = st.session_state.sim
     fleet_units = sorted({t["unit"] for t in sim["tags"] if t["area"] == "Mobile fleet"})
+    water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
+    water_by_tag = {tag["tag"]: tag for tag in water_tags}
+    for tag in sim["tags"]:
+        if tag["tag"] in water_by_tag:
+            tag.update(water_by_tag[tag["tag"]])
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sim_seconds": sim["tick"],
@@ -233,6 +250,7 @@ def publish_snapshot() -> dict:
         "available_scenarios": SCENARIO_RUNNER.catalog(),
         "scenario_run": sim["scenario_run"],
         "protocol_faults": sim["protocol_faults"],
+        "water_network": water_diagram[0],
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
                   "value": t["value"], "units": t["units"], "quality": t["quality"],
                   "low": t["low"], "high": t["high"], "last_change": t["last_change"]} for t in sim["tags"]],
@@ -365,6 +383,35 @@ def advance(force: bool = False) -> None:
         return
     SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
     PROCESS_MODEL.advance(sim, force=force)
+    water_events = [event.__dict__ for event in sim["events"]
+                    if event.area in ("Water supply network", "Whole factory")]
+    WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events)
+    water = sim["water_network"]
+    conditions = {
+        "process_tank_low": (water["nodes"]["process_tank"]["level_pct"] < 25,
+                              "Process water tank low level", "HIGH"),
+        "unmet_process_demand": (water["unmet_demand_m3h"] > 1,
+                                  "Process water demand is not being met", "CRITICAL"),
+        "raw_tank_high": (water["nodes"]["raw_tank"]["level_pct"] > 90,
+                           "Raw water tank high level", "HIGH"),
+    }
+    prior_states = sim.setdefault("water_alarm_states", {})
+    for alarm_key, (active, message, severity) in conditions.items():
+        was_active = prior_states.get(alarm_key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water supply network",
+                                     "severity": severity, "message": message,
+                                     "state": "ACTIVE / UNACK"})
+        elif was_active and not active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water supply network",
+                                     "severity": "INFO", "message": f"{message} cleared",
+                                     "state": "CLEARED"})
+        prior_states[alarm_key] = active
+    water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
+    water_by_tag = {tag["tag"]: tag for tag in water_tags}
+    for tag in sim["tags"]:
+        if tag["tag"] in water_by_tag:
+            tag.update(water_by_tag[tag["tag"]])
     SCENARIO_RUNNER.after_tick(sim)
     PROTOCOL_FAULTS.expire(sim)
 
@@ -463,7 +510,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
+    tabs = st.tabs(["Factory overview", "Water network", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -481,6 +528,79 @@ def render_dashboard():
         with c2:
             st.markdown("**Factory areas**")
             st.dataframe(overview[["area", "tags", "stale", "health"]].sort_values("area"), hide_index=True, width="stretch", height=560)
+    with tabs[1]:
+        water = sim["water_network"]
+        diagram = publish_snapshot()["water_network"]
+        st.markdown("### Mine water circuit · lumped mass-balance model")
+        st.caption("One simulated second per step. Tank storage changes by (inflow − outflow) × time; pump head, elevation, valve opening, demand, and recovery set link flows. Values are simulated training data, not a hydraulic design model.")
+        metric_cols = st.columns(4)
+        for col, label, value in zip(metric_cols, ["Process demand", "Water recovery", "Spilled water", "Unmet demand"],
+                                     [f"{water['demand_m3h']:.0f} m³/h", f"{water['water_recovery_pct']:.0f}%",
+                                      f"{water['total_spilled_m3']:.2f} m³", f"{water.get('unmet_demand_m3h', 0):.1f} m³/h"]):
+            col.metric(label, value)
+        with st.expander("Operator controls · simulated equipment only"):
+            pump_cols = st.columns(3)
+            for col, (pump_name, pump) in zip(pump_cols, water["pumps"].items()):
+                with col:
+                    pump["running"] = st.toggle(f"{pump_name} running", value=pump["running"], key=f"water_pump_{pump_name}")
+                    pump["speed_pct"] = st.slider(f"{pump_name} speed (%)", 0, 100, int(pump["speed_pct"]), key=f"water_speed_{pump_name}")
+            valve_cols = st.columns(4)
+            for col, (valve_name, opening) in zip(valve_cols, list(water["valves"].items())):
+                with col:
+                    water["valves"][valve_name] = st.slider(f"{valve_name} (%)", 0, 100, int(opening), key=f"water_valve_{valve_name}")
+        positions = {"north_reservoir": (0.08, .72), "raw_tank": (.34, .72),
+                     "process_tank": (.62, .72), "reclaim_pond": (.62, .23), "treated_tank": (.9, .23)}
+        node_x, node_y, node_text = [], [], []
+        for node in diagram["nodes"]:
+            x, y = positions[node["id"]]
+            node_x.append(x); node_y.append(y)
+            node_text.append(f"{node['label']}<br>{node['level_pct']:.1f}% · {node['volume_m3']:.0f}/{node['capacity_m3']:.0f} m³")
+        network_fig = go.Figure()
+        for link in diagram["links"]:
+            x0, y0 = positions[link["from"]]; x1, y1 = positions[link["to"]]
+            max_flow = WATER_MODEL.LINKS[link["id"]]["max_flow_m3h"]
+            flow_ratio = min(1.0, link["flow_m3h"] / max_flow)
+            color = "#277da1" if link["flow_m3h"] > 1 else "#d1495b"
+            network_fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines",
+                                              line={"color": color, "width": 2 + 7 * flow_ratio},
+                                              hovertemplate=f"{link['label']} · {link['flow_m3h']:.1f} m³/h<extra></extra>",
+                                              showlegend=False))
+        network_fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers+text",
+                                          marker={"size": 24, "color": ["#4c78a8", "#72a0c1", "#f2a541", "#43aa8b", "#277da1"],
+                                                  "line": {"color": "white", "width": 2}},
+                                          text=node_text, textposition="top center", textfont={"size": 11, "color": "#243746"},
+                                          hovertemplate="%{text}<extra></extra>", showlegend=False))
+        for link in diagram["links"]:
+            x0, y0 = positions[link["from"]]; x1, y1 = positions[link["to"]]
+            network_fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+                                       showarrow=True, arrowhead=3, arrowsize=1.1, arrowwidth=2,
+                                       arrowcolor="#277da1" if link["flow_m3h"] > 1 else "#d1495b")
+            network_fig.add_annotation(x=(x0+x1)/2, y=(y0+y1)/2 + .06,
+                                       text=f"{link['label']}<br>{link['flow_m3h']:.0f} m³/h · {link['pressure_kpa']:.0f} kPa",
+                                       showarrow=False, font={"size": 10, "color": "#243746"}, bgcolor="rgba(255,255,255,.88)")
+        network_fig.update_layout(height=420, margin={"l": 10, "r": 10, "t": 10, "b": 10},
+                                  xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},
+                                  plot_bgcolor="white", paper_bgcolor="white",
+                                  font={"color": "#243746"}, uirevision="water-network")
+        st.plotly_chart(network_fig, width="stretch")
+        hist = pd.DataFrame(water["history"])
+        if not hist.empty:
+            left, right = st.columns(2)
+            with left:
+                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "reclaim_pond_level_pct"],
+                            labels={"time": "Simulated seconds", "value": "Tank level (%)", "variable": "Tank"},
+                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+                f.update_layout(uirevision="water-level-trend")
+                st.plotly_chart(f, width="stretch")
+            with right:
+                f = px.line(hist, x="time", y=["intake_flow_m3h", "process_feed_m3h", "demand_m3h"],
+                            labels={"time": "Simulated seconds", "value": "Flow (m³/h)", "variable": "Flow"},
+                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+                f.update_layout(uirevision="water-flow-trend")
+                st.plotly_chart(f, width="stretch")
+        else:
+            st.info("Start or single-step the factory to build level and flow trends.")
+        st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")
     with tabs[1]:
         area = st.selectbox("Choose area", list(AREAS), key="area_detail")
         area_df = tags_df[tags_df.area == area]

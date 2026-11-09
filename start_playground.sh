@@ -10,6 +10,11 @@ if [[ ! -x "$ROOT/.venv/bin/streamlit" ]]; then
 fi
 
 export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+SNAPSHOT="$ROOT/scada_playground/.runtime/factory_snapshot.json"
+# The gateway builds its fixed Modbus/OPC UA tag model from the first snapshot.
+# Discard a previous run's generated snapshot so startup waits for the fresh
+# dashboard session and cannot expose an obsolete schema after an upgrade.
+rm -f "$SNAPSHOT"
 "$ROOT/.venv/bin/streamlit" run scada_playground/app.py \
   --server.address 127.0.0.1 --server.port 8501 --server.headless true &
 APP_PID=$!
@@ -26,7 +31,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-SNAPSHOT="$ROOT/scada_playground/.runtime/factory_snapshot.json"
 "$ROOT/.venv/bin/python" scada_playground/mcp_server.py --transport streamable-http &
 MCP_PID=$!
 

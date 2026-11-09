@@ -170,6 +170,17 @@ def get_fleet_positions(vehicle_type: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_water_network_state() -> dict[str, Any]:
+    """Read mine-water tank inventories, link flows/pressure, and process demand."""
+    data = snapshot()
+    network = data.get("water_network")
+    if not network:
+        raise RuntimeError("Mine water network is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **network}
+
+
+@mcp.tool()
 def list_protocol_faults() -> dict[str, Any]:
     """List active protocol-output faults and their simulation-time expiry."""
     data = snapshot()

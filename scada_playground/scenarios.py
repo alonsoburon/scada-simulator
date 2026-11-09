@@ -28,6 +28,23 @@ class ScenarioDefinition:
 
 
 SCENARIOS = {
+    "mine-water-pump-and-demand": ScenarioDefinition(
+        scenario_id="mine-water-pump-and-demand",
+        name="Mine water demand surge and pump degradation",
+        description="A process demand surge follows pump degradation; tank inventories and flows respond and recover.",
+        duration_seconds=75,
+        steps=(
+            ScenarioStep(8, "incident", {"incident_name": "Process upset", "severity": "Medium",
+                                          "target_area": "Water supply network", "duration_seconds": 30}),
+            ScenarioStep(18, "incident", {"incident_name": "Mechanical degradation", "severity": "Medium",
+                                           "target_area": "Water supply network", "duration_seconds": 25}),
+        ),
+        expected_observations=(
+            "Process demand rises and recovery percentage falls during the process upset.",
+            "Pump degradation lowers available head and linked flows; tank inventory responds with a lag.",
+            "Demand, pump performance, and tank inventory return toward normal after both events clear.",
+        ),
+    ),
     "grid-comms-recovery": ScenarioDefinition(
         scenario_id="grid-comms-recovery",
         name="Grid communications loss and recovery",

@@ -42,6 +42,7 @@ MCP tag reads show the canonical simulator snapshot. Protocol faults are applied
 - `search_tags`: filter tags by substring, area, asset, or quality; paginated.
 - `read_tags`: read up to 200 exact tag IDs from one snapshot. Each sample includes units, engineering limits, quality, and timestamp.
 - `get_alarms`, `get_fleet_positions`: read alarm records and simulated vehicle locations/state.
+- `get_water_network_state`: read water tank inventories, pipe flows, pressure, demand, and spill.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
 - `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
 - `step_simulation`: advance a paused run by an exact number of simulated seconds.
@@ -73,6 +74,7 @@ The sidebar's **Scenario replay** panel and the MCP `run_scenario` tool run a na
 
 Built-in scenarios:
 
+- `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
 - `grid-comms-recovery`: simulated network partition in Grid distribution, stale quality, then recovery.
 - `frozen-signal`: freeze one signal while simulation time and other values continue.
 - `mqtt-tag-gap`: omit one tag from MQTT batches temporarily, then restore it.
@@ -85,6 +87,14 @@ For an edge-case drill, run `mqtt-tag-gap` with seed `17`, subscribe to the Grid
 
 The included incident types are Signal drift, Network partition, Utility loss, Mechanical degradation, Process upset, and Conveyor jam. Each has Small, Medium, and Large severity and can target a plant area or `Whole factory`. Incidents create alarm records and change synthetic values or quality. A network partition marks affected readings `STALE`; the effect clears when its simulated duration expires or the simulation is reset.
 
+## Mine water flow simulation
+
+The **Water network** tab runs a separate, modular flow model for a north reservoir, raw-water tank, process-water tank, reclaim pond, and treated-water tank. It advances at one-second simulation steps. Link flow responds to pump speed and availability, valve opening, elevation head, a simplified pipe resistance, and finite upstream storage. Tank volumes follow an explicit inflow/outflow mass balance; process demand, water recovery, unmet demand, and spill are tracked. Medium and Large utility-loss incidents stop pumps, pump degradation lowers available head, and a process upset increases demand while lowering recovery. Level and demand alarms are raised and cleared as conditions cross their thresholds. Pump state, speed, efficiency, valve position, tank levels, pressure, and flow are exposed as regular SCADA tags.
+
+Use the simulated pump and valve controls to create operating changes. The diagram encodes flow with line width and direction; trends show storage and flows over simulated time. Scenario `mine-water-pump-and-demand` provides a deterministic demand and pump degradation replay.
+
+This is a transparent, lumped-parameter learning model. It does not solve transient water hammer, detailed friction-factor hydraulics, cavitation, pump curves, treatment chemistry, or calibrated site behavior. Its purpose is to create coherent, inspectable flow propagation for SCADA integration experiments, not engineering design.
+
 Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.line_voltage`. Values have explicit engineering units, limits, quality, last-change reason, and snapshot timestamp. GPS coordinates and roads are fictional and geographically positioned near Escondida only for context.
 
 ## Configuration and development
@@ -96,7 +106,7 @@ Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.lin
 - Runtime snapshots, register maps, command files, virtual environments, and secrets are ignored by Git.
 - Run the fast deterministic model/fault tests with `./.venv/bin/python -m unittest discover -s tests -v`.
 
-The runtime is split into focused modules: `process_model.py` advances synthetic plant state, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. The simulation uses simplified heuristics rather than calibrated mass/energy models, and it does not implement a control system or industrial security stack.
+The runtime is split into focused modules: `process_model.py` advances synthetic plant state, `water_network.py` handles the explicit mine-water mass balance, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Other factory areas still use generated behavioral heuristics, and the simulator does not implement a control system or industrial security stack.
 
 ## Safety and network scope
 
