@@ -45,6 +45,7 @@ MCP tag reads show the canonical simulator snapshot. Protocol faults are applied
 - `get_haulage_state`: read truck cycle states, delivery rate, payload/fuel tags, and ROM dispatch holds.
 - `get_water_network_state`: read water tank inventories, pipe flows, pressure, demand, and spill.
 - `get_concentrator_state`: read ore buffers, grinding limits, product size, recovery, water use, and power.
+- `get_process_control_state`, `control_process`: inspect the simulated process sequence and request orderly `START`, `STOP`, or `RESET_TRIPS` after the cause clears.
 - `get_power_network_state`: read grid import, diesel/solar/storage dispatch, frequency, voltage, load shedding, and feeder limits.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
 - `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
@@ -107,6 +108,8 @@ The **Mineral process** tab follows a copper-ore circuit from ROM feed through p
 
 The model samples every simulated second, smooths slow process measurements, and adds repeatable measurement noise keyed by seed and tag. A Large conveyor jam sharply reduces crushing, but the stockpile temporarily shields the mill; a grinding fault changes mill capacity, vibration, grind size, and recovery. Replay `concentrator-mill-degradation` to observe the effects and recovery. The MCP `get_concentrator_state` tool provides a process summary; regular tag reads expose individual measurements through the same interfaces as the rest of the plant.
 
+The **Process PLC sequence** controls a teaching sequence for tailings pumping, flotation, grinding, conveyors, and primary crushing. It models downstream-first startup, orderly shutdown, utility permissives, three-second delayed trips, basic dependency interlocks, and manual trip reset. Factory timeline start/stop controls only simulation time; process start/stop controls the simulated equipment sequence. Reset clears trips only after the simulated supply recovers and active jam/severe mechanical causes clear; a separate operator start is required afterward. This is a small ordinary process-control model, not a certified safety PLC or safety instrumented system.
+
 This is a low-compute supervisory approximation, not a calibrated comminution or metallurgy model. It does not simulate particle-size distributions, breakage kinetics, liberation/mineralogy, flotation-cell residence-time distributions, reagent chemistry, water chemistry, or a detailed electrical load-flow model. The copper mass balance and finite buffers are useful for integration, historian, alarm, and failure-propagation exercises; they are not suitable for production forecasts or equipment selection.
 
 ## Open-pit haulage
@@ -132,7 +135,7 @@ Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.lin
 - Runtime snapshots, register maps, command files, virtual environments, and secrets are ignored by Git.
 - Run the fast deterministic model/fault tests with `./.venv/bin/python -m unittest discover -s tests -v`.
 
-The runtime is split into focused modules: `process_model.py` advances unmodeled synthetic areas, `power_network.py` dispatches the mine electrical network, `water_network.py` handles mine-water hydraulics and level controllers, `concentrator.py` models ore processing, `haulage.py` models truck cycles, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Power, water, haulage, and mineral processing share explicit operating constraints and process connections; other areas still use generated behavioral heuristics. The project does not yet execute PLC scan logic, model a complete protection system, or provide an industrial security stack.
+The runtime is split into focused modules: `process_model.py` advances unmodeled synthetic areas, `power_network.py` dispatches the mine electrical network, `water_network.py` handles mine-water hydraulics and level controllers, `concentrator.py` models ore processing, `plant_controller.py` executes a limited PLC-style equipment sequence, `haulage.py` models truck cycles, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Power, water, haulage, and mineral processing share explicit operating constraints and process connections; other areas still use generated behavioral heuristics. It does not model a full PLC program, complete protection system, or industrial security stack.
 
 ## Safety and network scope
 

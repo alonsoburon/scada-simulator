@@ -22,6 +22,7 @@ from water_network import MineWaterNetwork
 from concentrator import CopperConcentrator
 from haulage import HaulTruckFleet
 from power_network import MinePowerNetwork
+from plant_controller import PlantController
 
 
 AREAS = {
@@ -176,6 +177,7 @@ WATER_MODEL = MineWaterNetwork()
 CONCENTRATOR_MODEL = CopperConcentrator()
 HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 POWER_MODEL = MinePowerNetwork()
+PLANT_CONTROLLER = PlantController()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -215,6 +217,7 @@ def initialize(seed: int = 17) -> None:
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
         concentrator_state = CONCENTRATOR_MODEL.initialize()
+        process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
@@ -242,6 +245,7 @@ def initialize(seed: int = 17) -> None:
                                 "water_network": water_state,
                                 "power_network": power_state,
                                 "concentrator": concentrator_state,
+                                "process_control": process_control_state,
                                 "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
@@ -259,6 +263,8 @@ def initialize(seed: int = 17) -> None:
         sim.setdefault("scenario_run", None)
         if "concentrator" not in sim:
             sim["concentrator"] = CONCENTRATOR_MODEL.initialize()
+        if "process_control" not in sim:
+            sim["process_control"] = PLANT_CONTROLLER.initialize()
         if "haulage" not in sim:
             sim["haulage"] = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
@@ -325,6 +331,7 @@ def publish_snapshot() -> dict:
         "water_network": water_diagram[0],
         "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
+        "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
         "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
                   "value": t["value"], "units": t["units"], "quality": t["quality"],
@@ -418,6 +425,21 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 duration = command.get("duration_seconds")
                 inject(name, area, severity, duration)
                 message = f"{severity} {name} injected in {area}. Start the factory to evolve its simulated process effects."
+            elif action == "process_control":
+                control = sim["process_control"]
+                process_action = command.get("process_action", "").upper()
+                if process_action in {"START", "STOP"}:
+                    PLANT_CONTROLLER.request(control, process_action)
+                    message = f"Orderly process {process_action.lower()} sequence requested."
+                elif process_action == "RESET_TRIPS":
+                    power = sim["power_network"]
+                    cleared = PLANT_CONTROLLER.reset_trips(
+                        control, events=[event.__dict__ for event in sim["events"]],
+                        power_fraction=power["process_power_fraction"],
+                        voltage_pu=power["voltage_pu"], frequency_hz=power["frequency_hz"])
+                    message = f"Reset {len(cleared)} latched process trip(s); inspect and request START manually."
+                else:
+                    raise ValueError("process_action must be START, STOP, or RESET_TRIPS")
             elif action == "inject_protocol_fault":
                 fault = PROTOCOL_FAULTS.add(
                     sim, command.get("protocol", ""), command.get("mode", ""),
@@ -468,6 +490,21 @@ def advance(force: bool = False) -> None:
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw, seed=sim["seed"])
+    water_level = sim["water_network"]["nodes"]["process_tank"]["level_pct"]
+    trips_before = sim["process_control"]["trip_count"]
+    PLANT_CONTROLLER.advance(
+        sim["process_control"], sim["tick"], concentrator_events,
+        process_power_fraction=sim["power_network"]["process_power_fraction"],
+        water_power_fraction=sim["power_network"]["water_power_fraction"],
+        process_water_level_pct=water_level,
+        voltage_pu=sim["power_network"]["voltage_pu"],
+        frequency_hz=sim["power_network"]["frequency_hz"])
+    new_trips = sim["process_control"]["trip_count"] - trips_before
+    if new_trips > 0:
+        sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
+            "severity": "CRITICAL", "message": sim["process_control"]["last_transition"],
+            "state": "ACTIVE / UNACK"})
+    equipment_available = PLANT_CONTROLLER.availability(sim["process_control"])
     mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
                                              sim["concentrator"]["rom_stockpile_t"])
     prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
@@ -475,7 +512,8 @@ def advance(force: bool = False) -> None:
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
                                water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
                                seed=sim["seed"], mine_delivery_t=mine_delivery_t,
-                               power_available_fraction=sim["power_network"]["process_power_fraction"])
+                               power_available_fraction=sim["power_network"]["process_power_fraction"],
+                               equipment_available=equipment_available)
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
                         concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
@@ -804,6 +842,7 @@ def render_dashboard():
         st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")
     with tabs[2]:
         plant = sim["concentrator"]
+        control = sim["process_control"]
         st.subheader("Copper concentrator · ore-to-tailings process circuit")
         st.caption("Crusher and mill power limits, ore hardness, finite stockpiles, cyclone recirculating load, flotation recovery, concentrate mass balance, tailings capacity, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
         metric_cols = st.columns(6)
@@ -817,6 +856,37 @@ def render_dashboard():
         ]
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
+        with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
+            st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. It is not a certified safety PLC or safety instrumented system. The factory timeline must be running or single-stepped for sequences to progress.")
+            state_col, buttons = st.columns([1.1, 2])
+            state_col.metric("Process sequence", control["mode"])
+            state_col.caption(control["last_transition"])
+            with buttons:
+                start_col, stop_col, reset_col = st.columns(3)
+                if start_col.button("Start process", disabled=(control["requested_mode"] == "RUNNING"
+                                    or control["trip_count"] > 0),
+                                    key=f"process_start_{sim['simulation_id']}"):
+                    PLANT_CONTROLLER.request(control, "START")
+                if stop_col.button("Stop process", disabled=control["requested_mode"] == "STOPPED",
+                                   key=f"process_stop_{sim['simulation_id']}"):
+                    PLANT_CONTROLLER.request(control, "STOP")
+                if reset_col.button("Reset trips", disabled=control["trip_count"] == 0,
+                                    key=f"process_trip_reset_{sim['simulation_id']}"):
+                    try:
+                        power = sim["power_network"]
+                        cleared = PLANT_CONTROLLER.reset_trips(
+                            control, events=[event.__dict__ for event in sim["events"]],
+                            power_fraction=power["process_power_fraction"],
+                            voltage_pu=power["voltage_pu"], frequency_hz=power["frequency_hz"])
+                        st.success(f"Reset {len(cleared)} trip(s). Inspect the condition, then start manually.")
+                    except ValueError as error:
+                        st.error(str(error))
+            equipment_rows = [{"Equipment": PLANT_CONTROLLER.LABELS[name],
+                               "State": item["state"], "Elapsed (s)": item["elapsed_s"],
+                               "Trips": item["trips"], "Trip reason": item["trip_reason"] or "—"}
+                              for name, item in control["equipment"].items()]
+            st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
+            st.caption("Permissive: " + control["permissive_reason"])
         st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener inventory {plant['tailings_thickener_inventory_t']:.0f} t · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
         flow_stages = [
             ("ROM feed", plant["rom_feed_tph"], "#277da1"),

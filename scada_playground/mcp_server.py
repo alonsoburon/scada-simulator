@@ -207,6 +207,17 @@ def get_concentrator_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_process_control_state() -> dict[str, Any]:
+    """Read the simulated concentrator PLC sequence, equipment states, permissive, and latched trips."""
+    data = snapshot()
+    control = data.get("process_control")
+    if not control:
+        raise RuntimeError("Process controller is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **control}
+
+
+@mcp.tool()
 def get_power_network_state() -> dict[str, Any]:
     """Read grid import, generation, storage, frequency, voltage, and feeder capacity."""
     data = snapshot()
@@ -273,6 +284,19 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds})
+
+
+@mcp.tool()
+def control_process(process_action: Literal["START", "STOP", "RESET_TRIPS"]) -> dict[str, Any]:
+    """Request orderly simulated concentrator START/STOP or reset trips after their causes clear.
+
+    The command affects only the local synthetic process model. START/STOP sequences
+    advance when the factory timeline is running or stepped. Trip reset never restarts
+    equipment automatically; inspect state and request START separately.
+    """
+    if process_action not in {"START", "STOP", "RESET_TRIPS"}:
+        raise ValueError("process_action must be START, STOP, or RESET_TRIPS")
+    return submit_command({"action": "process_control", "process_action": process_action})
 
 
 @mcp.tool()

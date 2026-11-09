@@ -71,6 +71,19 @@ class CopperConcentratorTests(unittest.TestCase):
             self.model.advance(second, tick, [], seed=123)
         self.assertEqual(first, second)
 
+    def test_equipment_status_tags_follow_plc_availability(self):
+        unavailable = {name: False for name in (
+            "crusher", "conveyors", "sag_mill", "ball_mill", "flotation", "tailings_pump")}
+        self.model.advance(self.state, 1, [], equipment_available=unavailable)
+        readings = {tag["tag"]: tag["value"] for tag in self.model.telemetry(self.state)}
+        for tag in ("crushing_and_screening.primary_crusher.equipment_running",
+                    "crushing_and_screening.ore_conveyors.equipment_running",
+                    "grinding_and_flotation.sag_mill.equipment_running",
+                    "grinding_and_flotation.ball_mill_01.equipment_running",
+                    "grinding_and_flotation.flotation_cells.equipment_running",
+                    "tailings_and_reclaim.tailings_pump_station_a.equipment_running"):
+            self.assertEqual(readings[tag], 0.0, tag)
+
     def test_discrete_truck_payloads_preserve_rom_inventory_mass_balance(self):
         initial = self.state["rom_stockpile_t"]
         for tick in range(1, 901):

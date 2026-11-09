@@ -53,6 +53,9 @@ class CopperConcentrator:
             "ball_vibration_mm_s": 2.4, "flotation_vibration_mm_s": 1.8,
             "tailings_vibration_mm_s": 2.1, "crushing_running": 1.0,
             "sag_running": 1.0, "flotation_running": 1.0, "measurement_drift": 0.0,
+            "ball_running": 1.0, "crusher_motor_running": 1.0, "conveyors_motor_running": 1.0,
+            "sag_motor_running": 1.0, "ball_motor_running": 1.0,
+            "flotation_motor_running": 1.0, "tailings_motor_running": 1.0,
             "history": [], "noise_seed": 17,
         }
 
@@ -69,10 +72,15 @@ class CopperConcentrator:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
                 mine_delivery_t: float | None = None,
-                power_available_fraction: float | None = None) -> None:
+                power_available_fraction: float | None = None,
+                equipment_available: dict[str, bool] | None = None) -> None:
         """Advance coupled ore, comminution, flotation, water and power balances."""
         state["sim_seconds"] = sim_seconds
         state["noise_seed"] = seed
+        equipment_available = equipment_available or {
+            "tailings_pump": True, "flotation": True, "ball_mill": True,
+            "sag_mill": True, "conveyors": True, "crusher": True,
+        }
         jam = self._severity(events, "Conveyor jam", ("Crushing and screening",))
         mechanical = self._severity(events, "Mechanical degradation",
                                     ("Crushing and screening", "Grinding and flotation", "Tailings and reclaim"))
@@ -94,19 +102,23 @@ class CopperConcentrator:
         # payloads; standalone model experiments retain a smooth mine-source input.
         scheduled_rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
         jam_factor = 0.0 if jam >= 0.78 else 1.0 - jam
-        crusher_capacity = 1_460.0 * state["crusher_condition"] * jam_factor
+        crusher_running = equipment_available.get("crusher", True) and equipment_available.get("conveyors", True)
+        crusher_capacity = (1_460.0 * state["crusher_condition"] * jam_factor) if crusher_running else 0.0
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
         power_factor = (max(0.0, min(1.0, power_available_fraction))
                         if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
         plant_target *= min(water_factor, power_factor)
 
-        sag_power_cap = 21.0 * state["sag_condition"] * power_factor
-        ball_power_cap = 16.5 * state["ball_condition"] * power_factor
+        sag_power_cap = (21.0 * state["sag_condition"] * power_factor
+                         if equipment_available.get("sag_mill", True) else 0.0)
+        ball_power_cap = (16.5 * state["ball_condition"] * power_factor
+                          if equipment_available.get("ball_mill", True) else 0.0)
         sag_capacity = sag_power_cap * 1_000.0 / max(state["ore_hardness_kwh_t"] * 1.04, 1.0)
         cyclone_recirculating_load = min(2.15, max(1.4, 2.0 + (state["p80_microns"] - 150.0) / 180.0))
         ball_capacity = ball_power_cap * 1_000.0 / (8.6 * state["ore_hardness_factor"] * cyclone_recirculating_load)
-        flotation_capacity = 1_240.0 * state["flotation_condition"] * (0.90 + 0.10 * water_factor)
+        flotation_capacity = (1_240.0 * state["flotation_condition"] * (0.90 + 0.10 * water_factor)
+                              if equipment_available.get("flotation", True) else 0.0)
         requested_feed = min(plant_target, sag_capacity, ball_capacity, flotation_capacity)
 
         rom_discharge = min(state["rom_stockpile_t"] * 3600.0, crusher_capacity, 1_250.0)
@@ -131,8 +143,11 @@ class CopperConcentrator:
             state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_feed, 30)
             state["rom_feed_curtailed_tph"] = (sum(state["rom_curtailed_window_t"])
                                                 * 3_600.0 / max(1, len(state["rom_curtailed_window_t"])))
-        sag_feeder_rate = min(900.0, state["crushed_stockpile_t"] * 3600.0,
-                              max(0.0, 900.0 - state["sag_bin_t"]) * 3600.0)
+        sag_feeder_enabled = (equipment_available.get("sag_mill", True)
+                              and equipment_available.get("ball_mill", True))
+        sag_feeder_rate = (min(900.0, state["crushed_stockpile_t"] * 3600.0,
+                               max(0.0, 900.0 - state["sag_bin_t"]) * 3600.0)
+                           if sag_feeder_enabled else 0.0)
         sag_available_t = state["sag_bin_t"] + sag_feeder_rate / 3600.0
         sag_rate = min(requested_feed, sag_available_t * 3600.0)
         ball_rate = min(sag_rate * cyclone_recirculating_load, ball_power_cap * 1_000.0 / max(8.6 * state["ore_hardness_factor"], 1))
@@ -169,7 +184,8 @@ class CopperConcentrator:
         tailings = max(0.0, cyclone_overflow - concentrate)
         thickener_input = tailings + (concentrate * 0.025)
         thickener_capacity = 1_400.0 * state["tailings_condition"]
-        tailings_pumped = min(thickener_input, thickener_capacity)
+        tailings_pumped = (min(thickener_input, thickener_capacity)
+                           if equipment_available.get("tailings_pump", True) else 0.0)
         state["tailings_thickener_inventory_t"] = min(3_000.0, max(0.0,
             state["tailings_thickener_inventory_t"] + (thickener_input - tailings_pumped) * dt_h))
 
@@ -199,9 +215,16 @@ class CopperConcentrator:
 
         # Fault signatures show up as actual process effects plus equipment load,
         # vibration, interlock status, and degraded mass flow.
-        state["crushing_running"] = float(crushed_rate > 5)
-        state["sag_running"] = float(sag_rate > 5)
-        state["flotation_running"] = float(cyclone_overflow > 5)
+        state["crushing_running"] = float(crushed_rate > 5 and crusher_running)
+        state["sag_running"] = float(sag_rate > 5 and equipment_available.get("sag_mill", True))
+        state["ball_running"] = float(ball_rate > 5 and equipment_available.get("ball_mill", True))
+        state["flotation_running"] = float(cyclone_overflow > 5 and equipment_available.get("flotation", True))
+        state["crusher_motor_running"] = float(equipment_available.get("crusher", True))
+        state["conveyors_motor_running"] = float(equipment_available.get("conveyors", True))
+        state["sag_motor_running"] = float(equipment_available.get("sag_mill", True))
+        state["ball_motor_running"] = float(equipment_available.get("ball_mill", True))
+        state["flotation_motor_running"] = float(equipment_available.get("flotation", True))
+        state["tailings_motor_running"] = float(equipment_available.get("tailings_pump", True))
         state["crusher_vibration_mm_s"] = 2.4 + mechanical * 12 + jam * 5
         state["sag_vibration_mm_s"] = 2.8 + mechanical * 10
         state["ball_vibration_mm_s"] = 2.4 + mechanical * 9
@@ -234,36 +257,36 @@ class CopperConcentrator:
                     "motor_power": (state["crusher_power_mw"], "MW", 0, 5),
                     "motor_current": (state["crusher_power_mw"] * 31.0, "A", 0, 250),
                     "vibration_rms": (state["crusher_vibration_mm_s"], "mm/s", 0, 30),
-                    "equipment_running": (state["crushing_running"], "bool", 0, 1)},
+                    "equipment_running": (state.get("crusher_motor_running", state["crushing_running"]), "bool", 0, 1)},
                 "Ore conveyors": {"ore_rate": (state["crushed_ore_tph"], "t/h", 0, 2_000),
                     "stockpile_inventory": (state["crushed_stockpile_t"], "t", 0, 8_000),
                     "motor_power": (0.45 * state["crushing_running"], "MW", 0, 1),
                     "belt_speed": (3.1 * state["crushing_running"], "m/s", 0, 8),
-                    "equipment_running": (state["crushing_running"], "bool", 0, 1)},
+                    "equipment_running": (state.get("conveyors_motor_running", state["crushing_running"]), "bool", 0, 1)},
             },
             "Grinding and flotation": {
                 "SAG mill": {"ore_rate": (state["sag_feed_tph"], "t/h", 0, 2_000),
                     "motor_power": (state["sag_power_mw"], "MW", 0, 30),
                     "motor_current": (state["sag_power_mw"] * 41.0, "A", 0, 2_500),
                     "vibration_rms": (state["sag_vibration_mm_s"], "mm/s", 0, 30),
-                    "equipment_running": (state["sag_running"], "bool", 0, 1),
+                    "equipment_running": (state.get("sag_motor_running", state["sag_running"]), "bool", 0, 1),
                     "ore_hardness": (state["ore_hardness_kwh_t"], "kWh/t", 8, 32)},
                 "Ball mill 01": {"ore_rate": (state["ball_circuit_feed_tph"], "t/h", 0, 4_000),
                     "motor_power": (state["ball_power_mw"], "MW", 0, 20),
                     "motor_current": (state["ball_power_mw"] * 44.0, "A", 0, 2_500),
                     "vibration_rms": (state["ball_vibration_mm_s"], "mm/s", 0, 30),
-                    "equipment_running": (state["sag_running"], "bool", 0, 1)},
+                    "equipment_running": (state.get("ball_motor_running", state["ball_running"]), "bool", 0, 1)},
                 "Cyclone cluster": {"ore_rate": (state["cyclone_overflow_tph"], "t/h", 0, 2_000),
                     "product_p80": (state["p80_microns"], "µm", 50, 400),
                     "circulating_load": (100 * (state["ball_circuit_feed_tph"] / max(state["sag_feed_tph"], 1) - 1), "%", 0, 300),
-                    "equipment_running": (state["sag_running"], "bool", 0, 1)},
+                    "equipment_running": (float(state["cyclone_overflow_tph"] > 5), "bool", 0, 1)},
                 "Flotation cells": {"ore_rate": (state["plant_feed_tph"], "t/h", 0, 2_000),
                     "copper_recovery": (state["copper_recovery_pct"], "%", 0, 100),
                     "concentrate_grade": (state["concentrate_grade_pct"], "%", 0, 40),
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),
                     "air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),
                     "reagent_rate": (state["reagent_l_h"], "L/h", 0, 1_000),
-                    "equipment_running": (state["flotation_running"], "bool", 0, 1)},
+                    "equipment_running": (state.get("flotation_motor_running", state["flotation_running"]), "bool", 0, 1)},
             },
             "Concentrate handling": {
                 "Thickener": {"ore_rate": (state["tailings_tph"], "t/h", 0, 2_000),
@@ -279,7 +302,7 @@ class CopperConcentrator:
                     "motor_power": (0.62 * state["tailings_condition"], "MW", 0, 2),
                     "motor_current": (62 * state["tailings_condition"], "A", 0, 250),
                     "vibration_rms": (state["tailings_vibration_mm_s"], "mm/s", 0, 30),
-                    "equipment_running": (float(state["tailings_tph"] > 5), "bool", 0, 1)},
+                    "equipment_running": (state.get("tailings_motor_running", float(state["tailings_tph"] > 5)), "bool", 0, 1)},
             },
         }
         rows = []
@@ -289,7 +312,9 @@ class CopperConcentrator:
                     tag = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{signal}"
                     stable_id = sum((i + 1) * ord(char) for i, char in enumerate(tag))
                     rng = random.Random(state["noise_seed"] * 1_000_003 + state["sim_seconds"] * 9_176 + stable_id)
-                    noise = rng.gauss(0.0, max(high-low, 1e-9) * (0.0015 if signal in ("product_p80", "copper_recovery") else 0.002))
+                    noise = (0.0 if units == "bool" else
+                             rng.gauss(0.0, max(high-low, 1e-9) *
+                                       (0.0015 if signal in ("product_p80", "copper_recovery") else 0.002)))
                     value = truth + noise
                     if signal in ("ore_rate", "product_p80"):
                         value *= 1.0 + state.get("measurement_drift", 0.0)
