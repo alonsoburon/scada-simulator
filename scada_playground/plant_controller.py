@@ -7,13 +7,20 @@ from __future__ import annotations
 
 
 class PlantController:
-    START_ORDER = ("tailings_pump", "flotation", "ball_mill", "sag_mill", "conveyors", "crusher")
-    STOP_ORDER = ("crusher", "conveyors", "sag_mill", "ball_mill", "flotation", "tailings_pump")
-    START_DELAY_S = {"tailings_pump": 4, "flotation": 5, "ball_mill": 12,
+    START_ORDER = ("tailings_pump", "tailings_thickener", "filter_press",
+                   "concentrate_thickener", "flotation", "ball_mill",
+                   "sag_mill", "conveyors", "crusher")
+    STOP_ORDER = ("crusher", "conveyors", "sag_mill", "ball_mill", "flotation",
+                  "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump")
+    START_DELAY_S = {"tailings_pump": 4, "tailings_thickener": 8, "filter_press": 8,
+                     "concentrate_thickener": 7, "flotation": 5, "ball_mill": 12,
                      "sag_mill": 12, "conveyors": 5, "crusher": 8}
     STOP_DELAY_S = {"crusher": 3, "conveyors": 5, "sag_mill": 15,
-                    "ball_mill": 10, "flotation": 5, "tailings_pump": 8}
-    LABELS = {"tailings_pump": "Tailings pump", "flotation": "Flotation air and cells",
+                    "ball_mill": 10, "flotation": 5, "concentrate_thickener": 10,
+                    "filter_press": 8, "tailings_thickener": 12, "tailings_pump": 8}
+    LABELS = {"tailings_pump": "Tailings pump", "tailings_thickener": "Tailings thickener",
+              "filter_press": "Concentrate filter press",
+              "concentrate_thickener": "Concentrate thickener", "flotation": "Flotation air and cells",
               "ball_mill": "Ball mill", "sag_mill": "SAG mill",
               "conveyors": "Ore conveyors", "crusher": "Primary crusher"}
 
@@ -30,6 +37,24 @@ class PlantController:
                           for name in self.START_ORDER},
             "condition_timers": {},
         }
+
+    def migrate(self, state: dict) -> None:
+        """Keep a live Streamlit session valid across controller schema updates."""
+        defaults = self.initialize()
+        equipment = state.setdefault("equipment", {})
+        for name, initial in defaults["equipment"].items():
+            equipment.setdefault(name, {**initial})
+        for key, value in defaults.items():
+            if key in ("equipment", "history", "condition_timers"):
+                continue
+            state.setdefault(key, value)
+        state.setdefault("history", [])
+        state.setdefault("condition_timers", {})
+        if state["requested_mode"] == "RUNNING" and all(
+                item["state"] == "RUNNING" for item in equipment.values()):
+            state["sequence_index"] = len(self.START_ORDER)
+        elif state["requested_mode"] == "STOPPED":
+            state["sequence_index"] = 0
 
     @staticmethod
     def _active(events: list[dict], name: str, areas: tuple[str, ...]) -> bool:
@@ -67,7 +92,8 @@ class PlantController:
         large_mechanical = any(event["name"] == "Mechanical degradation"
                                and event["severity"] == "Large"
                                and event["area"] in ("Crushing and screening", "Grinding and flotation",
-                                                     "Tailings and reclaim", "Whole factory")
+                                                     "Concentrate handling", "Tailings and reclaim",
+                                                     "Whole factory")
                                for event in events)
         if jam_active or large_mechanical:
             raise ValueError("Reset blocked: clear the active jam or severe mechanical condition first")
@@ -88,7 +114,10 @@ class PlantController:
         # Ordinary process interlocks cascade upstream when a required service
         # disappears. These are control protections, not certified safety trips.
         cascade = {
-            "tailings_pump": ("flotation", "ball_mill", "sag_mill"),
+            "tailings_pump": ("tailings_thickener", "flotation", "ball_mill", "sag_mill"),
+            "tailings_thickener": ("flotation", "ball_mill", "sag_mill"),
+            "filter_press": ("concentrate_thickener", "flotation", "ball_mill", "sag_mill"),
+            "concentrate_thickener": ("flotation", "ball_mill", "sag_mill"),
             "flotation": ("ball_mill", "sag_mill"),
             "ball_mill": ("sag_mill",),
             "conveyors": ("crusher",),
@@ -136,7 +165,11 @@ class PlantController:
         area_by_equipment = {
             "crusher": ("Crushing and screening",), "conveyors": ("Crushing and screening",),
             "sag_mill": ("Grinding and flotation",), "ball_mill": ("Grinding and flotation",),
-            "flotation": ("Grinding and flotation",), "tailings_pump": ("Tailings and reclaim",),
+            "flotation": ("Grinding and flotation",),
+            "concentrate_thickener": ("Concentrate handling",),
+            "filter_press": ("Concentrate handling",),
+            "tailings_thickener": ("Tailings and reclaim",),
+            "tailings_pump": ("Tailings and reclaim",),
         }
         affected = tuple(name for name, areas in area_by_equipment.items()
                          if any(event["name"] == "Mechanical degradation"
@@ -170,8 +203,20 @@ class PlantController:
                 reason = "Healthy mine bus required for tailings pump start"
             elif name == "flotation":
                 permit = (state["equipment"]["tailings_pump"]["state"] == "RUNNING"
+                          and state["equipment"]["tailings_thickener"]["state"] == "RUNNING"
+                          and state["equipment"]["filter_press"]["state"] == "RUNNING"
+                          and state["equipment"]["concentrate_thickener"]["state"] == "RUNNING"
                           and water_power_fraction >= 0.80 and process_water_level_pct >= 20)
-                reason = "Tailings pump, process water, and electrical supply required for flotation"
+                reason = "Concentrate/tailings handling, process water, and electrical supply required for flotation"
+            elif name == "tailings_thickener":
+                permit = state["equipment"]["tailings_pump"]["state"] == "RUNNING"
+                reason = "Tailings pump ready before tailings thickener starts"
+            elif name == "filter_press":
+                permit = process_power_fraction >= 0.90
+                reason = "Healthy process electrical supply required for filter press"
+            elif name == "concentrate_thickener":
+                permit = state["equipment"]["filter_press"]["state"] == "RUNNING"
+                reason = "Filter press ready before concentrate thickener starts"
             elif name in ("ball_mill", "sag_mill"):
                 permit = (state["equipment"]["tailings_pump"]["state"] == "RUNNING"
                           and water_power_fraction >= 0.80 and process_water_level_pct >= 20)

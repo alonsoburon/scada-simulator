@@ -78,6 +78,21 @@ class PlantControllerTests(unittest.TestCase):
         self.advance(80)
         self.assertEqual(self.state["mode"], "RUNNING")
 
+    def test_filter_press_fault_trips_upstream_feed_and_requires_manual_reset(self):
+        fault = [{"name": "Mechanical degradation", "area": "Concentrate handling", "severity": "Large"}]
+        self.advance(3, events=fault)
+        for name in ("filter_press", "concentrate_thickener", "flotation", "ball_mill", "sag_mill"):
+            self.assertEqual(self.state["equipment"][name]["state"], "TRIPPED")
+        with self.assertRaisesRegex(ValueError, "clear the active jam or severe mechanical"):
+            self.controller.reset_trips(self.state, events=fault, power_fraction=1,
+                                        voltage_pu=1, frequency_hz=50)
+        self.controller.reset_trips(self.state, events=[], power_fraction=1,
+                                    voltage_pu=1, frequency_hz=50)
+        self.assertEqual(self.state["trip_count"], 0)
+        self.controller.request(self.state, "START")
+        self.advance(80)
+        self.assertEqual(self.state["mode"], "RUNNING")
+
     def test_electrical_protection_is_delayed_and_latched(self):
         self.advance(2, process_power_fraction=0.5)
         self.assertEqual(self.state["trip_count"], 0)
@@ -86,6 +101,16 @@ class PlantControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "electrical supply"):
             self.controller.reset_trips(self.state, events=[], power_fraction=0.5,
                                         voltage_pu=0.75, frequency_hz=47)
+
+    def test_live_session_migration_adds_downstream_equipment_as_running(self):
+        legacy = self.controller.initialize()
+        for name in ("tailings_thickener", "filter_press", "concentrate_thickener"):
+            legacy["equipment"].pop(name)
+        legacy["sequence_index"] = 6
+        self.controller.migrate(legacy)
+        self.assertEqual(len(legacy["equipment"]), len(self.controller.START_ORDER))
+        self.assertEqual(legacy["sequence_index"], len(self.controller.START_ORDER))
+        self.assertTrue(all(item["state"] == "RUNNING" for item in legacy["equipment"].values()))
 
 
 if __name__ == "__main__":

@@ -30,8 +30,8 @@ AREAS = {
     "Underground mining": ["Decline level 1", "Decline level 2", "Ventilation fans", "Ore pass system", "Underground pumps"],
     "Crushing and screening": ["Primary crusher", "Secondary crusher", "Cone crusher 01", "Screen deck A", "Ore conveyors"],
     "Grinding and flotation": ["SAG mill", "Ball mill 01", "Ball mill 02", "Cyclone cluster", "Flotation cells"],
-    "Concentrate handling": ["Thickener", "Filter press", "Concentrate dryer", "Loadout silo", "Rail loadout"],
-    "Tailings and reclaim": ["Tailings pump station A", "Tailings pump station B", "Deposition line", "Reclaim pond", "Reclaim pumps"],
+    "Concentrate handling": ["Concentrate thickener", "Filter press", "Concentrate dryer", "Loadout silo", "Rail loadout"],
+    "Tailings and reclaim": ["Tailings thickener", "Tailings pump station A", "Tailings pump station B", "Deposition line", "Reclaim pond", "Reclaim pumps"],
     "Mine power network": ["Mine substation A", "Mine substation B", "Pit distribution", "Underground feeders", "Emergency generation"],
     "Grid generation": ["Turbine generator 01", "Turbine generator 02", "Solar farm", "Battery storage", "Black start unit"],
     "Grid transmission": ["Transmission line A", "Transmission line B", "Grid substation A", "Grid substation B", "Intertie"],
@@ -220,6 +220,7 @@ def initialize(seed: int = 17) -> None:
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
@@ -265,9 +266,12 @@ def initialize(seed: int = 17) -> None:
             sim["concentrator"] = CONCENTRATOR_MODEL.initialize()
         if "process_control" not in sim:
             sim["process_control"] = PLANT_CONTROLLER.initialize()
+        PLANT_CONTROLLER.migrate(sim["process_control"])
+        CONCENTRATOR_MODEL.migrate(sim["concentrator"])
         if "haulage" not in sim:
             sim["haulage"] = HAULAGE_MODEL.initialize()
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
@@ -544,30 +548,40 @@ def advance(force: bool = False) -> None:
         prior_states[alarm_key] = active
     plant = sim["concentrator"]
     concentrator_conditions = {
-        "low_crushed_inventory": (plant["crushed_stockpile_t"] < 500,
+        "low_crushed_inventory": ("Grinding and flotation", plant["crushed_stockpile_t"] < 500,
             plant["crushed_stockpile_t"] > 800, "Crushed-ore stockpile low; mill feed buffer is being depleted", "HIGH"),
-        "rom_stockpile_high": (plant["rom_stockpile_t"] > 40_000,
+        "rom_stockpile_high": ("Open-pit mining", plant["rom_stockpile_t"] > 40_000,
             plant["rom_stockpile_t"] < 34_000, "ROM stockpile high; haul dispatch is waiting at the shovel", "HIGH"),
-        "sag_bin_high": (plant["sag_bin_t"] > 820, plant["sag_bin_t"] < 720,
+        "sag_bin_high": ("Grinding and flotation", plant["sag_bin_t"] > 820, plant["sag_bin_t"] < 720,
             "SAG feed bin high; upstream feeder should reduce rate", "HIGH"),
-        "coarse_grind_product": (plant["p80_microns"] > 200, plant["p80_microns"] < 180,
-            "Grinding product is coarse; flotation liberation may be reduced", "HIGH"),
-        "low_copper_recovery": (plant["copper_recovery_pct"] < 78, plant["copper_recovery_pct"] > 82,
-            "Estimated copper recovery below operating target", "HIGH"),
-        "tailings_thickener_high": (plant["tailings_thickener_inventory_t"] > 2_700,
-            plant["tailings_thickener_inventory_t"] < 2_350, "Tailings thickener solids inventory high", "HIGH"),
-        "concentrator_water_shortage": (plant["fresh_water_shortage_m3h"] > 25,
+        "coarse_grind_product": ("Grinding and flotation", plant["p80_microns"] > 200,
+            plant["p80_microns"] < 180, "Grinding product is coarse; flotation liberation may be reduced", "HIGH"),
+        "low_copper_recovery": ("Grinding and flotation", plant["copper_recovery_pct"] < 78,
+            plant["copper_recovery_pct"] > 82, "Estimated copper recovery below operating target", "HIGH"),
+        "tailings_thickener_high": ("Tailings and reclaim",
+            plant["tailings_thickener_inventory_t"] > 0.90 * plant["tailings_thickener_capacity_t"],
+            plant["tailings_thickener_inventory_t"] < 0.78 * plant["tailings_thickener_capacity_t"],
+            "Tailings thickener inventory high; concentrator feed is being curtailed", "HIGH"),
+        "concentrate_thickener_high": ("Concentrate handling",
+            plant["concentrate_thickener_inventory_t"] > 0.85 * plant["concentrate_thickener_capacity_t"],
+            plant["concentrate_thickener_inventory_t"] < 0.70 * plant["concentrate_thickener_capacity_t"],
+            "Concentrate thickener inventory high; filter press throughput is limiting", "HIGH"),
+        "concentrate_cake_high": ("Concentrate handling",
+            plant["concentrate_cake_inventory_t"] > 0.90 * plant["concentrate_cake_capacity_t"],
+            plant["concentrate_cake_inventory_t"] < 0.75 * plant["concentrate_cake_capacity_t"],
+            "Concentrate cake stockpile high; filter press discharge is backing up", "HIGH"),
+        "concentrator_water_shortage": ("Grinding and flotation", plant["fresh_water_shortage_m3h"] > 25,
             plant["fresh_water_shortage_m3h"] < 5, "Concentrator process water shortfall is limiting feed", "CRITICAL"),
     }
     concentration_states = sim.setdefault("concentrator_alarm_states", {})
-    for alarm_key, (active, clear_now, message, severity) in concentrator_conditions.items():
+    for alarm_key, (area, active, clear_now, message, severity) in concentrator_conditions.items():
         was_active = concentration_states.get(alarm_key, False)
         if active and not was_active:
-            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
                 "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
             concentration_states[alarm_key] = True
         elif was_active and clear_now:
-            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
                 "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
             concentration_states[alarm_key] = False
     haulage_alarm_states = sim.setdefault("haulage_alarm_states", {})
@@ -844,7 +858,7 @@ def render_dashboard():
         plant = sim["concentrator"]
         control = sim["process_control"]
         st.subheader("Copper concentrator · ore-to-tailings process circuit")
-        st.caption("Crusher and mill power limits, ore hardness, finite stockpiles, cyclone recirculating load, flotation recovery, concentrate mass balance, tailings capacity, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
+        st.caption("Crusher and mill power limits, ore hardness, finite buffers, cyclone recirculating load, flotation recovery, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
         metric_cols = st.columns(6)
         metric_values = [
             ("Plant feed", f"{plant['plant_feed_tph']:.0f} t/h"),
@@ -888,6 +902,7 @@ def render_dashboard():
             st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
             st.caption("Permissive: " + control["permissive_reason"])
         st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener inventory {plant['tailings_thickener_inventory_t']:.0f} t · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
+        st.caption(f"Concentrate thickener {plant['concentrate_thickener_inventory_t']:.1f}/{plant['concentrate_thickener_capacity_t']:.0f} t · filter press {plant['filter_press_phase'].lower()} ({plant['filter_press_batch_t']:.2f}/{plant['filter_press_batch_capacity_t']:.1f} t batch) · cake stockpile {plant['concentrate_cake_inventory_t']:.1f}/{plant['concentrate_cake_capacity_t']:.0f} t · concentrate shipped {plant['cumulative_concentrate_shipped_t']:.1f} t")
         flow_stages = [
             ("ROM feed", plant["rom_feed_tph"], "#277da1"),
             ("Crusher", plant["crushed_ore_tph"], "#4c78a8"),
@@ -922,9 +937,12 @@ def render_dashboard():
                 trend.update_layout(height=470, uirevision="concentrator-process-trend")
                 st.plotly_chart(trend, width="stretch")
             with process_right:
-                trend = px.line(history, x="time", y=["rom_stockpile_t", "crushed_stockpile_t", "sag_bin_t"],
+                trend = px.line(history, x="time", y=["rom_stockpile_t", "crushed_stockpile_t", "sag_bin_t",
+                                                        "tailings_thickener_inventory_t",
+                                                        "concentrate_thickener_inventory_t",
+                                                        "concentrate_cake_inventory_t"],
                     labels={"time": "Simulated seconds", "value": "Inventory (t)", "variable": "Buffer"},
-                    color_discrete_sequence=["#277da1", "#e07a5f", "#f2a541"])
+                    color_discrete_sequence=["#277da1", "#e07a5f", "#f2a541", "#43aa8b", "#9b5de5", "#d1495b"])
                 trend.update_layout(uirevision="concentrator-inventory-trend")
                 st.plotly_chart(trend, width="stretch")
         else:

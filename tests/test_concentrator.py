@@ -84,6 +84,35 @@ class CopperConcentratorTests(unittest.TestCase):
                     "tailings_and_reclaim.tailings_pump_station_a.equipment_running"):
             self.assertEqual(readings[tag], 0.0, tag)
 
+    def test_concentrate_and_tailings_solids_balances_close(self):
+        initial_concentrate = (self.state["concentrate_thickener_inventory_t"]
+                               + self.state["concentrate_cake_inventory_t"])
+        initial_tailings = self.state["tailings_thickener_inventory_t"]
+        self.advance(1_800)
+        concentrate_accounted = (self.state["concentrate_thickener_inventory_t"]
+                                 + self.state["filter_press_batch_t"]
+                                 + self.state["concentrate_cake_inventory_t"]
+                                 + self.state["cumulative_concentrate_shipped_t"])
+        self.assertAlmostEqual(initial_concentrate + self.state["cumulative_concentrate_produced_t"],
+                               concentrate_accounted, places=5)
+        tailings_accounted = (self.state["tailings_thickener_inventory_t"]
+                              + self.state["cumulative_tailings_pumped_t"])
+        self.assertAlmostEqual(initial_tailings + self.state["cumulative_tailings_received_t"],
+                               tailings_accounted, places=5)
+        self.assertGreater(self.state["filter_press_cycle_count"], 0)
+
+    def test_filter_press_trip_fills_concentrate_buffer_then_curbs_flotation(self):
+        self.state["concentrate_thickener_inventory_t"] = 100.0
+        unavailable = {name: True for name in (
+            "crusher", "conveyors", "sag_mill", "ball_mill", "flotation",
+            "tailings_pump", "tailings_thickener", "concentrate_thickener", "filter_press")}
+        unavailable["filter_press"] = False
+        baseline_feed = self.state["plant_feed_tph"]
+        self.advance(300, equipment_available=unavailable)
+        self.assertGreater(self.state["concentrate_thickener_inventory_t"], 100.0)
+        self.assertLess(self.state["plant_feed_tph"], baseline_feed * 0.9)
+        self.assertEqual(self.state["filter_press_feed_tph"], 0.0)
+
     def test_discrete_truck_payloads_preserve_rom_inventory_mass_balance(self):
         initial = self.state["rom_stockpile_t"]
         for tick in range(1, 901):
