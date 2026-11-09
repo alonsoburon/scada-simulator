@@ -84,7 +84,8 @@ class MineWaterNetwork:
                                                       "Reclaim return valve", "Reclaim transfer valve")},
                 "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True}
                           for key in self.LINKS},
-                "demand_m3h": 240.0, "treated_demand_m3h": 96.0,
+                "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
+                "treated_demand_m3h": 96.0,
                 "unmet_demand_m3h": 0.0, "unmet_treated_demand_m3h": 0.0,
                 "water_recovery_pct": 68.0,
                 "history": [], "total_spilled_m3": 0.0, "cumulative_source_withdrawal_m3": 0.0,
@@ -186,13 +187,16 @@ class MineWaterNetwork:
             state["pumps"][spec["pump"]]["pump_head_m"] = max(0.0, pump_head)
         return flow_m3h, pressure_drop_kpa
 
-    def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17) -> None:
+    def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17,
+                concentrator_demand_m3h: float = 0.0) -> None:
         """Advance one second with PI level controls, hydraulic links and delayed transport."""
         state["sim_seconds"] = sim_seconds
         state["sensor_rng_seed"] = seed
         stress = max(({"Small": 1.2, "Medium": 1.6, "Large": 2.1}[e["severity"]]
                       for e in active_events if e["name"] == "Process upset"), default=1.0)
-        state["demand_m3h"] = 240.0 * stress * (1 + 0.08 * math.sin(sim_seconds / 95.0))
+        state["concentrator_demand_m3h"] = max(0.0, concentrator_demand_m3h)
+        state["base_demand_m3h"] = 240.0 * stress * (1 + 0.08 * math.sin(sim_seconds / 95.0))
+        state["demand_m3h"] = state["base_demand_m3h"] + state["concentrator_demand_m3h"]
         state["treated_demand_m3h"] = 96.0 * (1 + 0.12 * math.sin(sim_seconds / 137.0 + 1.2))
         state["water_recovery_pct"] = 68.0 if stress == 1.0 else max(35.0, 68.0 - (stress - 1.0) * 18)
         degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
@@ -250,8 +254,11 @@ class MineWaterNetwork:
         process_available_m3 = volumes["process_tank"] + outlet["process_feed"] / 3600.0
         served = min(state["demand_m3h"], process_available_m3 * 3600.0)
         state["unmet_demand_m3h"] = state["demand_m3h"] - served
+        # Reclaim applies to the baseline circulating process stream. Concentrator
+        # makeup is consumed fresh water and is not falsely counted as return flow.
+        circulating_served = min(served, state["base_demand_m3h"])
         return_request = min(requested["reclaim_return"],
-                             served * state["water_recovery_pct"] / 100.0)
+                             circulating_served * state["water_recovery_pct"] / 100.0)
         requested["reclaim_return"] = return_request
         transfer("reclaim_return", process_available_m3)
         reclaim_available = volumes["reclaim_pond"] + outlet["reclaim_return"] / 3600.0
@@ -367,7 +374,7 @@ class MineWaterNetwork:
             add(asset, "controller_auto", float(controller["mode"] == "AUTO"), "bool", 0, 1)
         for name, opening in state["valves"].items():
             add(name.lower().replace(" ", "_"), "valve_position", opening, "%", 0, 100)
-        add("process_demand", "water_demand", state["demand_m3h"], "m³/h", 0, 600, 0.005)
+        add("process_demand", "water_demand", state["demand_m3h"], "m³/h", 0, 1_200, 0.005)
         add("process_demand", "unmet_demand", state["unmet_demand_m3h"], "m³/h", 0, 600, 0.005)
         add("process_demand", "water_recovery", state["water_recovery_pct"], "%", 0, 100, 0.002)
         add("process_demand", "treated_water_demand", state["treated_demand_m3h"], "m³/h", 0, 300, 0.005)

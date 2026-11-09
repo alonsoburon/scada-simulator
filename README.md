@@ -2,7 +2,7 @@
 
 A local synthetic industrial operations world for developers building, testing, and demoing SCADA monitoring integrations. One simulator publishes the same values through Modbus TCP, OPC UA, MQTT, and MCP, with a small operator UI and a separate live fleet map.
 
-It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, 177 assets, and about 1,500 tags**. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
+It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, 177 assets, and about 1,500 tags**. The mine-water network and copper concentrator have explicit dynamic process models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
 
 > Everything here is simulated. It is not a PLC, a process engineering model, a safety system, or a connection to real equipment.
 
@@ -43,6 +43,7 @@ MCP tag reads show the canonical simulator snapshot. Protocol faults are applied
 - `read_tags`: read up to 200 exact tag IDs from one snapshot. Each sample includes units, engineering limits, quality, and timestamp.
 - `get_alarms`, `get_fleet_positions`: read alarm records and simulated vehicle locations/state.
 - `get_water_network_state`: read water tank inventories, pipe flows, pressure, demand, and spill.
+- `get_concentrator_state`: read ore buffers, grinding limits, product size, recovery, water use, and power.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
 - `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
 - `step_simulation`: advance a paused run by an exact number of simulated seconds.
@@ -74,6 +75,7 @@ The sidebar's **Scenario replay** panel and the MCP `run_scenario` tool run a na
 
 Built-in scenarios:
 
+- `concentrator-mill-degradation`: changing ore hardness, grinding degradation, and a mine power disturbance propagate into grind size, flotation recovery, water demand, and buffered inventories.
 - `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
 - `grid-comms-recovery`: simulated network partition in Grid distribution, stale quality, then recovery.
 - `frozen-signal`: freeze one signal while simulation time and other values continue.
@@ -95,6 +97,14 @@ Use the simulated pump and valve controls to create operating changes. The diagr
 
 This remains a compact learning model. Pipe friction and pump curves are simplified steady-state relationships; queues approximate plug flow. It does not model water hammer, elevation profiles along each pipe, changing pipe diameter, cavitation, pump efficiency maps, treatment chemistry, or site-calibrated equipment. Those omissions matter for engineering design and fast transients. The network is intended to provide credible control-loop and telemetry behavior at low compute cost.
 
+## Copper concentrator process simulation
+
+The **Mineral process** tab follows a copper-ore circuit from ROM feed through primary crushing, crushed-ore stockpile, SAG mill, ball mill/cyclone recirculation, flotation, thickener, filter press, and tailings pumping. ROM and crushed-ore buffers make upstream stoppages propagate with a delay. A bounded change in ore hardness alters specific energy and grind size; available SAG/ball mill power and equipment condition limit fresh throughput; P80 (the particle size below which 80% of measured material falls) and water availability influence estimated flotation recovery. Concentrate tonnage follows a copper feed/recovery/product-grade mass balance. The circuit publishes power demand and make-up water demand as tags; a mine utility loss derates mill and pump capacity, while water shortage constrains feed and recovery.
+
+The model samples every simulated second, smooths slow process measurements, and adds repeatable measurement noise keyed by seed and tag. A Large conveyor jam sharply reduces crushing, but the stockpile temporarily shields the mill; a grinding fault changes mill capacity, vibration, grind size, and recovery. Replay `concentrator-mill-degradation` to observe the effects and recovery. The MCP `get_concentrator_state` tool provides a process summary; regular tag reads expose individual measurements through the same interfaces as the rest of the plant.
+
+This is a low-compute supervisory approximation, not a calibrated comminution or metallurgy model. It does not simulate individual truck payload delivery, particle-size distributions, breakage kinetics, liberation/mineralogy, flotation-cell residence-time distributions, reagent chemistry, water chemistry, or a detailed electrical load-flow model. The copper mass balance and finite buffers are useful for integration, historian, alarm, and failure-propagation exercises; they are not suitable for production forecasts or equipment selection.
+
 Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.line_voltage`. Values have explicit engineering units, limits, quality, last-change reason, and snapshot timestamp. GPS coordinates and roads are fictional and geographically positioned near Escondida only for context.
 
 ## Configuration and development
@@ -106,7 +116,7 @@ Tag IDs use `area.asset.signal`, for example `grid_distribution.feeder_north.lin
 - Runtime snapshots, register maps, command files, virtual environments, and secrets are ignored by Git.
 - Run the fast deterministic model/fault tests with `./.venv/bin/python -m unittest discover -s tests -v`.
 
-The runtime is split into focused modules: `process_model.py` advances synthetic plant state, `water_network.py` handles the mine-water hydraulics and level controllers, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. The water network is the first process area with closed-loop dynamics; other areas still use generated behavioral heuristics. The project does not yet execute PLC scan logic, model a complete protection system, or provide an industrial security stack.
+The runtime is split into focused modules: `process_model.py` advances unmodeled synthetic areas, `water_network.py` handles mine-water hydraulics and level controllers, `concentrator.py` models ore processing, `scenarios.py` schedules deterministic runs, `protocol_faults.py` transforms each protocol's view, `protocol_gateway.py` serves the industrial interfaces, `mcp_server.py` provides MCP tools, and `app.py` supplies the UI. Water and mineral processing are the first areas with explicit cross-system dynamics; other areas still use generated behavioral heuristics. The project does not yet execute PLC scan logic, model a complete protection system, or provide an industrial security stack.
 
 ## Safety and network scope
 

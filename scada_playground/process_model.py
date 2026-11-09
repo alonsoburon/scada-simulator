@@ -60,6 +60,15 @@ class FactoryProcessModel:
                           for area in self.areas}
 
         for tag in sim["tags"]:
+            # Process-specific models own these values. Keep this broad model
+            # responsible only for unmodeled equipment and the site fleet.
+            if tag.get("dynamic_model"):
+                issues = active_by_area[tag["area"]]
+                comms_fault = next((event for event in issues
+                                    if self.incidents[event.name] == "comms"), None)
+                tag["quality"] = "STALE" if comms_fault else "GOOD"
+                tag["last_change"] = comms_fault.name if comms_fault else "Dynamic process model"
+                continue
             if tag["sensor"] in ("gps_latitude", "gps_longitude", "gps_speed", "heading", "payload"):
                 latitude, longitude, speed, heading, payload, _state = self.fleet_motion(tag["unit"], sim["tick"])
                 tag["value"] = round({"gps_latitude": latitude, "gps_longitude": longitude,
@@ -92,9 +101,3 @@ class FactoryProcessModel:
                 tag["quality"] = "GOOD"
                 tag["last_change"] = "Normal"
             tag["value"] = round(min(tag["high"] * 1.15, max(tag["low"] - span * 0.1, value)), 2)
-
-        if sim["tick"] % 15 == 0:
-            samples = [{"time": sim["tick"], "tag": tag["tag"], "value": tag["value"],
-                        "quality": tag["quality"]} for tag in sim["tags"]]
-            sim["history"].extend(samples)
-            sim["history"] = sim["history"][-len(sim["tags"]) * 120:]

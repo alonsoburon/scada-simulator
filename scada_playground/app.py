@@ -12,12 +12,14 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from process_model import FactoryProcessModel
 from protocol_faults import FAULT_MODES, PROTOCOLS, ProtocolFaultInjector
 from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
 from water_network import MineWaterNetwork
+from concentrator import CopperConcentrator
 
 
 AREAS = {
@@ -169,6 +171,7 @@ def fleet_motion(unit: str, sim_seconds: int) -> tuple[float, float, float, floa
 
 PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
 WATER_MODEL = MineWaterNetwork()
+CONCENTRATOR_MODEL = CopperConcentrator()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -207,6 +210,13 @@ def initialize(seed: int = 17) -> None:
                                      "low": low, "high": high, "base": gps_base, "value": gps_base,
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
+        concentrator_state = CONCENTRATOR_MODEL.initialize()
+        modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
+        concentrator_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state)
+        for tag in concentrator_tags:
+            tag["dynamic_model"] = True
+        tags.extend(concentrator_tags)
         water_state = WATER_MODEL.initialize()
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         tags.extend(water_tags)
@@ -218,8 +228,10 @@ def initialize(seed: int = 17) -> None:
                      "last_change": "Water pump electrical load"})
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
+                                "concentrator": concentrator_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
+                                "concentrator_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
                                 "protocol_faults": [], "next_fault_id": 1, "scenario_run": None,
                                 "last_tick": time.time(), "factory_on": False}
@@ -230,6 +242,13 @@ def initialize(seed: int = 17) -> None:
         sim.setdefault("protocol_faults", [])
         sim.setdefault("next_fault_id", 1)
         sim.setdefault("scenario_run", None)
+        if "concentrator" not in sim:
+            sim["concentrator"] = CONCENTRATOR_MODEL.initialize()
+        modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
+        for tag in CONCENTRATOR_MODEL.telemetry(sim["concentrator"]):
+            tag["dynamic_model"] = True
+            sim["tags"].append(tag)
         if "water_network" not in sim:
             sim["water_network"] = WATER_MODEL.initialize()
             water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
@@ -241,10 +260,20 @@ def publish_snapshot() -> dict:
     sim = st.session_state.sim
     fleet_units = sorted({t["unit"] for t in sim["tags"] if t["area"] == "Mobile fleet"})
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
+    concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+    concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags}
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
+        elif tag["tag"] in concentrator_by_tag:
+            tag.update(concentrator_by_tag[tag["tag"]])
+        comms_fault = next((event for event in sim["events"]
+                            if event.name == "Network partition"
+                            and event.area in (tag["area"], "Whole factory")), None)
+        if comms_fault:
+            tag["quality"] = "STALE"
+            tag["last_change"] = "Network partition"
         elif tag["tag"] == "mine_power_network.water_pump_station.pump_load":
             tag.update(value=round(sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0, 3),
                        quality="GOOD", last_change="Water pump electrical load changed")
@@ -260,6 +289,7 @@ def publish_snapshot() -> dict:
         "scenario_run": sim["scenario_run"],
         "protocol_faults": sim["protocol_faults"],
         "water_network": water_diagram[0],
+        "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "tags": [{"tag": t["tag"], "area": t["area"], "asset": t["unit"], "sensor": t["sensor"],
                   "value": t["value"], "units": t["units"], "quality": t["quality"],
                   "low": t["low"], "high": t["high"], "last_change": t["last_change"]} for t in sim["tags"]],
@@ -393,8 +423,15 @@ def advance(force: bool = False) -> None:
     SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
     PROCESS_MODEL.advance(sim, force=force)
     water_events = [event.__dict__ for event in sim["events"]
-                    if event.area in ("Water supply network", "Whole factory")]
-    WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"])
+                    if event.area in ("Water supply network", "Mine power network", "Whole factory")]
+    concentrator_events = [event.__dict__ for event in sim["events"]]
+    prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
+    concentrator_share = sim["concentrator"]["water_makeup_m3h"] / max(sim["water_network"].get("demand_m3h", 1), 1)
+    CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
+                               water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
+                               seed=sim["seed"])
+    WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
+                        concentrator_demand_m3h=sim["concentrator"]["water_makeup_m3h"])
     water = sim["water_network"]
     conditions = {
         "process_tank_low": (water["nodes"]["process_tank"]["level_pct"] < 25,
@@ -420,11 +457,46 @@ def advance(force: bool = False) -> None:
                                      "severity": "INFO", "message": f"{message} cleared",
                                      "state": "CLEARED"})
         prior_states[alarm_key] = active
+    plant = sim["concentrator"]
+    concentrator_conditions = {
+        "low_crushed_inventory": (plant["crushed_stockpile_t"] < 500,
+            plant["crushed_stockpile_t"] > 800, "Crushed-ore stockpile low; mill feed buffer is being depleted", "HIGH"),
+        "rom_stockpile_high": (plant["rom_stockpile_t"] > 42_000,
+            plant["rom_stockpile_t"] < 39_000, "ROM stockpile is near capacity; mine feed is being curtailed", "HIGH"),
+        "sag_bin_high": (plant["sag_bin_t"] > 820, plant["sag_bin_t"] < 720,
+            "SAG feed bin high; upstream feeder should reduce rate", "HIGH"),
+        "coarse_grind_product": (plant["p80_microns"] > 200, plant["p80_microns"] < 180,
+            "Grinding product is coarse; flotation liberation may be reduced", "HIGH"),
+        "low_copper_recovery": (plant["copper_recovery_pct"] < 78, plant["copper_recovery_pct"] > 82,
+            "Estimated copper recovery below operating target", "HIGH"),
+        "tailings_thickener_high": (plant["tailings_thickener_inventory_t"] > 2_700,
+            plant["tailings_thickener_inventory_t"] < 2_350, "Tailings thickener solids inventory high", "HIGH"),
+        "concentrator_water_shortage": (plant["fresh_water_shortage_m3h"] > 25,
+            plant["fresh_water_shortage_m3h"] < 5, "Concentrator process water shortfall is limiting feed", "CRITICAL"),
+    }
+    concentration_states = sim.setdefault("concentrator_alarm_states", {})
+    for alarm_key, (active, clear_now, message, severity) in concentrator_conditions.items():
+        was_active = concentration_states.get(alarm_key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+            concentration_states[alarm_key] = True
+        elif was_active and clear_now:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Grinding and flotation",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+            concentration_states[alarm_key] = False
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
+    concentrator_by_tag = {tag["tag"]: tag for tag in CONCENTRATOR_MODEL.telemetry(sim["concentrator"])}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
+        elif tag["tag"] in concentrator_by_tag:
+            tag.update(concentrator_by_tag[tag["tag"]])
+    if sim["tick"] % 15 == 0:
+        sim["history"].extend({"time": sim["tick"], "tag": tag["tag"], "value": tag["value"],
+                               "quality": tag["quality"]} for tag in sim["tags"])
+        sim["history"] = sim["history"][-len(sim["tags"]) * 120:]
     SCENARIO_RUNNER.after_tick(sim)
     PROTOCOL_FAULTS.expire(sim)
 
@@ -523,7 +595,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Learning missions"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -630,7 +702,65 @@ def render_dashboard():
         else:
             st.info("Start or single-step the factory to build level and flow trends.")
         st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")
-    with tabs[1]:
+    with tabs[2]:
+        plant = sim["concentrator"]
+        st.subheader("Copper concentrator · ore-to-tailings process circuit")
+        st.caption("Crusher and mill power limits, ore hardness, finite stockpiles, cyclone recirculating load, flotation recovery, concentrate mass balance, tailings capacity, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
+        metric_cols = st.columns(6)
+        metric_values = [
+            ("Plant feed", f"{plant['plant_feed_tph']:.0f} t/h"),
+            ("Copper recovery", f"{plant['copper_recovery_pct']:.1f}%"),
+            ("Product P80", f"{plant['p80_microns']:.0f} µm"),
+            ("Concentrate", f"{plant['concentrate_tph']:.1f} t/h"),
+            ("Process power", f"{plant['sag_power_mw'] + plant['ball_power_mw'] + plant['crusher_power_mw']:.1f} MW"),
+            ("Water makeup", f"{plant['water_makeup_m3h']:.0f} m³/h"),
+        ]
+        for col, (label, value) in zip(metric_cols, metric_values):
+            col.metric(label, value)
+        st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener inventory {plant['tailings_thickener_inventory_t']:.0f} t · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
+        flow_stages = [
+            ("ROM feed", plant["rom_feed_tph"], "#277da1"),
+            ("Crusher", plant["crushed_ore_tph"], "#4c78a8"),
+            ("SAG fresh feed", plant["sag_feed_tph"], "#f2a541"),
+            ("Ball circuit", plant["ball_circuit_feed_tph"], "#e07a5f"),
+            ("Cyclone overflow", plant["cyclone_overflow_tph"], "#43aa8b"),
+            ("Tailings pumped", plant["tailings_tph"], "#9b5de5"),
+        ]
+        process_fig = go.Figure(go.Bar(x=[item[0] for item in flow_stages], y=[item[1] for item in flow_stages],
+            marker_color=[item[2] for item in flow_stages], text=[f"{item[1]:.0f} t/h" for item in flow_stages],
+            textposition="outside", hovertemplate="%{x}<br>%{y:.1f} t/h<extra></extra>"))
+        process_fig.update_layout(height=340, margin={"l": 10, "r": 10, "t": 25, "b": 5},
+            yaxis_title="Solids rate (t/h)", xaxis_title="Material flow stage", showlegend=False,
+            uirevision="concentrator-material-flow")
+        st.plotly_chart(process_fig, width="stretch")
+        process_left, process_right = st.columns(2)
+        history = pd.DataFrame(plant["history"])
+        if not history.empty:
+            with process_left:
+                trend = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.15,
+                                      specs=[[{"secondary_y": False}], [{"secondary_y": True}]])
+                trend.add_trace(go.Scatter(x=history.time, y=history.plant_feed_tph, name="Plant feed",
+                                           line={"color": "#277da1"}), row=1, col=1)
+                trend.add_trace(go.Scatter(x=history.time, y=history.copper_recovery_pct, name="Cu recovery",
+                                           line={"color": "#43aa8b"}), row=2, col=1, secondary_y=False)
+                trend.add_trace(go.Scatter(x=history.time, y=history.p80_microns, name="Product P80",
+                                           line={"color": "#f2a541"}), row=2, col=1, secondary_y=True)
+                trend.update_yaxes(title_text="Feed (t/h)", row=1, col=1)
+                trend.update_yaxes(title_text="Recovery (%)", row=2, col=1, secondary_y=False)
+                trend.update_yaxes(title_text="P80 (µm)", row=2, col=1, secondary_y=True)
+                trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
+                trend.update_layout(height=470, uirevision="concentrator-process-trend")
+                st.plotly_chart(trend, width="stretch")
+            with process_right:
+                trend = px.line(history, x="time", y=["rom_stockpile_t", "crushed_stockpile_t", "sag_bin_t"],
+                    labels={"time": "Simulated seconds", "value": "Inventory (t)", "variable": "Buffer"},
+                    color_discrete_sequence=["#277da1", "#e07a5f", "#f2a541"])
+                trend.update_layout(uirevision="concentrator-inventory-trend")
+                st.plotly_chart(trend, width="stretch")
+        else:
+            st.info("Start or single-step the factory to build concentrator trends.")
+        st.markdown("**Fault drills:** inject Conveyor jam in Crushing and screening and watch ore buffers absorb the interruption before milling slows. Inject Mechanical degradation in Grinding and flotation to compare vibration, power, circulating load, P80, and recovery. Inject Utility loss in Mine power network to observe power-limited throughput and the coupled water shortfall response.")
+    with tabs[3]:
         area = st.selectbox("Choose area", list(AREAS), key="area_detail")
         area_df = tags_df[tags_df.area == area]
         st.write(f"**{area}** · {len(AREAS[area])} equipment units · {len(area_df)} tags")
@@ -649,7 +779,7 @@ def render_dashboard():
                 st.info("Trend begins after the simulator has collected its first interval.")
         else:
             st.info("Start the factory to collect trend history.")
-    with tabs[2]:
+    with tabs[4]:
         fleet = tags_df[tags_df.area == "Mobile fleet"].copy()
         st.caption("Fleet GPS is streamed on the live map above. This view lists the vehicle process and instrumentation tags.")
         st.subheader("Vehicle telemetry")
@@ -658,7 +788,7 @@ def render_dashboard():
         st.subheader("Building and site telemetry")
         buildings = tags_df[tags_df.area == "Site buildings"]
         st.dataframe(buildings[["tag", "value", "units", "quality", "last_change"]], hide_index=True, width="stretch")
-    with tabs[3]:
+    with tabs[5]:
         q1, q2, q3 = st.columns(3)
         area_filter = q1.selectbox("Area filter", ["All", *AREAS.keys()])
         quality_filter = q2.selectbox("Quality", ["All", "GOOD", "STALE"])
@@ -669,7 +799,7 @@ def render_dashboard():
         if search: filtered = filtered[filtered.tag.str.contains(search, case=False, regex=False)]
         st.dataframe(filtered[["tag", "area", "unit", "value", "units", "quality", "last_change"]], hide_index=True, width="stretch", height=550)
         st.download_button("Download current tag snapshot (CSV)", filtered.to_csv(index=False), "factory_tags.csv", "text/csv")
-    with tabs[4]:
+    with tabs[6]:
         if alarms_df.empty:
             st.info("No alarms yet. Inject an incident to see alarm behavior.")
         else:
@@ -677,7 +807,7 @@ def render_dashboard():
             if st.button("Acknowledge active alarms"):
                 sim["alarms"] = [{**a, "state": "ACTIVE / ACK" if a["state"] == "ACTIVE / UNACK" else a["state"]} for a in sim["alarms"]]
                 st.rerun(scope="fragment")
-    with tabs[5]:
+    with tabs[7]:
         st.subheader("Investigation missions")
         st.markdown("Use these as exercises: form hypotheses, locate evidence across areas, identify first-out signals, and propose what a unified monitoring layer should show.")
         missions = [

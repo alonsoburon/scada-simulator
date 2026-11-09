@@ -119,19 +119,13 @@ def slug(value: str) -> str:
     return "_".join(value.lower().replace("&", "and").replace("/", "_").split())
 
 
-async def build_opcua() -> tuple[Server, dict[str, tuple]]:
-    snapshot = load_snapshot()
-    server = Server()
-    await server.init()
-    server.set_endpoint("opc.tcp://127.0.0.1:4840/factory/server/")
-    idx = await server.register_namespace(NAMESPACE)
-    factory = await server.nodes.objects.add_object(
-        ua.NodeId("Factory", idx), ua.QualifiedName("Factory", idx)
-    )
-    area_nodes: dict[str, object] = {}
-    asset_nodes: dict[tuple[str, str], object] = {}
-    references = {}
-    for tag in snapshot["tags"]:
+async def add_opcua_tags(server: Server, namespace_index: int, factory, tags: list[dict],
+                        references: dict[str, tuple], area_nodes: dict, asset_nodes: dict) -> None:
+    """Add newly published tags without invalidating existing OPC UA node IDs."""
+    idx = namespace_index
+    for tag in tags:
+        if tag["tag"] in references:
+            continue
         area = tag["area"]
         asset = tag["asset"]
         if area not in area_nodes:
@@ -156,7 +150,22 @@ async def build_opcua() -> tuple[Server, dict[str, tuple]]:
             ua.NodeId(f"Units/{tag['tag']}", idx), ua.QualifiedName("Units", idx), str(tag["units"])
         )
         references[tag["tag"]] = (value_node, quality_node, units_node)
-    return server, references
+
+
+async def build_opcua() -> tuple[Server, dict[str, tuple], tuple]:
+    server = Server()
+    await server.init()
+    server.set_endpoint("opc.tcp://127.0.0.1:4840/factory/server/")
+    idx = await server.register_namespace(NAMESPACE)
+    factory = await server.nodes.objects.add_object(
+        ua.NodeId("Factory", idx), ua.QualifiedName("Factory", idx)
+    )
+    area_nodes: dict[str, object] = {}
+    asset_nodes: dict[tuple[str, str], object] = {}
+    references: dict[str, tuple] = {}
+    initial_tags = load_snapshot()["tags"]
+    await add_opcua_tags(server, idx, factory, initial_tags, references, area_nodes, asset_nodes)
+    return server, references, (idx, factory, area_nodes, asset_nodes)
 
 
 def mqtt_publish(client: mqtt.Client, snapshot: dict) -> None:
@@ -193,7 +202,9 @@ async def main() -> None:
     write_register_map(initial["tags"])
 
     # FC04 input registers make this Modbus endpoint read-only by function code.
-    modbus_block = ModbusSequentialDataBlock(1, [0] * (3 * len(initial["tags"])))
+    # Reserve the full FC04 address space so a newly added simulator tag cannot
+    # exhaust the backing block before the map is refreshed.
+    modbus_block = ModbusSequentialDataBlock(1, [0] * 65_536)
     device = ModbusDeviceContext(ir=modbus_block)
     context = ModbusServerContext(devices={1: device}, single=False)
     write_modbus(context, initial["tags"])
@@ -216,7 +227,8 @@ async def main() -> None:
     publisher.connect("127.0.0.1", 1883, keepalive=30)
     publisher.loop_start()
 
-    server, opc_nodes = await build_opcua()
+    server, opc_nodes, opcua_context = await build_opcua()
+    known_tag_ids = {tag["tag"] for tag in initial["tags"]}
     fault_injector = ProtocolFaultInjector()
     logging.info("Modbus TCP listening on 127.0.0.1:1502, unit ID 1 (FC04 input registers)")
     logging.info("OPC UA listening on opc.tcp://127.0.0.1:4840/factory/server/")
@@ -228,6 +240,21 @@ async def main() -> None:
         async with server:
             while True:
                 snapshot = load_snapshot()
+                current_tag_ids = {tag["tag"] for tag in snapshot["tags"]}
+                added_ids = current_tag_ids - known_tag_ids
+                removed_ids = known_tag_ids - current_tag_ids
+                if added_ids:
+                    namespace_index, factory, area_nodes, asset_nodes = opcua_context
+                    await add_opcua_tags(server, namespace_index, factory,
+                        [tag for tag in snapshot["tags"] if tag["tag"] in added_ids],
+                        opc_nodes, area_nodes, asset_nodes)
+                for tag_id in removed_ids:
+                    if tag_id in opc_nodes:
+                        await opc_nodes[tag_id][1].write_value("STALE")
+                if added_ids or removed_ids:
+                    write_register_map(snapshot["tags"])
+                    logging.info("Tag schema changed: %d added, %d removed; register map refreshed", len(added_ids), len(removed_ids))
+                    known_tag_ids = current_tag_ids
                 fault_injector.sync(snapshot)
                 modbus_view = fault_injector.apply(snapshot, "Modbus TCP")
                 opcua_view = fault_injector.apply(snapshot, "OPC UA")

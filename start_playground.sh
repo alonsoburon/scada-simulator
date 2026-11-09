@@ -11,9 +11,8 @@ fi
 
 export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 SNAPSHOT="$ROOT/scada_playground/.runtime/factory_snapshot.json"
-# The gateway builds its fixed Modbus/OPC UA tag model from the first snapshot.
-# Discard a previous run's generated snapshot so startup waits for the fresh
-# dashboard session and cannot expose an obsolete schema after an upgrade.
+# Discard the last generated snapshot so the gateway waits for a fresh dashboard
+# session. The gateway can also add/remove tag IDs while the simulator is running.
 rm -f "$SNAPSHOT"
 "$ROOT/.venv/bin/streamlit" run scada_playground/app.py \
   --server.address 127.0.0.1 --server.port 8501 --server.headless true &

@@ -28,6 +28,24 @@ class ScenarioDefinition:
 
 
 SCENARIOS = {
+    "concentrator-mill-degradation": ScenarioDefinition(
+        scenario_id="concentrator-mill-degradation",
+        name="Hard ore and grinding circuit degradation",
+        description="Ore hardness increases naturally while a mechanical fault degrades grinding; power, circulating load, product size, recovery, water demand, and stockpiles interact.",
+        duration_seconds=5_400,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Mechanical degradation", "severity": "Medium",
+                                             "target_area": "Grinding and flotation", "duration_seconds": 2_400}),
+            ScenarioStep(1_800, "incident", {"incident_name": "Utility loss", "severity": "Small",
+                                               "target_area": "Mine power network", "duration_seconds": 600}),
+        ),
+        expected_observations=(
+            "The harder ore signal changes mill energy requirement and P80 with residence-time lag.",
+            "Grinding degradation limits fresh-feed capacity and shifts power, cyclone recirculating load, and copper recovery.",
+            "Mine power disturbance derates the concentrator and the coupled water pump station; inventory buffers delay process effects.",
+            "After the faults clear, process variables and inventories recover at different rates.",
+        ),
+    ),
     "mine-water-pump-and-demand": ScenarioDefinition(
         scenario_id="mine-water-pump-and-demand",
         name="Mine water demand surge and pump degradation",

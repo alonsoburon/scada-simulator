@@ -47,6 +47,13 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertGreater(self.state["demand_m3h"], baseline)
         self.assertLess(self.state["water_recovery_pct"], 68)
 
+    def test_concentrator_makeup_is_added_as_fresh_demand_not_recycled(self):
+        self.model.advance(self.state, 1, [], concentrator_demand_m3h=260)
+        self.assertAlmostEqual(self.state["demand_m3h"], self.state["base_demand_m3h"] + 260)
+        self.assertEqual(self.state["concentrator_demand_m3h"], 260)
+        self.assertLess(self.state["links"]["reclaim_return"]["inlet_flow_m3h"],
+                        self.state["base_demand_m3h"] * self.state["water_recovery_pct"] / 100 + 1)
+
     def test_telemetry_includes_flow_and_storage_in_engineering_units(self):
         tags, diagram = self.model.telemetry(self.state)
         by_id = {tag["tag"]: tag for tag in tags}

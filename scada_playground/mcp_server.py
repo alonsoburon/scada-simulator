@@ -181,6 +181,17 @@ def get_water_network_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_concentrator_state() -> dict[str, Any]:
+    """Read ore buffers, mill limits, grind size, flotation recovery, water use, and power."""
+    data = snapshot()
+    concentrator = data.get("concentrator")
+    if not concentrator:
+        raise RuntimeError("Concentrator model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **concentrator}
+
+
+@mcp.tool()
 def list_protocol_faults() -> dict[str, Any]:
     """List active protocol-output faults and their simulation-time expiry."""
     data = snapshot()

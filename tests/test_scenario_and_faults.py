@@ -107,6 +107,18 @@ class ProcessDeterminismTests(unittest.TestCase):
         model.advance(second)
         self.assertEqual(first["tags"], second["tags"])
 
+    def test_network_partition_marks_dynamic_model_measurements_stale_then_recovers(self):
+        sim = simulation_state()
+        sim["running"] = True
+        sim["tags"][0]["dynamic_model"] = True
+        model = FactoryProcessModel({"Grid distribution": []}, {"Network partition": "comms"},
+                                    lambda _unit, _tick: ())
+        model.inject(sim, "Network partition", "Grid distribution", "Small", duration_seconds=2)
+        model.advance(sim)
+        self.assertEqual(sim["tags"][0]["quality"], "STALE")
+        model.advance(sim)
+        self.assertEqual(sim["tags"][0]["quality"], "GOOD")
+
 
 if __name__ == "__main__":
     unittest.main()
