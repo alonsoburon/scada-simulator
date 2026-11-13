@@ -83,6 +83,7 @@ SCENARIOS = {
         ),
         expected_observations=(
             "The harder ore signal changes mill energy requirement and P80 with residence-time lag.",
+            "Mine block grade changes at the ROM stockpile while the blended flotation feed grade moves more slowly as copper-bearing ore turns over through ROM, crushed-ore, and SAG buffers.",
             "Grinding degradation limits fresh-feed capacity and shifts power, cyclone recirculating load, and copper recovery.",
             "Mine power disturbance derates the concentrator and the coupled water pump station; inventory buffers delay process effects.",
             "After the faults clear, process variables and inventories recover at different rates.",

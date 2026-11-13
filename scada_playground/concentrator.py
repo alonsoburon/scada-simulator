@@ -32,6 +32,13 @@ class CopperConcentrator:
         return {
             "sim_seconds": 0, "rom_stockpile_t": 18_000.0, "rom_feed_curtailed_t": 0.0,
             "initial_rom_stockpile_t": 18_000.0, "cumulative_rom_received_t": 0.0,
+            # Copper inventories travel with ore through each finite buffer. This
+            # lets ROM stockpiles blend geology instead of changing plant grade
+            # instantaneously when the mine moves to a new block.
+            "rom_copper_inventory_t": 18_000.0 * 0.0062,
+            "crushed_copper_inventory_t": 3_200.0 * 0.0062,
+            "sag_bin_copper_inventory_t": 410.0 * 0.0062,
+            "mine_block_grade_pct": 0.62,
             "cumulative_rom_discharge_t": 0.0, "initial_crushed_stockpile_t": 3_200.0,
             "cumulative_crushed_ore_t": 0.0, "cumulative_sag_feeder_t": 0.0,
             "initial_sag_bin_t": 410.0, "cumulative_sag_processed_t": 0.0,
@@ -102,6 +109,8 @@ class CopperConcentrator:
     def migrate(self, state: dict) -> None:
         """Add downstream-circuit state when a browser session predates this model."""
         keys = ("tailings_thickener_capacity_t", "concentrate_thickener_inventory_t",
+                    "rom_copper_inventory_t", "crushed_copper_inventory_t",
+                    "sag_bin_copper_inventory_t", "mine_block_grade_pct",
                     "concentrate_thickener_capacity_t", "filter_press_phase",
                     "filter_press_cycle_s", "filter_press_batch_t",
                     "filter_press_batch_capacity_t", "filter_press_cycle_count",
@@ -130,12 +139,15 @@ class CopperConcentrator:
                     "flotation_residence_time_min", "coarse_breakage_per_pass",
                     "intermediate_breakage_per_pass", "grind_model_revision")
         history_defaults = {"tailings_thickener_water_inventory_m3": 0.0,
+            "copper_feed_grade_pct": 0.62, "mine_block_grade_pct": 0.62,
             "grind_coarse_fraction": 0.6327, "grind_intermediate_fraction": 0.3561,
             "grind_fine_fraction": 0.0112, "cyclone_overflow_fraction": 0.5152,
             "circulating_load_ratio": 0.9411, "flotation_residence_time_min": 28.3,
             "coarse_breakage_per_pass": 0.798, "intermediate_breakage_per_pass": 0.600}
         for sample in state.get("history", []):
             sample.setdefault("tailings_thickener_water_inventory_m3", 0.0)
+            sample.setdefault("copper_feed_grade_pct", 0.62)
+            sample.setdefault("mine_block_grade_pct", 0.62)
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
                         "cyclone_overflow_fraction", "circulating_load_ratio", "flotation_residence_time_min",
                         "coarse_breakage_per_pass", "intermediate_breakage_per_pass"):
@@ -261,6 +273,15 @@ class CopperConcentrator:
         state["ore_hardness_factor"] = min(1.42, max(0.78,
             1.0 + 0.12 * math.sin(sim_seconds / 1_800) + 0.05 * math.sin(sim_seconds / 317 + 0.8)))
         state["ore_hardness_kwh_t"] = 17.0 * state["ore_hardness_factor"]
+        # Open-pit mining advances through geometallurgical blocks. Small seeded
+        # within-block variation represents local grade scatter while remaining
+        # exactly reproducible for a given simulation seed and timestamp.
+        grade_blocks_pct = (0.44, 0.72, 0.53, 0.91, 0.39, 0.63, 0.82, 0.48)
+        block_index = (sim_seconds // 1_800) % len(grade_blocks_pct)
+        block_rng = random.Random(seed + sim_seconds // 1_800)
+        mine_grade_pct = min(1.2, max(0.25,
+            grade_blocks_pct[block_index] + block_rng.gauss(0.0, 0.025)))
+        state["mine_block_grade_pct"] = mine_grade_pct
         crushing_wear = self._severity(events, "Mechanical degradation", ("Crushing and screening",))
         grinding_wear = self._severity(events, "Mechanical degradation", ("Grinding and flotation",))
         concentrate_wear = self._severity(events, "Mechanical degradation", ("Concentrate handling",))
@@ -335,8 +356,11 @@ class CopperConcentrator:
                               if equipment_available.get("flotation", True) else 0.0)
         requested_feed = min(plant_target, sag_capacity, ball_capacity, flotation_capacity)
 
-        rom_discharge = min(state["rom_stockpile_t"] * 3600.0, crusher_capacity, 1_250.0)
-        crushed_rate = min(rom_discharge, crusher_capacity) if jam < 0.95 else 0.0
+        # ROM is a surge stockpile, not a reclaim stream that empties on its
+        # own. A severe jam closes the feeder and holds the ore in the pile.
+        rom_discharge = (min(state["rom_stockpile_t"] * 3600.0, crusher_capacity, 1_250.0)
+                         if jam < 0.95 else 0.0)
+        crushed_rate = rom_discharge
         rom_space_t = max(0.0, 45_000.0 - state["rom_stockpile_t"])
         if mine_delivery_t is None:
             rom_feed = scheduled_rom_feed
@@ -372,12 +396,34 @@ class CopperConcentrator:
         state["cumulative_crushed_ore_t"] += crushed_rate * dt_h
         state["cumulative_sag_feeder_t"] += sag_feeder_rate * dt_h
         state["cumulative_sag_processed_t"] += sag_rate * dt_h
+        rom_grade_fraction = (state["rom_copper_inventory_t"] / max(state["rom_stockpile_t"], 1e-9)
+                              if state["rom_stockpile_t"] > 1e-9 else mine_grade_pct / 100.0)
+        crushed_grade_fraction = (state["crushed_copper_inventory_t"]
+                                  / max(state["crushed_stockpile_t"], 1e-9)
+                                  if state["crushed_stockpile_t"] > 1e-9 else rom_grade_fraction)
+        sag_grade_fraction = (state["sag_bin_copper_inventory_t"] / max(state["sag_bin_t"], 1e-9)
+                              if state["sag_bin_t"] > 1e-9 else crushed_grade_fraction)
+        rom_copper = (state["rom_copper_inventory_t"] + rom_received * mine_grade_pct / 100.0
+                      - rom_discharge * dt_h * rom_grade_fraction)
+        crushed_copper = (state["crushed_copper_inventory_t"]
+                          + crushed_rate * dt_h * rom_grade_fraction
+                          - sag_feeder_rate * dt_h * crushed_grade_fraction)
+        sag_copper = (state["sag_bin_copper_inventory_t"]
+                      + sag_feeder_rate * dt_h * crushed_grade_fraction
+                      - sag_rate * dt_h * sag_grade_fraction)
         state["rom_stockpile_t"] = min(45_000.0, max(0.0,
             state["rom_stockpile_t"] + rom_received - rom_discharge * dt_h))
         state["crushed_stockpile_t"] = min(8_000.0, max(0.0,
             state["crushed_stockpile_t"] + (crushed_rate - sag_feeder_rate) * dt_h))
         state["sag_bin_t"] = min(900.0, max(0.0,
             state["sag_bin_t"] + (sag_feeder_rate - sag_rate) * dt_h))
+        state["rom_copper_inventory_t"] = min(state["rom_stockpile_t"] * 0.012,
+                                               max(0.0, rom_copper))
+        state["crushed_copper_inventory_t"] = min(state["crushed_stockpile_t"] * 0.012,
+                                                   max(0.0, crushed_copper))
+        state["sag_bin_copper_inventory_t"] = min(state["sag_bin_t"] * 0.012,
+                                                  max(0.0, sag_copper))
+        state["copper_feed_grade_pct"] = 100.0 * sag_grade_fraction
 
         # Circuit composition changes over the 15-minute grind/cyclone residence
         # as fresh coarse ore mixes with size-dependent cyclone rejects.
@@ -406,7 +452,8 @@ class CopperConcentrator:
         water_recovery_penalty = (1.0 - water_factor) * 17.0
         recovery = min(94.0, max(0.0,
             kinetic_recovery - water_recovery_penalty - upset * 12.0))
-        concentrate = cyclone_overflow * (0.0062 * recovery / 100.0) / 0.25
+        concentrate = cyclone_overflow * (state["copper_feed_grade_pct"] / 100.0
+                                           * recovery / 100.0) / 0.25
         tailings = max(0.0, cyclone_overflow - concentrate)
         state["cumulative_concentrate_produced_t"] += concentrate * dt_h
         state["cumulative_tailings_received_t"] += tailings * dt_h
@@ -586,6 +633,8 @@ class CopperConcentrator:
             state["history"].append({"time": sim_seconds, "rom_stockpile_t": state["rom_stockpile_t"],
                 "crushed_stockpile_t": state["crushed_stockpile_t"], "sag_bin_t": state["sag_bin_t"],
                 "plant_feed_tph": state["plant_feed_tph"],
+                "copper_feed_grade_pct": state["copper_feed_grade_pct"],
+                "mine_block_grade_pct": state["mine_block_grade_pct"],
                 "copper_recovery_pct": state["copper_recovery_pct"], "p80_microns": state["p80_microns"],
                 "tailings_thickener_inventory_t": state["tailings_thickener_inventory_t"],
                 "tailings_thickener_water_inventory_m3": state["tailings_thickener_water_inventory_m3"],
@@ -611,6 +660,7 @@ class CopperConcentrator:
         readings = {
             "Open-pit mining": {
                 "Pit sector A": {"ore_rate": (state["rom_feed_tph"], "t/h", 0, 2_000),
+                    "ore_grade": (state["mine_block_grade_pct"], "% Cu", 0.2, 1.2),
                     "rom_stockpile": (state["rom_stockpile_t"], "t", 0, 45_000),
                     "mine_feed_curtailed": (state["rom_feed_curtailed_tph"], "t/h", 0, 2_000)},
             },
@@ -649,6 +699,7 @@ class CopperConcentrator:
                     "cyclone_overflow_partition": (100 * state["cyclone_overflow_fraction"], "%", 0, 100),
                     "equipment_running": (float(state["cyclone_overflow_tph"] > 5), "bool", 0, 1)},
                 "Flotation cells": {"ore_rate": (state["plant_feed_tph"], "t/h", 0, 2_000),
+                    "feed_grade": (state["copper_feed_grade_pct"], "% Cu", 0.2, 1.2),
                     "copper_recovery": (state["copper_recovery_pct"], "%", 0, 100),
                     "concentrate_grade": (state["concentrate_grade_pct"], "%", 0, 40),
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),

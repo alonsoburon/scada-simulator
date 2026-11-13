@@ -1615,14 +1615,20 @@ def render_dashboard():
         if not history.empty:
             with process_left:
                 trend = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.15,
-                                      specs=[[{"secondary_y": False}], [{"secondary_y": True}]])
+                                      specs=[[{"secondary_y": True}], [{"secondary_y": True}]])
                 trend.add_trace(go.Scatter(x=history.time, y=history.plant_feed_tph, name="Plant feed",
                                            line={"color": "#277da1"}), row=1, col=1)
+                trend.add_trace(go.Scatter(x=history.time, y=history.copper_feed_grade_pct,
+                                           name="Cu feed grade",
+                                           line={"color": "#9b5de5", "dash": "dot"}),
+                                row=1, col=1, secondary_y=True)
                 trend.add_trace(go.Scatter(x=history.time, y=history.copper_recovery_pct, name="Cu recovery",
                                            line={"color": "#43aa8b"}), row=2, col=1, secondary_y=False)
                 trend.add_trace(go.Scatter(x=history.time, y=history.p80_microns, name="Product P80",
                                            line={"color": "#f2a541"}), row=2, col=1, secondary_y=True)
-                trend.update_yaxes(title_text="Feed (t/h)", row=1, col=1)
+                trend.update_yaxes(title_text="Feed (t/h)", row=1, col=1, secondary_y=False)
+                trend.update_yaxes(title_text="Cu grade (%)", range=[0.2, 1.2],
+                                   row=1, col=1, secondary_y=True)
                 trend.update_yaxes(title_text="Recovery (%)", row=2, col=1, secondary_y=False)
                 trend.update_yaxes(title_text="P80 (µm)", row=2, col=1, secondary_y=True)
                 trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
