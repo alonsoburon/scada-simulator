@@ -6,10 +6,10 @@ from scada_playground.concentrator import CopperConcentrator
 
 
 ROUTES = {"Haul truck": [
-    ("Pit loading", -24.2910, -69.0810, 0),
+    ("Pit loading", -24.2910, -69.0810, 32),
     ("Pit ramp bend", -24.2870, -69.0765, 0),
     ("Haul road junction", -24.2815, -69.0730, 0),
-    ("Crusher tip", -24.2780, -69.0670, 0),
+    ("Crusher tip", -24.2780, -69.0670, 24),
     ("East return bend", -24.2810, -69.0605, 0),
     ("South return road", -24.2870, -69.0640, 0),
 ]}
@@ -77,6 +77,35 @@ class HaulTruckFleetTests(unittest.TestCase):
             self.model.advance(first, tick, incident, 18_000)
             self.model.advance(second, tick, incident, 18_000)
         self.assertEqual(first, second)
+
+    def test_route_grade_changes_travel_speed_and_loaded_fuel_rate(self):
+        cycle = self.model.cycles[self.model.truck_names[0]]
+        loaded_climb = next(segment for segment in cycle
+                            if segment["kind"] == "travel_loaded" and segment["road_grade_pct"] > 0)
+        loaded_flat = next(segment for segment in cycle
+                           if segment["kind"] == "travel_loaded" and abs(segment["road_grade_pct"]) < 1e-9)
+        loaded_descent = next(segment for segment in cycle
+                              if segment["kind"] == "travel_loaded" and segment["road_grade_pct"] < 0)
+        empty_climb = next(segment for segment in cycle
+                           if segment["kind"] == "travel_empty" and segment["road_grade_pct"] > 0)
+        empty_flat = next(segment for segment in cycle
+                          if segment["kind"] == "travel_empty" and abs(segment["road_grade_pct"]) < 1e-9)
+
+        def at_midpoint(segment):
+            return self.model._frame(self.model.truck_names[0],
+                                     segment["start"] + segment["duration"] / 2)
+
+        climb_frame, flat_frame, descent_frame = map(
+            at_midpoint, (loaded_climb, loaded_flat, loaded_descent))
+        self.assertGreater(climb_frame["road_grade_pct"], 0.0)
+        self.assertLess(climb_frame["speed_kmh"], flat_frame["speed_kmh"])
+        self.assertLess(descent_frame["speed_kmh"], flat_frame["speed_kmh"])
+        self.assertGreater(self.model._fuel_rate_lph(climb_frame),
+                           self.model._fuel_rate_lph(flat_frame))
+        self.assertLess(at_midpoint(empty_climb)["speed_kmh"],
+                        at_midpoint(empty_flat)["speed_kmh"])
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertIn("mobile_fleet.haul_truck_01.road_grade", tags)
 
     def test_trucks_refuel_at_the_shovel_queue_before_running_dry(self):
         self.run_ticks(self.state, 86_400)

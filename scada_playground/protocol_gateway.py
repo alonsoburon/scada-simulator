@@ -57,7 +57,8 @@ function connect(){const ws=new WebSocket((location.protocol==='https:'?'wss://'
    const icon=L.divIcon({className:'',html:`<div class="vehicle" style="color:${color};transform:rotate(${v.heading}deg)">▲</div>`,iconSize:[22,24],iconAnchor:[11,12]});
    if(!marker){marker=L.marker(point,{icon}).addTo(map);markers.set(v.unit,marker)}else{const from=marker.getLatLng();if(Math.abs(from.lat-point[0])+Math.abs(from.lng-point[1])>0.000001){marker.setIcon(icon);animate(marker,[from.lat,from.lng],point)}}
    const queue=Number(v.queue_position||0), queueText=queue>0?`<br>Queue position: ${queue}`:'';
-   marker.bindPopup(`<b>${v.unit}</b><br>${v.state}${queueText}<br>Speed: ${Number(v.speed_kmh).toFixed(1)} km/h<br>Payload: ${Number(v.payload_t).toFixed(0)} t`);
+   const grade=Number(v.road_grade_pct||0);
+   marker.bindPopup(`<b>${v.unit}</b><br>${v.state}${queueText}<br>Speed: ${Number(v.speed_kmh).toFixed(1)} km/h<br>Grade: ${grade.toFixed(1)}%<br>Payload: ${Number(v.payload_t).toFixed(0)} t`);
   }
   const t=Number(data.sim_seconds||0),status=`${data.running?'● SIM RUNNING':'○ SIM STOPPED'} · ${data.fleet.length} vehicles · ${String(Math.floor(t/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')} sim time`;
   if(document.getElementById('status').textContent!==status)document.getElementById('status').textContent=status;

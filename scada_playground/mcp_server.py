@@ -171,7 +171,7 @@ def get_fleet_positions(vehicle_type: str = "") -> dict[str, Any]:
 
 @mcp.tool()
 def get_haulage_state() -> dict[str, Any]:
-    """Read truck-cycle states, ROM delivery rate, payloads, fuel, and fleet quality tags."""
+    """Read FIFO shovel/tip queues, ROM commitments, truck cycles, grade, payload, and fuel tags."""
     data = snapshot()
     haulage = data.get("haulage")
     if not haulage:

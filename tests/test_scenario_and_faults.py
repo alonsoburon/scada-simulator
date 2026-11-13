@@ -60,6 +60,8 @@ class ScenarioRunnerTests(unittest.TestCase):
                             for note in definition.expected_observations))
         self.assertTrue(any("committed" in note.lower()
                             for note in definition.expected_observations))
+        self.assertTrue(any("elevation" in note.lower()
+                            for note in definition.expected_observations))
 
     def test_scenario_actions_are_dispatched_at_their_simulated_offset(self):
         runner = ScenarioRunner()
