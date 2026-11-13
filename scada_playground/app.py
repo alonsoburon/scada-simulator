@@ -244,7 +244,7 @@ def initialize(seed: int = 17) -> None:
         power_state = POWER_MODEL.initialize()
         initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
                                      + concentrator_state["crusher_power_mw"] + 1.0)
-        initial_water_power_mw = sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0
+        initial_water_power_mw = water_state["electrical_load_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
                             utility_load_mw=utility_state["electric_load_mw"], seed=seed)
@@ -310,7 +310,7 @@ def initialize(seed: int = 17) -> None:
                                                 + sim["water_network"]["concentrator_demand_m3h"]
                                                 + sim["water_network"].get("factory_cip_demand_m3h", 0.0))
         sim["tags"] = [tag for tag in sim["tags"]
-                       if not tag["tag"].startswith("water_supply_network.")]
+                       if not tag["tag"].startswith(("water_supply_network.", "water_treatment."))]
         water_tags, _water_diagram = WATER_MODEL.telemetry(sim["water_network"])
         for tag in water_tags:
             tag["dynamic_model"] = True
@@ -319,7 +319,7 @@ def initialize(seed: int = 17) -> None:
             sim["power_network"] = POWER_MODEL.initialize()
             process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
                                + sim["concentrator"]["crusher_power_mw"] + 1.0)
-            water_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
+            water_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw,
                                 utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
@@ -575,11 +575,11 @@ def advance(force: bool = False) -> None:
         seed=sim["seed"],
     )
     water_events = [event.__dict__ for event in sim["events"]
-                    if event.area in ("Water supply network", "Mine power network", "Whole factory")]
+                    if event.area in ("Water supply network", "Water treatment", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
                              + sim["concentrator"]["crusher_power_mw"] + 1.0)
-    water_power_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
+    water_power_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw,
@@ -616,26 +616,39 @@ def advance(force: bool = False) -> None:
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
     water = sim["water_network"]
     conditions = {
-        "process_tank_low": (water["nodes"]["process_tank"]["level_pct"] < 25,
+        "process_tank_low": ("Water supply network", water["nodes"]["process_tank"]["level_pct"] < 25,
                               "Process water tank low level", "HIGH"),
-        "unmet_process_demand": (water["unmet_demand_m3h"] > 1,
+        "unmet_process_demand": ("Water supply network", water["unmet_demand_m3h"] > 1,
                                   "Process water demand is not being met", "CRITICAL"),
-        "unmet_treated_water_demand": (water["unmet_treated_demand_m3h"] > 1,
+        "unmet_treated_water_demand": ("Water distribution", water["unmet_treated_demand_m3h"] > 1,
                                         "Treated water distribution demand is not being met", "HIGH"),
-        "raw_tank_high": (water["nodes"]["raw_tank"]["level_pct"] > 90,
+        "treated_water_turbidity_high": ("Water treatment", water["nodes"]["treated_tank"]["turbidity_ntu"] > 5.0,
+                                           "Treated service-water turbidity exceeds the operating target", "HIGH"),
+        "treated_water_chlorine_low": ("Water treatment", water["nodes"]["treated_tank"]["chlorine_residual_mg_l"] < 0.2,
+                                        "Treated service-water chlorine residual is below the operating target", "HIGH"),
+        "water_filter_backwash": ("Water treatment", water["treatment"]["mode"] == "BACKWASH",
+                                  "Service-water filter is in backwash; treated-water transfer is temporarily isolated", "MEDIUM"),
+        "water_filter_high_dp": ("Water treatment", water["treatment"]["filter_differential_pressure_kpa"] > 55,
+                                  "Service-water filter differential pressure is high; transfer capacity is reduced", "HIGH"),
+        "water_treatment_power_hold": ("Water treatment", water["treatment"]["mode"] == "POWER_HOLD",
+                                        "Service-water treatment is paused by low electrical supply", "HIGH"),
+        "water_treatment_chemical_low": ("Water treatment", water["treatment"]["coagulant_inventory_kg"] < 40
+                                          or water["treatment"]["chlorine_inventory_kg"] < 5,
+                                          "Water-treatment chemical inventory is low", "MEDIUM"),
+        "raw_tank_high": ("Water supply network", water["nodes"]["raw_tank"]["level_pct"] > 90,
                            "Raw water tank high level", "HIGH"),
-        "tank_spill": (any(node["overflow_m3"] > 0 for node in water["nodes"].values()),
+        "tank_spill": ("Water supply network", any(node["overflow_m3"] > 0 for node in water["nodes"].values()),
                        "Water tank overflow detected", "HIGH"),
     }
     prior_states = sim.setdefault("water_alarm_states", {})
-    for alarm_key, (active, message, severity) in conditions.items():
+    for alarm_key, (area, active, message, severity) in conditions.items():
         was_active = prior_states.get(alarm_key, False)
         if active and not was_active:
-            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water supply network",
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
                                      "severity": severity, "message": message,
                                      "state": "ACTIVE / UNACK"})
         elif was_active and not active:
-            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water supply network",
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
                                      "severity": "INFO", "message": f"{message} cleared",
                                      "state": "CLEARED"})
         prior_states[alarm_key] = active
@@ -920,11 +933,11 @@ def render_dashboard():
         water = sim["water_network"]
         diagram = published_snapshot["water_network"]
         st.markdown("### Mine water circuit · hydraulic network and level control")
-        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow packets, so a pump trip can leave downstream flow running until the line empties.")
+        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow and water-quality packets, so a pump trip can leave downstream flow running until the line empties.")
         metric_cols = st.columns(6)
         for col, label, value in zip(metric_cols, ["Total water demand", "Concentrator make-up", "Concentrator return",
                                                    "Background reclaim loop", "Water in transit", "Unmet demand"],
-                                     [f"{water['base_demand_m3h'] + sim['concentrator']['gross_process_water_m3h']:.0f} m³/h",
+                                     [f"{water['demand_m3h']:.0f} m³/h",
                                       f"{sim['concentrator']['water_makeup_m3h']:.0f} m³/h",
                                       f"{sim['concentrator']['concentrator_reclaim_m3h']:.0f} m³/h",
                                       f"{water['water_recovery_pct']:.0f}%", f"{diagram['pipe_inventory_m3']:.0f} m³",
@@ -932,6 +945,14 @@ def render_dashboard():
             col.metric(label, value)
         st.caption(f"Concentrator gross draw: {sim['concentrator']['gross_process_water_m3h']:.0f} m³/h · "
                    f"cumulative spill: {water['total_spilled_m3']:.2f} m³ · total water inventory (tanks + pipes): {diagram['total_inventory_m3']:.0f} m³")
+        treatment = water["treatment"]
+        treated_tank = water["nodes"]["treated_tank"]
+        st.caption(f"Service-water treatment: {treatment['mode']} · treated tank {treated_tank['turbidity_ntu']:.1f} NTU / "
+                   f"{treated_tank['chlorine_residual_mg_l']:.2f} mg/L chlorine · filter ΔP "
+                   f"{treatment['filter_differential_pressure_kpa']:.1f} kPa · media loading "
+                   f"{100*treatment['filter_solids_kg']/WATER_MODEL.TREATMENT.FILTER_CAPACITY_KG:.0f}% · "
+                   f"coagulant {treatment['coagulant_inventory_kg']:.0f} kg / chlorine "
+                   f"{treatment['chlorine_inventory_kg']:.0f} kg")
         with st.expander("Operator controls · simulated equipment only"):
             pump_cols = st.columns(4)
             for col, (pump_name, pump) in zip(pump_cols, water["pumps"].items()):
@@ -1007,6 +1028,35 @@ def render_dashboard():
                             color_discrete_sequence=["#277da1", "#4cc9f0", "#f2a541", "#43aa8b", "#9b5de5"])
                 f.update_layout(uirevision="water-flow-trend")
                 st.plotly_chart(f, width="stretch")
+            st.markdown("**Service-water quality and filter loading**")
+            quality_col, filter_col = st.columns(2)
+            with quality_col:
+                quality_fig = go.Figure()
+                quality_fig.add_trace(go.Scatter(x=hist["time"], y=hist["treated_turbidity_ntu"],
+                    name="Turbidity · NTU", line={"color": "#2A9D8F"}))
+                quality_fig.add_trace(go.Scatter(x=hist["time"], y=hist["treated_chlorine_residual_mg_l"],
+                    name="Chlorine residual · mg/L", yaxis="y2", line={"color": "#6A4C93"}))
+                quality_fig.update_layout(height=300, xaxis_title="Simulated seconds",
+                    yaxis={"title": "Turbidity (NTU)", "title_font": {"color": "#2A9D8F"},
+                           "tickfont": {"color": "#2A9D8F"}},
+                    yaxis2={"title": "Chlorine residual (mg/L)", "overlaying": "y", "side": "right",
+                            "title_font": {"color": "#6A4C93"}, "tickfont": {"color": "#6A4C93"}},
+                    legend={"orientation": "h", "y": 1.15}, uirevision="water-quality-trend")
+                st.plotly_chart(quality_fig, width="stretch")
+            with filter_col:
+                filter_fig = go.Figure()
+                filter_fig.add_trace(go.Scatter(x=hist["time"], y=hist["filter_differential_pressure_kpa"],
+                    name="Filter differential pressure · kPa", line={"color": "#E76F51"}))
+                filter_fig.add_trace(go.Scatter(x=hist["time"], y=hist["filter_solids_loading_pct"],
+                    name="Media solids loading · %", yaxis="y2", line={"color": "#457B9D"}))
+                filter_fig.update_layout(height=300, xaxis_title="Simulated seconds",
+                    yaxis={"title": "Differential pressure (kPa)", "title_font": {"color": "#E76F51"},
+                           "tickfont": {"color": "#E76F51"}},
+                    yaxis2={"title": "Media solids loading (%)", "overlaying": "y", "side": "right",
+                            "range": [0, 100], "title_font": {"color": "#457B9D"},
+                            "tickfont": {"color": "#457B9D"}},
+                    legend={"orientation": "h", "y": 1.15}, uirevision="water-filter-trend")
+                st.plotly_chart(filter_fig, width="stretch")
             st.markdown("**Concentrator water balance · simulated flow rates**")
             f = px.line(hist, x="time", y=["concentrator_gross_demand_m3h", "concentrator_makeup_m3h",
                                              "concentrator_reclaim_m3h"],

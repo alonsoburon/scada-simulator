@@ -20,6 +20,14 @@ def simulation_state() -> dict:
 
 
 class ScenarioRunnerTests(unittest.TestCase):
+    def test_water_treatment_scenario_exercises_quality_lag_and_recovery(self):
+        definition = ScenarioRunner().definition("mine-water-treatment-upset-and-recovery")
+        self.assertEqual(definition.steps[0].parameters["target_area"], "Water treatment")
+        self.assertEqual(definition.steps[0].parameters["severity"], "Large")
+        self.assertGreater(definition.duration_seconds, 20_000)
+        self.assertTrue(any("quality" in note.lower() and "tank" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_mine_grid_support_scenario_has_reserve_and_recovery_evidence(self):
         runner = ScenarioRunner()
         definition = runner.definition("mine-grid-support-and-recovery")

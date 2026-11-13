@@ -101,6 +101,22 @@ SCENARIOS = {
             "Demand, pump performance, and tank inventory return toward normal after both events clear.",
         ),
     ),
+    "mine-water-treatment-upset-and-recovery": ScenarioDefinition(
+        scenario_id="mine-water-treatment-upset-and-recovery",
+        name="Water-treatment quality upset and recovery",
+        description="A high-turbidity source upset loads clarification and filtration, consumes treatment chemicals, and propagates through delayed transfer into the treated-water tank before quality recovers.",
+        duration_seconds=21_600,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Process upset", "severity": "Large",
+                                             "target_area": "Water treatment", "duration_seconds": 14_400}),
+        ),
+        expected_observations=(
+            "Influent turbidity rises during the raw-water disturbance while coagulant dose and filter loading affect removal performance.",
+            "The reclaim-to-treated transfer line delays the quality front; the service-water tank buffers the downstream signal rather than changing instantly.",
+            "Filter differential pressure and chemical inventories trend with solids capture and treated-water flow.",
+            "After the source upset clears, the clarifier/filter output improves first and the finite treated-water tank quality recovers more slowly.",
+        ),
+    ),
     "boiler-header-pressure-and-recovery": ScenarioDefinition(
         scenario_id="boiler-header-pressure-and-recovery",
         name="Boiler trip, steam header depletion, and recovery",

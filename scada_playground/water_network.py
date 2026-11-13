@@ -9,11 +9,17 @@ import math
 import random
 from collections import deque
 
+try:
+    from .water_treatment import ServiceWaterTreatment
+except ImportError:
+    from water_treatment import ServiceWaterTreatment
+
 
 class MineWaterNetwork:
     """Mine-water storage and delayed links, advanced at one-second steps."""
 
     AREA = "Water supply network"
+    TREATMENT = ServiceWaterTreatment()
     NODES = {
         "north_reservoir": {"label": "North reservoir", "capacity_m3": 12_000.0,
                             "area_m2": 1_200.0, "elevation_m": 80.0, "initial_m3": 8_400.0},
@@ -56,7 +62,7 @@ class MineWaterNetwork:
                             "length_m": 360.0, "diameter_m": 0.30, "roughness_m": 0.00015,
                             "minor_loss_k": 22.0, "valve_loss_k": 2.0, "max_flow_m3h": 300.0,
                             "pump": None, "valve": "Reclaim return valve"},
-        "reclaim_transfer": {"label": "Reclaim → treated tank", "from": "reclaim_pond", "to": "treated_tank",
+        "reclaim_transfer": {"label": "Reclaim pond → treatment → treated tank", "from": "reclaim_pond", "to": "treated_tank",
                              "length_m": 520.0, "diameter_m": 0.35, "roughness_m": 0.00015,
                              "minor_loss_k": 14.0, "valve_loss_k": 1.8, "max_flow_m3h": 420.0,
                              "pump": "Reclaim pump", "valve": "Reclaim transfer valve"},
@@ -107,7 +113,9 @@ class MineWaterNetwork:
                 "water_recovery_pct": 68.0, "concentrator_recovery_pct": 0.0,
                 "history": [], "total_spilled_m3": 0.0, "cumulative_source_withdrawal_m3": 0.0,
                 "cumulative_process_consumption_m3": 0.0, "cumulative_treated_delivery_m3": 0.0,
+                "cumulative_treatment_backwash_m3": 0.0,
                 "cumulative_concentrator_return_m3": 0.0,
+                "electrical_load_kw": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {}}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
@@ -124,6 +132,11 @@ class MineWaterNetwork:
                                         pressure_kpa=pressure, available=flow > 0.1,
                                         pipe_volume_m3=pipe_volume, transport_delay_s=delay,
                                         transport_queue=deque([flow / 3600.0] * delay))
+            if key == "reclaim_transfer":
+                state["links"][key]["quality_transport_queue"] = deque(
+                    [{"turbidity_ntu": 4.0, "chlorine_residual_mg_l": 0.45} for _ in range(delay)])
+        state["treatment"] = self.TREATMENT.initialize()
+        state["nodes"]["treated_tank"].update(turbidity_ntu=4.0, chlorine_residual_mg_l=0.45)
         for name, pump in state["pumps"].items():
             link_key = next(key for key, spec in self.LINKS.items() if spec["pump"] == name)
             flow_m3s = state["links"][link_key]["inlet_flow_m3h"] / 3600.0
@@ -131,6 +144,8 @@ class MineWaterNetwork:
             electrical_kw = hydraulic_kw / max(self.PUMPS[name]["hydraulic_efficiency"], 0.1)
             pump["power_kw"] = electrical_kw
             pump["current_a"] = electrical_kw * 1000.0 / (math.sqrt(3) * 690.0 * 0.86)
+        state["electrical_load_kw"] = (sum(pump["power_kw"] for pump in pumps.values())
+                                       + state["treatment"]["electrical_load_kw"])
         return state
 
     def migrate(self, state: dict) -> None:
@@ -141,13 +156,33 @@ class MineWaterNetwork:
             for item, value in defaults[key].items():
                 state[key].setdefault(item, value)
         for key, value in defaults.items():
-            if key not in {"nodes", "pumps", "controllers", "valves", "links"}:
+            if key not in {"nodes", "pumps", "controllers", "valves", "links", "treatment"}:
                 state.setdefault(key, value)
+        if "treatment" not in state:
+            state["treatment"] = self.TREATMENT.initialize()
+            state["treatment"]["last_advance_seconds"] = state.get("sim_seconds", 0)
+        elif "last_advance_seconds" not in state["treatment"]:
+            state["treatment"]["last_advance_seconds"] = state.get("sim_seconds", 0)
+        state["nodes"]["treated_tank"].setdefault("turbidity_ntu", 4.0)
+        state["nodes"]["treated_tank"].setdefault("chlorine_residual_mg_l", 0.45)
+        self.TREATMENT.migrate(state["treatment"])
+        state["electrical_load_kw"] = (sum(pump["power_kw"] for pump in state["pumps"].values())
+                                       + state["treatment"]["electrical_load_kw"])
+        transfer_link = state["links"].get("reclaim_transfer", {})
+        transfer_link.setdefault("quality_transport_queue", deque(
+            [{"turbidity_ntu": state["nodes"]["treated_tank"]["turbidity_ntu"],
+              "chlorine_residual_mg_l": state["nodes"]["treated_tank"]["chlorine_residual_mg_l"]}
+             for _ in range(transfer_link.get("transport_delay_s", 1))]))
         for sample in state["history"]:
             sample.setdefault("concentrator_reclaim_sump_level_pct", 0.0)
             sample.setdefault("concentrator_gross_demand_m3h", 0.0)
             sample.setdefault("concentrator_reclaim_m3h", 0.0)
             sample.setdefault("concentrator_makeup_m3h", 0.0)
+            sample.setdefault("treated_turbidity_ntu", 4.0)
+            sample.setdefault("treated_chlorine_residual_mg_l", 0.45)
+            sample.setdefault("filter_differential_pressure_kpa", 18.0)
+            sample.setdefault("filter_solids_loading_pct", 0.0)
+            sample.setdefault("filter_mode", "FILTERING")
 
     @staticmethod
     def _level(node: dict) -> float:
@@ -180,7 +215,10 @@ class MineWaterNetwork:
         source, destination = state["nodes"][spec["from"]], state["nodes"][spec["to"]]
         static_head = self.NODES[spec["from"]]["elevation_m"] + self._level(source)
         destination_head = self.NODES[spec["to"]]["elevation_m"] + self._level(destination)
-        head_at_zero = pump_head_at_zero + static_head - destination_head
+        filter_pressure_kpa = (state.get("treatment", {}).get("filter_differential_pressure_kpa", 18.0)
+                               if key == "reclaim_transfer" else 0.0)
+        filter_head_loss_m = filter_pressure_kpa / 9.80665
+        head_at_zero = pump_head_at_zero + static_head - destination_head - filter_head_loss_m
         if head_at_zero <= 0:
             return 0.0, 0.0
 
@@ -219,7 +257,7 @@ class MineWaterNetwork:
                     high = midpoint
             flow_m3s = (low + high) / 2.0
         flow_m3h = flow_m3s * 3600.0
-        pressure_drop_kpa = losses(flow_m3s) * 9.80665
+        pressure_drop_kpa = losses(flow_m3s) * 9.80665 + filter_pressure_kpa
         if spec["pump"]:
             pump_head = pump_head_at_zero - pump_curve_slope * flow_m3s**2
             state["pumps"][spec["pump"]]["pump_head_m"] = max(0.0, pump_head)
@@ -234,7 +272,8 @@ class MineWaterNetwork:
         state["sim_seconds"] = sim_seconds
         state["sensor_rng_seed"] = seed
         stress = max(({"Small": 1.2, "Medium": 1.6, "Large": 2.1}[e["severity"]]
-                      for e in active_events if e["name"] == "Process upset"), default=1.0)
+                      for e in active_events if e["name"] == "Process upset"
+                      and e["area"] in ("Water supply network", "Whole factory")), default=1.0)
         state["concentrator_demand_m3h"] = max(0.0, concentrator_demand_m3h)
         state["concentrator_reclaim_m3h"] = max(0.0, concentrator_reclaim_m3h)
         state["factory_cip_demand_m3h"] = max(0.0, factory_cip_demand_m3h)
@@ -248,11 +287,13 @@ class MineWaterNetwork:
         state["treated_demand_m3h"] = 96.0 * (1 + 0.12 * math.sin(sim_seconds / 137.0 + 1.2))
         state["water_recovery_pct"] = 68.0 if stress == 1.0 else max(35.0, 68.0 - (stress - 1.0) * 18)
         degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
-                           for e in active_events if e["name"] == "Mechanical degradation"), default=1.0)
+                           for e in active_events if e["name"] == "Mechanical degradation"
+                           and e["area"] in ("Water supply network", "Whole factory")), default=1.0)
         utility_factor = (max(0.0, min(1.0, power_available_fraction))
                           if power_available_fraction is not None else
                           min(({"Small": 0.75, "Medium": 0.42, "Large": 0.0}[e["severity"]]
                                for e in active_events if e["name"] == "Utility loss"), default=1.0))
+        self.TREATMENT.prepare(state["treatment"], sim_seconds, active_events, utility_factor)
 
         # PI loops regulate the three pumped tank inlets. Output moves through a VFD ramp limit.
         for name, pump in state["pumps"].items():
@@ -282,6 +323,8 @@ class MineWaterNetwork:
         pressure = {}
         for key, spec in self.LINKS.items():
             requested[key], pressure[key] = self._link_reading(state, key, spec)
+        if state["treatment"]["mode"] != "FILTERING":
+            requested["reclaim_transfer"] = 0.0
 
         # Transfer plug-flow packets through each full pipe. The bounded deque is a
         # lightweight transport delay: one volumetric sample in and one out per step.
@@ -332,9 +375,34 @@ class MineWaterNetwork:
         transfer("reclaim_return", process_available_m3)
         reclaim_available = volumes["reclaim_pond"] + outlet["reclaim_return"] / 3600.0
         transfer("reclaim_transfer", reclaim_available)
+        treatment_link = state["links"]["reclaim_transfer"]
+        quality_queue = treatment_link["quality_transport_queue"]
+        quality_queue.append({"turbidity_ntu": state["treatment"]["effluent_turbidity_ntu"],
+                              "chlorine_residual_mg_l": state["treatment"]["chlorine_residual_mg_l"]})
+        treated_inlet_quality = quality_queue.popleft()
         treated_available_m3 = volumes["treated_tank"] + outlet["reclaim_transfer"] / 3600.0
         treated_served = min(state["treated_demand_m3h"], treated_available_m3 * 3600.0)
         state["unmet_treated_demand_m3h"] = state["treated_demand_m3h"] - treated_served
+        backwash_requested = (self.TREATMENT.BACKWASH_FLOW_M3H
+                              if state["treatment"]["mode"] == "BACKWASH" else 0.0)
+        backwash_water = min(backwash_requested,
+            max(0.0, treated_available_m3 - treated_served / 3600.0) * 3600.0)
+        self.TREATMENT.advance(state["treatment"], sim_seconds,
+                               inlet["reclaim_transfer"], backwash_water)
+
+        # Mixed-tank component balances preserve water quality as inventory changes.
+        old_treated_volume = volumes["treated_tank"]
+        new_treated_volume = old_treated_volume + (outlet["reclaim_transfer"]
+                                                    - treated_served - backwash_water) / 3600.0
+        for quality_key in ("turbidity_ntu", "chlorine_residual_mg_l"):
+            old_quality = state["nodes"]["treated_tank"][quality_key]
+            incoming_quality = treated_inlet_quality[quality_key]
+            quality_mass = (old_quality * old_treated_volume
+                            + incoming_quality * outlet["reclaim_transfer"] / 3600.0
+                            - old_quality * (treated_served + backwash_water) / 3600.0)
+            state["nodes"]["treated_tank"][quality_key] = (
+                max(0.0, quality_mass / new_treated_volume) if new_treated_volume > 1e-9 else 0.0)
+        state["nodes"]["treated_tank"]["chlorine_residual_mg_l"] *= math.exp(-0.00001)
 
         net_m3h = {key: 0.0 for key in self.NODES}
         net_m3h["concentrator_reclaim_sump"] += state["concentrator_reclaim_m3h"]
@@ -343,7 +411,7 @@ class MineWaterNetwork:
             net_m3h[link["to"]] += outlet[link_key]
         process_consumption = max(0.0, served - inlet["reclaim_return"])
         net_m3h["process_tank"] -= process_consumption
-        net_m3h["treated_tank"] -= treated_served
+        net_m3h["treated_tank"] -= treated_served + backwash_water
         spilled = 0.0
         for key, node in state["nodes"].items():
             node["inflow_m3h"] = sum(outlet[link_key] for link_key, link in self.LINKS.items()
@@ -353,7 +421,7 @@ class MineWaterNetwork:
             if key == "process_tank":
                 node["outflow_m3h"] += process_consumption
             elif key == "treated_tank":
-                node["outflow_m3h"] += treated_served
+                node["outflow_m3h"] += treated_served + backwash_water
             raw_volume = node["volume_m3"] + net_m3h[key] / 3600.0
             node_spill = 0.0
             if raw_volume > node["capacity_m3"]:
@@ -369,6 +437,7 @@ class MineWaterNetwork:
         state["cumulative_source_withdrawal_m3"] += inlet["raw_transfer"] / 3600.0
         state["cumulative_process_consumption_m3"] += process_consumption / 3600.0
         state["cumulative_treated_delivery_m3"] += treated_served / 3600.0
+        state["cumulative_treatment_backwash_m3"] += backwash_water / 3600.0
         state["cumulative_concentrator_return_m3"] += state["concentrator_reclaim_m3h"] / 3600.0
 
         # Derive shaft load and current from the operating point, then add a small
@@ -382,6 +451,8 @@ class MineWaterNetwork:
             pump["current_a"] = (electrical_kw * 1000.0 / (math.sqrt(3) * 690.0 * 0.86)
                                   if pump["running"] else 0.0)
             pump["vibration_mm_s"] = 1.2 + (1.0 - pump["efficiency"]) * 9.0 + max(0.0, 1.0 - flow_m3s * 3600 / self.PUMPS[name]["rated_flow_m3h"]) * 0.4
+        state["electrical_load_kw"] = (sum(pump["power_kw"] for pump in state["pumps"].values())
+                                       + state["treatment"]["electrical_load_kw"])
 
         if sim_seconds % 15 == 0:
             state["history"].append({"time": sim_seconds, "raw_tank_level_pct": state["nodes"]["raw_tank"]["level_pct"],
@@ -402,6 +473,11 @@ class MineWaterNetwork:
                                          0.0, state["concentrator_demand_m3h"]
                                          - state["concentrator_reclaim_m3h"]),
                                      "treated_demand_m3h": state["treated_demand_m3h"],
+                                     "treated_turbidity_ntu": state["nodes"]["treated_tank"]["turbidity_ntu"],
+                                     "treated_chlorine_residual_mg_l": state["nodes"]["treated_tank"]["chlorine_residual_mg_l"],
+                                     "filter_differential_pressure_kpa": state["treatment"]["filter_differential_pressure_kpa"],
+                                     "filter_solids_loading_pct": 100.0 * state["treatment"]["filter_solids_kg"] / self.TREATMENT.FILTER_CAPACITY_KG,
+                                     "filter_mode": state["treatment"]["mode"],
                                      "intake_pump_speed_pct": state["pumps"]["Intake pump"]["speed_pct"],
                                      "process_pump_speed_pct": state["pumps"]["Process feed pump"]["speed_pct"]})
             state["history"] = state["history"][-1_440:]
@@ -454,6 +530,9 @@ class MineWaterNetwork:
             add(asset, "controller_auto", float(controller["mode"] == "AUTO"), "bool", 0, 1)
         for name, opening in state["valves"].items():
             add(name.lower().replace(" ", "_"), "valve_position", opening, "%", 0, 100)
+        treated_tank = state["nodes"]["treated_tank"]
+        add("treated_tank", "turbidity", treated_tank["turbidity_ntu"], "NTU", 0, 100, 0.01)
+        add("treated_tank", "chlorine_residual", treated_tank["chlorine_residual_mg_l"], "mg/L", 0, 2, 0.01)
         add("process_demand", "water_demand", state["demand_m3h"], "m³/h", 0, 1_200, 0.005)
         add("process_demand", "unmet_demand", state["unmet_demand_m3h"], "m³/h", 0, 600, 0.005)
         add("process_demand", "water_recovery", state["water_recovery_pct"], "%", 0, 100, 0.002)
@@ -466,6 +545,9 @@ class MineWaterNetwork:
         add("process_demand", "factory_cip_effluent", state["factory_cip_effluent_m3h"], "m³/h", 0, 40, 0.005)
         add("process_demand", "treated_water_demand", state["treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         add("process_demand", "unmet_treated_water_demand", state["unmet_treated_demand_m3h"], "m³/h", 0, 300, 0.005)
+        add("process_demand", "treatment_backwash_flow", self.TREATMENT.BACKWASH_FLOW_M3H
+            if state["treatment"]["mode"] == "BACKWASH" else 0.0, "m³/h", 0, 30)
+        rows.extend(self.TREATMENT.telemetry(state["treatment"]))
         nodes = [{"id": key, "label": spec["label"], "level_pct": state["nodes"][key]["level_pct"],
                   "volume_m3": state["nodes"][key]["volume_m3"], "capacity_m3": spec["capacity_m3"]}
                  for key, spec in self.NODES.items()]
@@ -489,9 +571,15 @@ class MineWaterNetwork:
                        "demand_m3h": state["demand_m3h"],
                        "unmet_demand_m3h": state["unmet_demand_m3h"],
                        "treated_demand_m3h": state["treated_demand_m3h"],
-                       "electrical_load_kw": sum(pump["power_kw"] for pump in state["pumps"].values()),
+                       "electrical_load_kw": state["electrical_load_kw"],
                        "unmet_treated_demand_m3h": state["unmet_treated_demand_m3h"],
+                       "treated_water_quality": {"turbidity_ntu": state["nodes"]["treated_tank"]["turbidity_ntu"],
+                                                  "chlorine_residual_mg_l": state["nodes"]["treated_tank"]["chlorine_residual_mg_l"]},
+                       "treatment": {key: value for key, value in state["treatment"].items()
+                                     if key != "last_advance_seconds"},
                        "concentrator_recovery_pct": state["concentrator_recovery_pct"],
                        "pipe_inventory_m3": self.pipe_inventory_m3(state),
                        "total_inventory_m3": self.total_inventory_m3(state),
-                       "total_spilled_m3": state["total_spilled_m3"]}]
+                       "total_spilled_m3": state["total_spilled_m3"],
+                       "water_treatment": {key: value for key, value in state["treatment"].items()
+                                           if key != "last_advance_seconds"}}]

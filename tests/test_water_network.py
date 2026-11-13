@@ -26,6 +26,59 @@ class MineWaterNetworkTests(unittest.TestCase):
             self.assertGreaterEqual(node["volume_m3"], 0)
             self.assertLessEqual(node["volume_m3"], node["capacity_m3"])
 
+    def test_filter_backwash_consumes_tank_water_and_preserves_network_balance(self):
+        self.state["treatment"]["filter_solids_kg"] = self.model.TREATMENT.FILTER_CAPACITY_KG
+        initial_storage = self.model.total_inventory_m3(self.state)
+        for second in range(1, self.model.TREATMENT.FILTER_BACKWASH_SECONDS + 1):
+            self.model.advance(self.state, second, [])
+        self.assertGreater(self.state["cumulative_treatment_backwash_m3"], 0.5)
+        self.assertEqual(self.state["treatment"]["mode"], "FILTERING")
+        self.assertLess(self.state["treatment"]["filter_solids_kg"], 50)
+        expected = (initial_storage - self.state["cumulative_process_consumption_m3"]
+                    - self.state["cumulative_treated_delivery_m3"]
+                    - self.state["cumulative_treatment_backwash_m3"]
+                    - self.state["total_spilled_m3"])
+        self.assertAlmostEqual(self.model.total_inventory_m3(self.state), expected, places=6)
+
+    def test_loaded_filter_pressure_reduces_transfer_pump_flow(self):
+        normal, _ = self.model._link_reading(
+            self.state, "reclaim_transfer", self.model.LINKS["reclaim_transfer"])
+        self.state["treatment"]["filter_differential_pressure_kpa"] = 100.0
+        loaded, _ = self.model._link_reading(
+            self.state, "reclaim_transfer", self.model.LINKS["reclaim_transfer"])
+        self.assertLess(loaded, normal)
+
+    def test_local_treatment_power_loss_holds_filters_without_tripping_mine_pumps(self):
+        event = {"name": "Utility loss", "area": "Water treatment", "severity": "Large"}
+        self.model.advance(self.state, 1, [event], power_available_fraction=1.0)
+        self.assertEqual(self.state["treatment"]["mode"], "POWER_HOLD")
+        self.assertEqual(self.state["treatment"]["treatment_power_fraction"], 0.0)
+        self.assertTrue(all(pump["running"] for pump in self.state["pumps"].values()))
+
+    def test_treatment_quality_tracks_source_upset_and_finite_chemical_inventory(self):
+        treatment = self.state["treatment"]
+        treatment["coagulant_inventory_kg"] = 0.0
+        treatment["chlorine_inventory_kg"] = 0.0
+        upset = {"name": "Process upset", "area": "Water treatment", "severity": "Large"}
+        self.model.advance(self.state, 1, [upset])
+        self.assertGreater(treatment["influent_turbidity_ntu"], 100)
+        self.assertGreater(treatment["effluent_turbidity_ntu"], 20)
+        self.assertEqual(treatment["chlorine_residual_mg_l"], 0.0)
+        self.assertGreater(self.state["treatment"]["filter_differential_pressure_kpa"], 18.0)
+
+    def test_treated_tank_quality_follows_delayed_quality_front_and_mixes(self):
+        self.state["treatment"]["coagulant_inventory_kg"] = 0.0
+        self.state["treatment"]["chlorine_inventory_kg"] = 0.0
+        initial_turbidity = self.state["nodes"]["treated_tank"]["turbidity_ntu"]
+        upset = {"name": "Process upset", "area": "Water treatment", "severity": "Large"}
+        for second in range(1, 100):
+            self.model.advance(self.state, second, [upset])
+        self.assertAlmostEqual(self.state["nodes"]["treated_tank"]["turbidity_ntu"], initial_turbidity, places=2)
+        self.assertGreater(self.state["treatment"]["effluent_turbidity_ntu"], 20)
+        for second in range(100, 2_000):
+            self.model.advance(self.state, second, [upset])
+        self.assertGreater(self.state["nodes"]["treated_tank"]["turbidity_ntu"], initial_turbidity + 0.4)
+
     def test_utility_loss_propagates_to_flow_and_unmet_demand(self):
         self.step(60)
         normal_flow = self.state["links"]["process_feed"]["inlet_flow_m3h"]
@@ -96,6 +149,8 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(by_id["water_supply_network.raw_tank.stored_volume"]["units"], "m³")
         self.assertIn("water_supply_network.intake_pump.pump_running", by_id)
         self.assertIn("water_supply_network.raw_transfer_valve.valve_position", by_id)
+        self.assertIn("water_treatment.filter_train.differential_pressure", by_id)
+        self.assertIn("water_supply_network.treated_tank.turbidity", by_id)
         self.assertEqual(len(diagram[0]["nodes"]), 6)
         self.assertEqual(len(diagram[0]["links"]), 5)
         self.assertGreater(diagram[0]["electrical_load_kw"], 0)
@@ -134,6 +189,17 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(legacy["nodes"]["concentrator_reclaim_sump"]["volume_m3"], 0)
         self.assertTrue(legacy["pumps"]["Concentrator reclaim pump"]["enabled"])
         self.assertIn("concentrator_reclaim", legacy["links"])
+
+    def test_treatment_migration_from_live_session_advances_one_scan_only(self):
+        legacy = self.model.initialize()
+        legacy["sim_seconds"] = 50_000
+        del legacy["treatment"]
+        del legacy["nodes"]["treated_tank"]["turbidity_ntu"]
+        del legacy["nodes"]["treated_tank"]["chlorine_residual_mg_l"]
+        del legacy["links"]["reclaim_transfer"]["quality_transport_queue"]
+        self.model.advance(legacy, 50_001, [])
+        self.assertEqual(legacy["treatment"]["last_advance_seconds"], 50_001)
+        self.assertLess(legacy["treatment"]["cumulative_treated_m3"], 0.2)
 
     def test_level_pi_loops_hold_the_process_tank_near_its_setpoint(self):
         self.step(10_000)
