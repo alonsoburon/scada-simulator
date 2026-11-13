@@ -23,6 +23,10 @@ class FactoryUtilities:
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     HEADER_CAPACITY_T = 1.5
     RECEIVER_VOLUME_M3 = 80.0  # Receiver plus effective ring-main volume.
+    RECEIVER_MAX_PRESSURE_BAR_G = 8.0
+    AIR_STANDARD_PRESSURE_BAR = 1.01325
+    AIR_STANDARD_TEMPERATURE_K = 273.15
+    AIR_RECEIVER_TEMPERATURE_K = 293.15
     CONDENSATE_CAPACITY_T = 30.0
     PRODUCT_TANK_CAPACITY_UNITS = 450.0
     PACKAGE_BUFFER_CAPACITY_UNITS = 180.0
@@ -80,7 +84,7 @@ class FactoryUtilities:
             "air_demand_nm3_min": 78.0,
             "air_consumption_nm3_min": 78.0,
             "air_supply_nm3_min": 78.0,
-            "air_inventory_nm3": 560.0,
+            "air_inventory_nm3": self._air_inventory_at_pressure(7.0),
             "air_receiver_pressure_bar": 7.0,
             "air_service_fraction": 1.0,
             "dryer_available": True,
@@ -114,6 +118,11 @@ class FactoryUtilities:
             state["pasteurizers"].setdefault(name, unit.copy())
             for key, value in unit.items():
                 state["pasteurizers"][name].setdefault(key, value)
+        stored_pressure = float(state.get("air_receiver_pressure_bar", 0.0))
+        calculated_pressure = self._air_pressure_from_inventory(state["air_inventory_nm3"])
+        if abs(stored_pressure - calculated_pressure) > 0.05:
+            # Migrate inventory from the previous linear Nm³/m³ pressure proxy.
+            state["air_inventory_nm3"] = self._air_inventory_at_pressure(stored_pressure)
 
     @staticmethod
     def chilled_water_demand_kw(state: dict) -> float:
@@ -121,6 +130,23 @@ class FactoryUtilities:
         product_flow = sum(pasteurizer.get("process_rate", 90.0)
                            for pasteurizer in state["pasteurizers"].values())
         return max(0.0, product_flow) * 4.186 * (82.0 - 12.0) / 60.0
+
+    @classmethod
+    def _air_inventory_at_pressure(cls, gauge_pressure_bar: float) -> float:
+        """Normal cubic metres required for gauge pressure at fixed receiver temperature."""
+        absolute_pressure_bar = max(0.0, gauge_pressure_bar) + cls.AIR_STANDARD_PRESSURE_BAR
+        return (absolute_pressure_bar / cls.AIR_STANDARD_PRESSURE_BAR
+                * cls.RECEIVER_VOLUME_M3 * cls.AIR_STANDARD_TEMPERATURE_K
+                / cls.AIR_RECEIVER_TEMPERATURE_K)
+
+    @classmethod
+    def _air_pressure_from_inventory(cls, inventory_nm3: float) -> float:
+        """Convert standard-volume inventory to isothermal receiver gauge pressure."""
+        absolute_pressure_bar = (max(0.0, inventory_nm3) / cls.RECEIVER_VOLUME_M3
+                                 * cls.AIR_RECEIVER_TEMPERATURE_K
+                                 / cls.AIR_STANDARD_TEMPERATURE_K
+                                 * cls.AIR_STANDARD_PRESSURE_BAR)
+        return max(0.0, absolute_pressure_bar - cls.AIR_STANDARD_PRESSURE_BAR)
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
@@ -202,7 +228,7 @@ class FactoryUtilities:
             self._event_severity(events, "Process upset", ("Filling",)),
             self._event_severity(events, "Process upset", ("Packaging",)))
         air_demand = 78.0 * (1.0 + 0.32 * air_demand_fault)
-        pressure = max(0.0, state["air_inventory_nm3"] / self.RECEIVER_VOLUME_M3)
+        pressure = self._air_pressure_from_inventory(state["air_inventory_nm3"])
         air_service = max(0.0, min(1.0, (pressure - 4.5) / 2.0))
         actual_air_demand = air_demand * (0.10 + 0.90 * air_service)
         receiver_recovery_flow = max(0.0, 7.0 - pressure) * 15.0
@@ -223,9 +249,11 @@ class FactoryUtilities:
         state["air_demand_nm3_min"] = air_demand
         state["air_consumption_nm3_min"] = actual_air_demand
         state["air_supply_nm3_min"] = air_supply
-        state["air_inventory_nm3"] = max(0.0, min(8.0 * self.RECEIVER_VOLUME_M3,
+        state["air_inventory_nm3"] = max(0.0, min(
+            self._air_inventory_at_pressure(self.RECEIVER_MAX_PRESSURE_BAR_G),
             state["air_inventory_nm3"] + (air_supply - actual_air_demand) / 60.0))
-        state["air_receiver_pressure_bar"] = state["air_inventory_nm3"] / self.RECEIVER_VOLUME_M3
+        state["air_receiver_pressure_bar"] = self._air_pressure_from_inventory(
+            state["air_inventory_nm3"])
         state["air_service_fraction"] = max(0.0, min(1.0,
             (state["air_receiver_pressure_bar"] - 4.5) / 2.0))
         dryer_fault = self._event_severity(events, "Mechanical degradation", ("Compressed air",))
@@ -412,7 +440,9 @@ class FactoryUtilities:
             },
             ("Compressed air", "Receiver 01"): {
                 "receiver_pressure": (air_pressure, "bar", 0, 12),
-                "stored_air": (100 * state["air_inventory_nm3"] / (8 * self.RECEIVER_VOLUME_M3), "%", 0, 100),
+                "stored_air": (100 * state["air_inventory_nm3"]
+                               / self._air_inventory_at_pressure(self.RECEIVER_MAX_PRESSURE_BAR_G),
+                               "%", 0, 100),
                 "inlet_flow": (state["air_supply_nm3_min"], "Nm³/min", 0, 120),
                 "outlet_flow": (air, "Nm³/min", 0, 120),
             },
