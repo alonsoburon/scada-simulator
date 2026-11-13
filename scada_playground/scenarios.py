@@ -106,8 +106,9 @@ SCENARIOS = {
         ),
         expected_observations=(
             "Process demand rises and recovery percentage falls during the process upset.",
-            "Pump degradation lowers available head and linked flows; tank inventory responds with a lag.",
-            "Demand, pump performance, and tank inventory return toward normal after both events clear.",
+            "Pump degradation lowers available head and linked flows; tank inventory responds with a lag while pump health declines under operation.",
+            "When the incident clears, the immediate severity multiplier disappears but pump health loss remains until the pump is disabled, coasts down, and is maintained.",
+            "Demand and tank inventory recover at different rates; restoring a pump's condition does not instantly refill depleted tanks or water in transit.",
         ),
     ),
     "mine-water-treatment-upset-and-recovery": ScenarioDefinition(

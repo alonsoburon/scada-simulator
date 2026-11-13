@@ -326,7 +326,8 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 
 @mcp.tool()
 def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident",
-                                     "reset_feeder_protection", "maintain_equipment"],
+                                     "reset_feeder_protection", "maintain_equipment",
+                                     "maintain_water_pump"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
                        target_asset: str = "", fault_location_pct: float = 90.0,
@@ -334,7 +335,7 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                        target_tag: str = "") -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
     manually reset a locked-out distribution feeder after its fault has cleared, or maintain a
-    stopped process asset after its active mechanical fault has cleared.
+    stopped process asset or isolated water pump after its active mechanical fault has cleared.
 
     For incident injection, pass a known incident_name, severity Small/Medium/Large,
     and target_area (an area name or Whole factory). Electrical fault also requires
@@ -344,10 +345,12 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
     For maintain_equipment, target_asset must be one of the named concentrator assets; the asset
     must be STOPPED and its mechanical fault cleared before maintenance is allowed.
+    For maintain_water_pump, target_asset must be one of the named mine-water pumps; disable it,
+    allow it to coast to zero speed, and clear its mechanical fault first.
     No physical device can be controlled.
     """
     allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
-               "reset_feeder_protection", "maintain_equipment"}
+               "reset_feeder_protection", "maintain_equipment", "maintain_water_pump"}
     if action not in allowed:
         raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
     if action == "inject_incident":
@@ -391,6 +394,11 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                           "Concentrate handling", "Tailings and reclaim"}}
             if target_asset not in labels:
                 raise ValueError("maintain_equipment requires a named concentrator asset in target_asset")
+    if action == "maintain_water_pump":
+        data = snapshot()
+        pumps = data.get("water_network", {}).get("pumps", {})
+        if target_asset not in pumps:
+            raise ValueError("maintain_water_pump requires a named pump in target_asset")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds, "target_asset": target_asset or None,

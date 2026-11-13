@@ -593,6 +593,19 @@ def maintain_process_equipment(sim: dict, target_asset: str) -> float:
     return previous
 
 
+def maintain_water_pump(sim: dict, pump_name: str) -> float:
+    """Repair a water pump after fault clearance and physical coastdown."""
+    fault_active = any(event.name == "Mechanical degradation"
+                       and event.area in ("Water supply network", "Whole factory")
+                       for event in sim["events"])
+    previous = WATER_MODEL.maintain_pump(sim["water_network"], pump_name,
+                                         fault_active=fault_active)
+    sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water supply network",
+        "severity": "INFO", "message": f"Maintenance completed on {pump_name}; condition restored "
+        f"from {previous * 100:.1f}% to 100%", "state": "ACTIVE / UNACK"})
+    return previous
+
+
 def process_mcp_commands() -> list[tuple[str, dict]]:
     """Apply localhost MCP requests inside the simulator's owning Streamlit session."""
     if not MCP_COMMAND_DIR.exists():
@@ -658,6 +671,11 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 target_asset = command.get("target_asset", "")
                 previous = maintain_process_equipment(sim, target_asset)
                 message = (f"Maintenance completed on {target_asset}; equipment condition restored "
+                           f"from {previous * 100:.1f}% to 100%.")
+            elif action == "maintain_water_pump":
+                target_asset = command.get("target_asset", "")
+                previous = maintain_water_pump(sim, target_asset)
+                message = (f"Maintenance completed on {target_asset}; pump condition restored "
                            f"from {previous * 100:.1f}% to 100%.")
             elif action == "process_control":
                 control = sim["process_control"]
@@ -1368,6 +1386,28 @@ def render_dashboard():
                                                               int(pump["manual_speed_pct"]),
                                                               key=f"water_manual_speed_{ui_key}_{pump_name}")
                     col.caption(f"VFD feedback {pump['speed_pct']:.1f}% · {pump['current_a']:.1f} A · {pump['power_kw']:.1f} kW")
+            st.markdown("**Pump condition and maintenance**")
+            pump_condition_rows = [{"Pump": pump_name,
+                                    "Health": f"{pump.get('health_factor', 1.0) * 100:.1f}%",
+                                    "Enabled": "Yes" if pump["enabled"] else "No",
+                                    "Speed": f"{pump['speed_pct']:.1f}%"}
+                                   for pump_name, pump in water["pumps"].items()]
+            st.dataframe(pd.DataFrame(pump_condition_rows), hide_index=True, width="stretch")
+            maintenance_pump = st.selectbox("Pump for maintenance", list(water["pumps"]),
+                key=f"water_maintenance_pump_{sim['simulation_id']}")
+            selected_pump = water["pumps"][maintenance_pump]
+            water_fault_active = any(event.name == "Mechanical degradation"
+                and event.area in ("Water supply network", "Whole factory") for event in sim["events"])
+            pump_isolated = (not selected_pump["enabled"] and not selected_pump["running"]
+                             and selected_pump["speed_pct"] < 1.0)
+            if st.button("Maintain water pump", disabled=not pump_isolated or water_fault_active,
+                         key=f"maintain_water_pump_{sim['simulation_id']}"):
+                previous = maintain_water_pump(sim, maintenance_pump)
+                st.success(f"{maintenance_pump}: condition restored from {previous * 100:.1f}% to 100%.")
+            if not pump_isolated:
+                st.caption("Disable the pump and wait for VFD feedback to reach zero before maintenance.")
+            elif water_fault_active:
+                st.caption("Clear the active mechanical fault before maintaining a pump.")
             valve_cols = st.columns(5)
             for col, (valve_name, opening) in zip(valve_cols, list(water["valves"].items())):
                 with col:

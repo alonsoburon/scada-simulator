@@ -115,7 +115,8 @@ class MineWaterNetwork:
             initial_speed = 66.0
             pumps[name] = {**spec, "enabled": True, "running": True, "speed_pct": initial_speed,
                            "speed_command_pct": initial_speed, "manual_speed_pct": initial_speed,
-                           "condition_factor": 1.0, "efficiency": 1.0, "current_a": 0.0,
+                           "health_factor": 1.0, "condition_factor": 1.0,
+                           "efficiency": 1.0, "current_a": 0.0,
                            "power_kw": 0.0, "pump_head_m": 0.0, "vibration_mm_s": 1.2}
             gains = {"Intake pump": (1.0, 0.0003),
                      "Process feed pump": (1.2, 0.0010),
@@ -173,7 +174,7 @@ class MineWaterNetwork:
                 "cumulative_concentrator_return_m3": 0.0,
                 "electrical_load_kw": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {},
-                "schema_revision": 3,
+                "schema_revision": 4,
                 "distribution": self.DISTRIBUTION.initialize()}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
@@ -213,7 +214,7 @@ class MineWaterNetwork:
 
     def migrate(self, state: dict) -> None:
         """Add the concentrator reclaim circuit to sessions created by older builds."""
-        if state.get("schema_revision") == 3:
+        if state.get("schema_revision") == 4:
             ready = all(key in state for key in (
                 "nodes", "pumps", "controllers", "valves", "links", "treatment",
                 "wastewater", "distribution", "history"))
@@ -228,6 +229,8 @@ class MineWaterNetwork:
             if ready:
                 ready = all("previous_velocity_m_s" in state["links"][key]
                             for key in self.LINKS)
+            if ready:
+                ready = all("health_factor" in state["pumps"][name] for name in self.PUMPS)
             if ready:
                 return
         defaults = self.initialize()
@@ -252,6 +255,7 @@ class MineWaterNetwork:
             if key not in {"nodes", "pumps", "controllers", "valves", "links", "treatment", "wastewater", "distribution"}:
                 state.setdefault(key, value)
         for name, pump in state["pumps"].items():
+            pump.setdefault("health_factor", 1.0)
             pump.setdefault("coastdown_time_constant_s", self.PUMPS[name]["coastdown_time_constant_s"])
             pump.setdefault("check_valve_closure_time_s", self.PUMPS[name]["check_valve_closure_time_s"])
             pump.setdefault("check_valve_cracking_head_m", self.PUMPS[name]["check_valve_cracking_head_m"])
@@ -340,7 +344,22 @@ class MineWaterNetwork:
             sample.setdefault("wastewater_effluent_ph", 7.0)
             sample.setdefault("wastewater_effluent_tss_mg_l", 0.0)
             sample.setdefault("wastewater_sludge_hopper_kg", 0.0)
-        state["schema_revision"] = 3
+        state["schema_revision"] = 4
+
+    def maintain_pump(self, state: dict, pump_name: str, *, fault_active: bool = False) -> float:
+        """Restore a water pump only after electrical isolation and coastdown."""
+        if pump_name not in self.PUMPS:
+            raise ValueError(f"Unknown water pump: {pump_name!r}")
+        pump = state["pumps"][pump_name]
+        if pump["enabled"] or pump["running"] or pump["speed_pct"] >= 1.0:
+            raise ValueError("Disable the pump and wait for it to stop before maintenance")
+        if fault_active:
+            raise ValueError("Clear the active mechanical fault before carrying out maintenance")
+        previous = pump.get("health_factor", 1.0)
+        pump["health_factor"] = 1.0
+        pump["condition_factor"] = 1.0
+        pump["efficiency"] = 1.0
+        return previous
 
     @staticmethod
     def _level(node: dict) -> float:
@@ -594,6 +613,9 @@ class MineWaterNetwork:
         degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
                            for e in active_events if e["name"] == "Mechanical degradation"
                            and e["area"] in ("Water supply network", "Whole factory")), default=1.0)
+        fault_intensity = 1.0 - degradation
+        damage_per_s = (0.25 / 3_600.0 * (fault_intensity / 0.48) ** 2
+                        if fault_intensity > 0 else 0.0)
         grid_power_factor = (max(0.0, min(1.0, power_available_fraction))
                              if power_available_fraction is not None else 1.0)
         local_water_power_factor = min(({"Small": 0.75, "Medium": 0.42, "Large": 0.0}[e["severity"]]
@@ -608,9 +630,11 @@ class MineWaterNetwork:
 
         # PI loops regulate the three pumped tank inlets. Output moves through a VFD ramp limit.
         for name, pump in state["pumps"].items():
-            pump["condition_factor"] = degradation
-            pump["efficiency"] = degradation
             pump["running"] = pump["enabled"] and utility_factor > 0.01
+            if pump["running"]:
+                pump["health_factor"] = max(0.35, pump.get("health_factor", 1.0) - damage_per_s)
+            pump["condition_factor"] = pump["health_factor"] * degradation
+            pump["efficiency"] = pump["health_factor"] * degradation
             controller = state["controllers"][name]
             controlled_node = pump["controlled_node"]
             tag_name = f"water_supply_network.{controlled_node}.tank_level"
@@ -1002,6 +1026,7 @@ class MineWaterNetwork:
             add(asset, "pump_efficiency", self.PUMPS[name]["hydraulic_efficiency"] * pump["efficiency"] * 100.0,
                 "%", 0, 100)
             add(asset, "pump_condition", pump["condition_factor"] * 100.0, "%", 0, 100)
+            add(asset, "pump_health", pump.get("health_factor", 1.0) * 100.0, "%", 0, 100)
             add(asset, "pump_head", pump["pump_head_m"], "m", 0, 200, 0.006)
             add(asset, "motor_current", pump["current_a"], "A", 0, 800, 0.01)
             add(asset, "motor_power", pump["power_kw"], "kW", 0, 800, 0.01)
@@ -1060,7 +1085,8 @@ class MineWaterNetwork:
                                          "speed_command_pct": pump["speed_command_pct"],
                                          "current_a": pump["current_a"], "power_kw": pump["power_kw"],
                                          "pump_head_m": pump["pump_head_m"],
-                                         "condition_factor": pump["condition_factor"]}
+                                         "condition_factor": pump["condition_factor"],
+                                         "health_factor": pump.get("health_factor", 1.0)}
                                  for name, pump in state["pumps"].items()},
                        "valves": state["valves"], "controllers": state["controllers"],
                        "demand_m3h": state["demand_m3h"],
