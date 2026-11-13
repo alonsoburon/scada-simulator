@@ -196,6 +196,17 @@ def get_water_network_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_water_distribution_state() -> dict[str, Any]:
+    """Read elevated-tank storage, district pressure/service, customer demand, chlorine, and leakage."""
+    data = snapshot()
+    distribution = data.get("water_network", {}).get("distribution")
+    if not distribution:
+        raise RuntimeError("Water distribution model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **distribution}
+
+
+@mcp.tool()
 def get_wastewater_state() -> dict[str, Any]:
     """Read shared wastewater equalization, treatment, effluent quality, reuse, and sludge state."""
     data = snapshot()

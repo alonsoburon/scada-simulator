@@ -121,6 +121,25 @@ SCENARIOS = {
             "After the source upset clears, the clarifier/filter output improves first and the finite treated-water tank quality recovers more slowly.",
         ),
     ),
+    "water-distribution-outage-and-demand-recovery": ScenarioDefinition(
+        scenario_id="water-distribution-outage-and-demand-recovery",
+        name="District water outage, pressure loss, and refill recovery",
+        description="A district-pump feeder outage removes elevated-tank refill while customers continue drawing water; a demand upset accelerates storage loss, lowers pressure in the high district, and tests recovery after power returns.",
+        duration_seconds=28_800,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                             "target_area": "Water distribution", "duration_seconds": 18_000}),
+            ScenarioStep(1_800, "incident", {"incident_name": "Process upset", "severity": "Medium",
+                                               "target_area": "Water distribution", "duration_seconds": 3_600}),
+        ),
+        expected_observations=(
+            "The elevated tank buffers district demand after its refill pump loses power; tank level declines while the treated-water plant remains available.",
+            "A customer-demand surge and pressure-scaled leaks draw down storage faster; the highest district loses pressure and customer service before the lower districts.",
+            "Pressure-dependent demand curtails service as pressure approaches the district minimum, while chlorine continues to decay with water age.",
+            "When feeder power returns, the VFD refill flow ramps up, the elevated tank rebuilds inventory, and district pressure and served demand recover with different lags.",
+            "Compare district meters with total leakage and non-revenue water to distinguish customer demand from network loss.",
+        ),
+    ),
     "mine-water-level-transmitter-drift": ScenarioDefinition(
         scenario_id="mine-water-level-transmitter-drift",
         name="Water-tank transmitter drift",

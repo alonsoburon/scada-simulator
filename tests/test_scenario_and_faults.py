@@ -42,6 +42,17 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("quality" in note.lower() and "tank" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_water_distribution_scenario_overlaps_tank_outage_and_demand_surge(self):
+        definition = ScenarioRunner().definition("water-distribution-outage-and-demand-recovery")
+        outage, upset = definition.steps
+        self.assertEqual(outage.parameters["target_area"], "Water distribution")
+        self.assertEqual(outage.parameters["incident_name"], "Utility loss")
+        self.assertEqual(upset.parameters["incident_name"], "Process upset")
+        self.assertLess(upset.at_seconds,
+                        outage.at_seconds + outage.parameters["duration_seconds"])
+        self.assertTrue(any("pressure" in note.lower() and "tank" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_instrument_drift_scenario_targets_level_transmitter_not_process(self):
         definition = ScenarioRunner().definition("mine-water-level-transmitter-drift")
         step = definition.steps[0]

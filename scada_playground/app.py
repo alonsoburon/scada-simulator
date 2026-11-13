@@ -227,7 +227,7 @@ def initialize(seed: int = 17) -> None:
                                      "last_change": "Normal"})
         # The wastewater treatment model now owns this area's measurements;
         # discard the generic placeholder tags before publishing its asset tree.
-        tags = [tag for tag in tags if tag["area"] != "Wastewater"]
+        tags = [tag for tag in tags if tag["area"] not in {"Wastewater", "Water distribution"}]
         concentrator_state = CONCENTRATOR_MODEL.initialize()
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
@@ -296,6 +296,7 @@ def initialize(seed: int = 17) -> None:
                                 "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
+                                "water_distribution_alarm_states": {},
                                 "building_alarm_states": {},
                                 "ventilation_alarm_states": {},
                                 "concentrator_alarm_states": {},
@@ -357,7 +358,8 @@ def initialize(seed: int = 17) -> None:
                                                 + sim["water_network"]["concentrator_demand_m3h"]
                                                 + sim["water_network"].get("factory_cip_demand_m3h", 0.0))
         sim["tags"] = [tag for tag in sim["tags"]
-                       if not tag["tag"].startswith(("water_supply_network.", "water_treatment.", "wastewater."))]
+                       if not tag["tag"].startswith(("water_supply_network.", "water_treatment.",
+                                                     "water_distribution.", "wastewater."))]
         water_tags, _water_diagram = WATER_MODEL.telemetry(sim["water_network"])
         for tag in water_tags:
             tag["dynamic_model"] = True
@@ -672,7 +674,8 @@ def advance(force: bool = False) -> None:
         seed=sim["seed"],
     )
     water_events = [event.__dict__ for event in sim["events"]
-                    if event.area in ("Water supply network", "Water treatment", "Wastewater", "Mine power network", "Whole factory")]
+                    if event.area in ("Water supply network", "Water distribution", "Water treatment",
+                                      "Wastewater", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
                              + sim["concentrator"]["crusher_power_mw"] + 1.0
@@ -843,6 +846,40 @@ def advance(force: bool = False) -> None:
                                      "severity": "INFO", "message": f"{message} cleared",
                                      "state": "CLEARED"})
         prior_states[alarm_key] = active
+    distribution_alarm_states = sim.setdefault("water_distribution_alarm_states", {})
+    distribution = water["distribution"]
+    distribution_conditions = [("elevated_tank_low",
+        distribution["tank_level_pct"] < 20.0, distribution["tank_level_pct"] > 30.0,
+        "Elevated service tank is low; district pressure reserve is shrinking", "HIGH")]
+    for zone_name, zone in distribution["zones"].items():
+        key = zone_name.lower().replace(" ", "_") + "_low_pressure"
+        distribution_conditions.append((key,
+            zone["pressure_kpa"] < zone["minimum_pressure_kpa"],
+            zone["pressure_kpa"] > zone["minimum_pressure_kpa"] + 15.0,
+            f"{zone_name} pressure is below its minimum service threshold", "CRITICAL"))
+    distribution_conditions.append(("chlorine_residual_low",
+        distribution["chlorine_residual_mg_l"] < 0.20,
+        distribution["chlorine_residual_mg_l"] > 0.30,
+        "Elevated-tank chlorine residual is low; inspect water age and dosing", "HIGH"))
+    distribution_conditions.append(("turbidity_high",
+        distribution["turbidity_ntu"] > 5.0,
+        distribution["turbidity_ntu"] < 2.0,
+        "Elevated-tank turbidity is high; inspect treatment breakthrough or resuspension", "HIGH"))
+    for zone_name, zone in distribution["zones"].items():
+        key = zone_name.lower().replace(" ", "_") + "_chlorine_low"
+        distribution_conditions.append((key,
+            zone["chlorine_residual_mg_l"] < 0.20,
+            zone["chlorine_residual_mg_l"] > 0.30,
+            f"{zone_name} chlorine residual is low after estimated distribution residence time", "HIGH"))
+    for alarm_key, active, cleared, message, severity in distribution_conditions:
+        was_active = distribution_alarm_states.get(alarm_key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water distribution",
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Water distribution",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+        distribution_alarm_states[alarm_key] = active if not was_active else not cleared
     plant = sim["concentrator"]
     concentrator_conditions = {
         "low_crushed_inventory": ("Grinding and flotation", plant["crushed_stockpile_t"] < 500,
@@ -1287,6 +1324,58 @@ def render_dashboard():
                                   plot_bgcolor="white", paper_bgcolor="white",
                                   font={"color": "#243746"}, uirevision="water-network")
         st.plotly_chart(network_fig, width="stretch")
+        distribution = water["distribution"]
+        st.markdown("#### District water distribution · pressure, service, and leakage")
+        st.caption("The treatment outlet refills a finite elevated tank. Gravity pressure pays elevation and Darcy–Weisbach pipe losses; pressure-dependent demand and pressure-scaled leakage then determine each district's delivered flow. A low-pressure event can therefore leave customer demand unmet even while some stored water remains.")
+        district_metrics = st.columns(5)
+        for col, label, value in zip(district_metrics,
+            ["Elevated tank", "Customer service", "Customer demand", "Network leakage", "Refill pump"],
+            [f"{distribution['tank_level_pct']:.1f}% · {distribution['tank_volume_m3']:.0f}/{distribution['tank_capacity_m3']:.0f} m³",
+             f"{distribution['service_fraction']*100:.1f}%",
+             f"{distribution['customer_served_m3h']:.1f}/{distribution['customer_demand_m3h']:.1f} m³/h",
+             f"{distribution['leak_flow_m3h']:.2f} m³/h · {distribution['non_revenue_water_pct']:.1f}%",
+             f"{distribution['transfer_received_m3h']:.1f} m³/h · {distribution['pump_power_kw']:.1f} kW"]):
+            col.metric(label, value)
+        st.caption(f"Elevated tank quality: {distribution['chlorine_residual_mg_l']:.3f} mg/L chlorine · {distribution['turbidity_ntu']:.2f} NTU turbidity. Branch chlorine decays with estimated pipe residence time; the district model is a low-order hydraulic and quality approximation.")
+        district_rows = [{"District": name,
+                          "Pressure (kPa)": zone["pressure_kpa"],
+                          "Minimum (kPa)": zone["minimum_pressure_kpa"],
+                          "Demand (m³/h)": zone["customer_demand_m3h"],
+                          "Served (m³/h)": zone["customer_served_m3h"],
+                          "Unmet (m³/h)": zone["unmet_demand_m3h"],
+                          "Leak (m³/h)": zone["leak_flow_m3h"],
+                          "PRV (%)": zone["prv_position_pct"],
+                          "Water age (h)": zone["water_age_h"],
+                          "Chlorine (mg/L)": zone["chlorine_residual_mg_l"],
+                          "Turbidity (NTU)": zone["turbidity_ntu"]}
+                         for name, zone in distribution["zones"].items()]
+        st.dataframe(pd.DataFrame(district_rows).round(2), hide_index=True, width="stretch")
+        pressure_colors = {"District zone A": "#277da1", "District zone B": "#e07a5f",
+                           "District zone C": "#43aa8b"}
+        pressure_fig = go.Figure()
+        for name, zone in distribution["zones"].items():
+            pressure_fig.add_trace(go.Bar(x=[zone["pressure_kpa"]], y=[name], orientation="h",
+                name=name, marker_color=pressure_colors[name],
+                hovertemplate=f"{name}: {zone['pressure_kpa']:.1f} kPa<extra></extra>"))
+            pressure_fig.add_trace(go.Scatter(x=[zone["minimum_pressure_kpa"]], y=[name],
+                mode="markers", name=f"{name} minimum", marker={"symbol": "line-ns-open",
+                    "size": 17, "color": "#202833"}, showlegend=False,
+                hovertemplate=f"{name} service limit: {zone['minimum_pressure_kpa']:.0f} kPa<extra></extra>"))
+        pressure_fig.update_layout(title="District pressure and minimum service threshold",
+            xaxis_title="Pressure (kPa)", barmode="overlay", height=280,
+            legend={"orientation": "h", "y": 1.12},
+            uirevision="water-distribution-pressure")
+        st.plotly_chart(pressure_fig, width="stretch")
+        distribution_history = pd.DataFrame(distribution["history"])
+        if not distribution_history.empty:
+            pressure_history = px.line(distribution_history, x="sim_seconds",
+                y=["zone_a_pressure_kpa", "zone_b_pressure_kpa", "zone_c_pressure_kpa"],
+                labels={"sim_seconds": "Simulated seconds", "value": "Pressure (kPa)",
+                        "variable": "District"},
+                color_discrete_sequence=["#277da1", "#e07a5f", "#43aa8b"])
+            pressure_history.update_layout(title="District pressure through demand and feeder changes",
+                uirevision="water-distribution-pressure-history")
+            st.plotly_chart(pressure_history, width="stretch")
         wave_history = pd.DataFrame(water.get("pressure_wave_history", []))
         if not wave_history.empty:
             wave_link = st.selectbox("Pressure-wave line", list(WATER_MODEL.LINKS),
@@ -1311,16 +1400,17 @@ def render_dashboard():
         if not hist.empty:
             left, right = st.columns(2)
             with left:
-                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "concentrator_reclaim_sump_level_pct", "reclaim_pond_level_pct", "treated_tank_level_pct"],
+                f = px.line(hist, x="time", y=["raw_tank_level_pct", "process_tank_level_pct", "concentrator_reclaim_sump_level_pct", "reclaim_pond_level_pct", "treated_tank_level_pct", "distribution_tank_level_pct"],
                             labels={"time": "Simulated seconds", "value": "Tank level (%)", "variable": "Tank"},
-                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b", "#9b5de5"])
+                            color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b", "#9b5de5", "#e07a5f", "#577590"])
                 f.update_layout(uirevision="water-level-trend")
                 st.plotly_chart(f, width="stretch")
             with right:
                 f = px.line(hist, x="time", y=["intake_flow_m3h", "intake_arrival_m3h", "process_feed_m3h",
-                                                 "process_demand_m3h", "treated_demand_m3h"],
+                                                 "process_demand_m3h", "treated_demand_m3h",
+                                                 "treated_customer_demand_m3h"],
                             labels={"time": "Simulated seconds", "value": "Flow (m³/h)", "variable": "Flow"},
-                            color_discrete_sequence=["#277da1", "#4cc9f0", "#f2a541", "#43aa8b", "#9b5de5"])
+                            color_discrete_sequence=["#277da1", "#4cc9f0", "#f2a541", "#43aa8b", "#9b5de5", "#e07a5f"])
                 f.update_layout(uirevision="water-flow-trend")
                 st.plotly_chart(f, width="stretch")
             st.markdown("**Service-water quality and filter loading**")
