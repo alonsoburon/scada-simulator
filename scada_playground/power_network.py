@@ -572,33 +572,92 @@ class MinePowerNetwork:
             available_share = sum(share for name, share in shares.items() if closed[name])
             return {name: served * share / available_share if closed[name] and available_share > 0 else 0.0
                     for name, share in shares.items()}
-        process_by_feeder = branch_allocation(served_process, "process")
-        utility_by_feeder = branch_allocation(served_utility, "utility")
-        site_by_feeder = branch_allocation(served_site, "site")
-        feeder_loads = {name:
-            process_by_feeder.get(name, 0.0) + utility_by_feeder.get(name, 0.0)
-            + site_by_feeder.get(name, 0.0)
-            + (served_water if name == "south" and closed["south"] else 0.0)
-            for name in self.DISTRIBUTION_FEEDERS}
-        feeder_flows = self._radial_feeder_flows(
-            state["served_load_mw"], source_voltage, state["capacitor_bank_mvar"], feeder_loads)
-        for name, flow in feeder_flows.items():
-            prior = state["distribution_feeders"][name]
-            flow.update({key: prior[key] for key in (
-                "breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",
-                "relay_timer_s", "trip_count", "reclose_count", "reclose_timer_s",
-                "lockout", "last_trip_reason", "pickup_current_a", "fault_current_a",
-                "fault_location_pct", "relay_operation_count", "breaker_failure_count",
-                "relay_operated")})
-            flow["energized"] = bool(flow["breaker_closed"] and distribution_online)
-            if not flow["energized"]:
-                flow.update(active_power_mw=0.0, reactive_power_mvar=0.0,
-                            apparent_power_mva=0.0, current_a=0.0, loss_mw=0.0, loading_pct=0.0,
-                            voltage_pu=0.0, voltage_drop_pu=source_voltage)
-            elif flow["relay_pickup"]:
-                flow["current_a"] = flow["fault_current_a"]
-                flow["voltage_pu"] = max(0.70, flow["voltage_pu"]
-                                          - min(0.28, 0.035 * flow["relay_current_multiple"]))
+        def solve_feeder_flows() -> dict[str, dict[str, float]]:
+            process_by_feeder = branch_allocation(served_process, "process")
+            utility_by_feeder = branch_allocation(served_utility, "utility")
+            site_by_feeder = branch_allocation(served_site, "site")
+            feeder_loads = {name:
+                process_by_feeder.get(name, 0.0) + utility_by_feeder.get(name, 0.0)
+                + site_by_feeder.get(name, 0.0)
+                + (served_water if name == "south" and closed["south"] else 0.0)
+                for name in self.DISTRIBUTION_FEEDERS}
+            flows = self._radial_feeder_flows(
+                state["served_load_mw"], source_voltage, state["capacitor_bank_mvar"], feeder_loads)
+            for name, flow in flows.items():
+                prior = state["distribution_feeders"][name]
+                flow.update({key: prior[key] for key in (
+                    "breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",
+                    "relay_timer_s", "trip_count", "reclose_count", "reclose_timer_s",
+                    "lockout", "last_trip_reason", "pickup_current_a", "fault_current_a",
+                    "fault_location_pct", "relay_operation_count", "breaker_failure_count",
+                    "relay_operated")})
+                flow["energized"] = bool(flow["breaker_closed"] and distribution_online)
+                if not flow["energized"]:
+                    flow.update(active_power_mw=0.0, reactive_power_mvar=0.0,
+                                apparent_power_mva=0.0, current_a=0.0, loss_mw=0.0, loading_pct=0.0,
+                                voltage_pu=0.0, voltage_drop_pu=source_voltage)
+                elif flow["relay_pickup"]:
+                    flow["current_a"] = flow["fault_current_a"]
+                    flow["voltage_pu"] = max(0.70, flow["voltage_pu"]
+                                              - min(0.28, 0.035 * flow["relay_current_multiple"]))
+            return flows
+
+        # Reconcile dispatch against this scan's actual I²R losses. A previous
+        # scan's loss estimate can be badly low just after a feeder is restored.
+        other_generation = (solar + state["diesel_mw"] + max(0.0, state["battery_power_mw"]))
+        charge_power = max(0.0, -state["battery_power_mw"])
+        for _ in range(4):
+            feeder_flows = solve_feeder_flows()
+            state["distribution_losses_mw"] = sum(flow["loss_mw"] for flow in feeder_flows.values())
+            required_grid = (state["served_load_mw"] + charge_power
+                             + state["distribution_losses_mw"] - other_generation)
+            grid_import = min(tie_cap, max(0.0, required_grid))
+            state["grid_import_mw"] = grid_import
+            state["total_generation_mw"] = other_generation + grid_import
+            shortfall = max(0.0, required_grid - tie_cap)
+            if shortfall <= 1e-7:
+                break
+            # Preserve the same priority order as dispatch: shed flexible site
+            # demand first, then process, utility, water, and critical site load.
+            for key in ("flexible", "process", "utility", "water", "critical"):
+                if shortfall <= 1e-7:
+                    break
+                if key == "flexible":
+                    cut = min(served_flexible_site, shortfall)
+                    served_flexible_site -= cut
+                    served_site -= cut
+                elif key == "process":
+                    cut = min(served_process, shortfall)
+                    served_process -= cut
+                elif key == "utility":
+                    cut = min(served_utility, shortfall)
+                    served_utility -= cut
+                elif key == "water":
+                    cut = min(served_water, shortfall)
+                    served_water -= cut
+                else:
+                    cut = min(served_critical_site, shortfall)
+                    served_critical_site -= cut
+                    served_site -= cut
+                shortfall -= cut
+            state["site_load_mw"] = served_site
+            state["water_load_mw"] = served_water
+            state["factory_utilities_load_mw"] = served_utility
+            state["process_load_mw"] = served_process
+            state["served_load_mw"] = served_site + served_water + served_utility + served_process
+            state["load_shed_mw"] = max(0.0, site_request - served_site)
+            state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
+            state["process_power_fraction"] = (min(1.0, served_process / process_request)
+                                                if process_request > 1e-6 else 1.0)
+            state["water_power_fraction"] = (min(1.0, served_water / water_request)
+                                               if water_request > 1e-6 else 1.0)
+            state["factory_utilities_power_fraction"] = (min(1.0, served_utility / utility_request)
+                if utility_request > 1e-6 else 1.0)
+            state["site_flexible_power_fraction"] = (
+                min(1.0, served_flexible_site / site_flexible_request)
+                if site_flexible_request > 1e-9 else 1.0)
+            state["power_deficit"] = state["unserved_load_mw"] > 0.05
+        feeder_flows = solve_feeder_flows()
         state["distribution_feeders"] = feeder_flows
         state["distribution_losses_mw"] = sum(flow["loss_mw"] for flow in feeder_flows.values())
         energized_voltages = [flow["voltage_pu"] for flow in feeder_flows.values()
