@@ -264,6 +264,25 @@ SCENARIOS = {
             "After the jam clears, the packer ramps up and drains buffers before the line returns to steady output.",
         ),
     ),
+    "warehouse-cold-store-outage-and-recovery": ScenarioDefinition(
+        scenario_id="warehouse-cold-store-outage-and-recovery",
+        name="Cold-store outage and dispatch recovery",
+        description="A warehouse refrigeration and dispatch outage warms finished-product storage while the finite pallet buffers fill and slow production; recovery drains inventory and cools the rooms again.",
+        duration_seconds=43_200,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                            "target_area": "Warehouse", "duration_seconds": 32_400}),
+            ScenarioStep(300, "incident", {"incident_name": "Process upset", "severity": "Large",
+                                            "target_area": "Warehouse", "duration_seconds": 18_000}),
+        ),
+        expected_observations=(
+            "A refrigeration utility loss reduces available cooling; room temperature rises according to envelope heat gain and stored thermal mass.",
+            "The dispatch interruption causes finished cases to accumulate in cold rooms, then the pallet conveyor and wrapper buffers.",
+            "Near-capacity buffers reduce the case-packer's downstream service fraction, then the packaging accumulator slows the filler.",
+            "Temperature exposure accumulates only while product is stored above the simulated limit; it does not disappear when temperature recovers.",
+            "When refrigeration and dispatch recover, the product queue drains at finite rates and room temperatures recover gradually.",
+        ),
+    ),
     "cip-water-steam-and-production-recovery": ScenarioDefinition(
         scenario_id="cip-water-steam-and-production-recovery",
         name="CIP water and steam demand with production recovery",

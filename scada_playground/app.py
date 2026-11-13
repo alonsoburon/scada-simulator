@@ -29,6 +29,7 @@ from plant_utilities import FactoryUtilities
 from chilled_water import ChilledWaterPlant
 from site_buildings import SiteBuildings
 from underground_ventilation import UndergroundVentilation
+from end_of_line import EndOfLineLogistics
 
 
 AREAS = {
@@ -191,6 +192,7 @@ CHILLED_MODEL = ChilledWaterPlant()
 PLANT_CONTROLLER = PlantController()
 BUILDING_MODEL = SiteBuildings()
 VENTILATION_MODEL = UndergroundVentilation()
+END_OF_LINE_MODEL = EndOfLineLogistics()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -236,6 +238,7 @@ def initialize(seed: int = 17) -> None:
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
         utility_state = UTILITY_MODEL.initialize()
+        end_of_line_state = END_OF_LINE_MODEL.initialize()
         chilled_state = CHILLED_MODEL.initialize()
         CHILLED_MODEL.advance(chilled_state, 0, [],
             cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(utility_state), seed=seed)
@@ -257,6 +260,8 @@ def initialize(seed: int = 17) -> None:
                                "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
+        modeled_assets.update((area, asset) for area, assets in END_OF_LINE_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
         for tag in modeled_tags:
@@ -276,12 +281,15 @@ def initialize(seed: int = 17) -> None:
             tag["dynamic_model"] = True
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
+        eol_initial_load_mw = end_of_line_state["electric_load_mw"]
         initial_process_power_mw = concentrator_state["total_power_mw"]
         initial_water_power_mw = water_state["electrical_load_kw"] / 1000.0
         initial_process_power_mw += ventilation_state["fan_power_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
-                            utility_load_mw=utility_state["electric_load_mw"] + chilled_state["electric_load_mw"],
+                            utility_load_mw=(utility_state["electric_load_mw"]
+                                             + chilled_state["electric_load_mw"]
+                                             + eol_initial_load_mw),
                             site_building_load_mw=buildings_state["electric_load_mw"],
                             site_nonbuilding_request_mw=5.6, seed=seed)
         power_tags = POWER_MODEL.telemetry(power_state)
@@ -296,6 +304,7 @@ def initialize(seed: int = 17) -> None:
         tags.extend(UTILITY_MODEL.telemetry(utility_state, seed))
         tags.extend(CHILLED_MODEL.telemetry(chilled_state, seed))
         tags.extend(BUILDING_MODEL.telemetry(buildings_state, seed))
+        tags.extend(END_OF_LINE_MODEL.telemetry(end_of_line_state, seed))
         ventilation_tags = VENTILATION_MODEL.telemetry(ventilation_state, seed)
         for tag in ventilation_tags:
             tag["dynamic_model"] = True
@@ -310,12 +319,14 @@ def initialize(seed: int = 17) -> None:
                                 "concentrator": concentrator_state,
                                 "process_control": process_control_state,
                                 "haulage": haulage_state,
+                                "end_of_line": end_of_line_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
                                 "water_distribution_alarm_states": {},
                                 "chilled_water_alarm_states": {},
                                 "building_alarm_states": {},
                                 "ventilation_alarm_states": {},
+                                "end_of_line_alarm_states": {},
                                 "concentrator_alarm_states": {},
                                 "haulage_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
@@ -349,6 +360,10 @@ def initialize(seed: int = 17) -> None:
             sim["site_buildings"] = BUILDING_MODEL.initialize()
             BUILDING_MODEL.advance(sim["site_buildings"], sim.get("tick", 0), [], seed=sim["seed"])
         BUILDING_MODEL.migrate(sim["site_buildings"])
+        if "end_of_line" not in sim:
+            sim["end_of_line"] = END_OF_LINE_MODEL.initialize()
+        END_OF_LINE_MODEL.migrate(sim["end_of_line"])
+        sim.setdefault("end_of_line_alarm_states", {})
         if "mine_ventilation" not in sim:
             sim["mine_ventilation"] = VENTILATION_MODEL.initialize()
             VENTILATION_MODEL.advance(sim["mine_ventilation"], sim.get("tick", 0), [], seed=sim["seed"])
@@ -363,6 +378,8 @@ def initialize(seed: int = 17) -> None:
                                "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
+        modeled_assets.update((area, asset) for area, assets in END_OF_LINE_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
         for tag in modeled_tags:
@@ -398,7 +415,8 @@ def initialize(seed: int = 17) -> None:
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw,
                                 utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
-                                                 + sim["chilled_water"]["electric_load_mw"]),
+                                                 + sim["chilled_water"]["electric_load_mw"]
+                                                 + sim["end_of_line"]["electric_load_mw"]),
                                 site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                                 site_nonbuilding_request_mw=5.6,
                                 seed=sim["seed"])
@@ -421,6 +439,7 @@ def initialize(seed: int = 17) -> None:
         sim["tags"].extend(CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"]))
         building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
         sim["tags"].extend(building_tags)
+        sim["tags"].extend(END_OF_LINE_MODEL.telemetry(sim["end_of_line"], sim["seed"]))
     unique_tags = {}
     for tag in st.session_state.sim["tags"]:
         unique_tags[tag["tag"]] = tag
@@ -490,6 +509,7 @@ def publish_snapshot() -> dict:
                             if key not in {"history", "_instrument_noise"}},
         "chilled_water": CHILLED_MODEL.public_state(sim["chilled_water"]),
         "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),
+        "end_of_line": END_OF_LINE_MODEL.public_state(sim["end_of_line"]),
         "mine_ventilation": VENTILATION_MODEL.public_state(sim["mine_ventilation"]),
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
@@ -749,6 +769,7 @@ def advance(force: bool = False) -> None:
     prior_factory_water_availability = sim["water_network"].get("factory_water_available_fraction", 1.0)
     prior_boiler_feedwater_delivery_m3h = (
         sim["water_network"].get("boiler_feedwater_in_transit_m3", 0.0) * 3600.0)
+    prior_case_service_fraction = sim["end_of_line"].get("case_acceptance_fraction", 1.0)
     prior_wastewater_availability = sim["water_network"].get("wastewater_available_fraction", 1.0)
     CHILLED_MODEL.advance(
         sim["chilled_water"], sim["tick"], utility_events,
@@ -761,6 +782,7 @@ def advance(force: bool = False) -> None:
         power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
         water_available_fraction=prior_factory_water_availability,
         boiler_feedwater_delivery_m3h=prior_boiler_feedwater_delivery_m3h,
+        downstream_case_service_fraction=prior_case_service_fraction,
         wastewater_available_fraction=prior_wastewater_availability,
         chilled_water_service_fraction=sim["chilled_water"]["cooling_service_fraction"],
         chilled_water_supply_temperature_c=sim["chilled_water"]["supply_temperature_c"],
@@ -777,11 +799,41 @@ def advance(force: bool = False) -> None:
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw,
                         utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
-                                         + sim["chilled_water"]["electric_load_mw"]),
+                                         + sim["chilled_water"]["electric_load_mw"]
+                                         + sim["end_of_line"]["electric_load_mw"]),
                         site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                         site_nonbuilding_request_mw=5.6,
                         motor_starting_load_mw=sim["process_control"]["motor_starting_load_mw"],
                         seed=sim["seed"])
+    END_OF_LINE_MODEL.advance(
+        sim["end_of_line"], sim["tick"], utility_events,
+        incoming_cases_mpm=sim["plant_utilities"]["packer_rate_cases_min"],
+        power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
+        seed=sim["seed"],
+    )
+    eol_conditions = {
+        "warehouse_high": (sim["end_of_line"]["warehouse_occupancy_pct"] > 90.0,
+                           sim["end_of_line"]["warehouse_occupancy_pct"] < 80.0,
+                           "Finished-goods warehouse is near capacity; packaging may back off", "HIGH"),
+        "cold_store_warm": (sim["end_of_line"]["cold_store_temperature_c"] > 8.0,
+                            sim["end_of_line"]["cold_store_temperature_c"] < 6.0,
+                            "Cold-store temperature is above the simulated product limit", "CRITICAL"),
+        "pallet_buffer_high": (sim["end_of_line"]["pallet_buffer_cases"]
+                               > 0.85 * END_OF_LINE_MODEL.PALLET_BUFFER_CAPACITY_CASES,
+                               sim["end_of_line"]["pallet_buffer_cases"]
+                               < 0.65 * END_OF_LINE_MODEL.PALLET_BUFFER_CAPACITY_CASES,
+                               "Pallet conveyor is backing up ahead of the stretch wrapper", "HIGH"),
+    }
+    eol_alarm_states = sim.setdefault("end_of_line_alarm_states", {})
+    for key, (active, cleared, message, severity) in eol_conditions.items():
+        was_active = eol_alarm_states.get(key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Warehouse",
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Warehouse",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+        eol_alarm_states[key] = active if not was_active else not cleared
     BUILDING_MODEL.advance(
         sim["site_buildings"], sim["tick"], utility_events, seed=sim["seed"],
         power_available_fraction=sim["power_network"]["site_flexible_power_fraction"])
@@ -1180,12 +1232,14 @@ def advance(force: bool = False) -> None:
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     chilled_tags = CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
+    end_of_line_tags = END_OF_LINE_MODEL.telemetry(sim["end_of_line"], sim["seed"])
     ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
     chilled_by_tag = {tag["tag"]: tag for tag in chilled_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
+    end_of_line_by_tag = {tag["tag"]: tag for tag in end_of_line_tags}
     ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
@@ -1201,6 +1255,8 @@ def advance(force: bool = False) -> None:
             tag.update(chilled_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
             tag.update(building_by_tag[tag["tag"]])
+        elif tag["tag"] in end_of_line_by_tag:
+            tag.update(end_of_line_by_tag[tag["tag"]])
         elif tag["tag"] in ventilation_by_tag:
             tag.update(ventilation_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
@@ -1350,7 +1406,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities", "Underground ventilation"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities", "Underground ventilation", "Palletizing & warehouse"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -2005,6 +2061,7 @@ def render_dashboard():
             ("Small · Instrument fault", "Inject Signal drift in one area. Find which tags moved together, separate process change from measurement fault, and propose a quality rule."),
             ("Medium · Utility disturbance", "Inject Utility loss in Boiler house or Compressed air. Trace which downstream areas lose pressure, flow, or production. Identify leading and lagging signals."),
             ("Large · Plant-wide incident", "Inject a Large incident into Whole factory. Rank affected areas by urgency, draft an alarm grouping strategy, and decide what evidence a shift handover needs."),
+            ("Cold chain · Dispatch and refrigeration", "Run `warehouse-cold-store-outage-and-recovery`. Determine whether dispatch congestion or refrigeration failed first; compare cases in each buffer, room temperature, accumulated exposure, and the case-packer response."),
             ("Integration challenge", "Design a canonical tag model for area, asset, signal, units, range, quality, timestamp, and source. Export a snapshot and sketch how your historian would ingest it."),
             ("Alarm rationalization", "Compare the alarm list with tag quality and trends. Define priority, deadband, delay, shelving rules, and operator response for each failure mode."),
         ]
@@ -2164,6 +2221,61 @@ def render_dashboard():
                 st.plotly_chart(gas, width="stretch")
         st.caption(f"Minimum district oxygen {min_oxygen:.2f}% vol · electrical demand is included in the mine process load. Exercise alarm limits are illustrative, not safety guidance.")
         st.markdown("**Fault drill:** run `underground-ventilation-loss-and-recovery`. Confirm airflow alarms first; then compare fan restoration with delayed gas, oxygen, dust, and thermal recovery.")
+
+    with tabs[11]:
+        logistics = sim["end_of_line"]
+        st.subheader("Finished product · palletizing, dispatch, and cold storage")
+        st.caption("Cases move through finite conveyors and warehouse inventory. Dispatch and cold-room refrigeration draw from the same product flow; congestion feeds back to the case packer and eventually the filler.")
+        metrics = st.columns(6)
+        for col, label, value in zip(metrics,
+            ["Warehouse stock", "Warehouse capacity", "Cold-room max", "Case conveyor", "Pallet buffer", "Dispatch"],
+            [f"{logistics['warehouse_inventory_cases']:.0f} cases",
+             f"{logistics['warehouse_occupancy_pct']:.1f}%",
+             f"{logistics['cold_store_temperature_c']:.1f} °C",
+             f"{logistics['case_buffer_cases']:.0f}/{END_OF_LINE_MODEL.CASE_BUFFER_CAPACITY:.0f} cases",
+             f"{logistics['pallet_buffer_cases']:.0f}/{END_OF_LINE_MODEL.PALLET_BUFFER_CAPACITY_CASES:.0f} cases",
+             f"{logistics['cases_dispatched_mpm']:.1f}/{logistics['dispatch_demand_mpm']:.1f} cases/min"]):
+            col.metric(label, value)
+        room_rows = [{"Cold room": name, "Inventory (cases)": room["inventory_cases"],
+                      "Temperature (°C)": room["temperature_c"],
+                      "Cooling load (kW)": room["cooling_kw"],
+                      "Door open": room["door_open_s"] > 0,
+                      "Exposure (case·h)": room["temperature_exposure_case_h"]}
+                     for name, room in logistics["rooms"].items()]
+        st.dataframe(pd.DataFrame(room_rows).round(2), hide_index=True, width="stretch")
+        cell_rows = [{"Palletizer": name, "Output (pallets/min)": cell["output_cases_min"] / END_OF_LINE_MODEL.CASES_PER_PALLET,
+                      "Availability (%)": 100 * cell["availability"],
+                      "Motor current (A)": cell["motor_current_a"],
+                      "Vibration (mm/s)": cell["vibration_mm_s"]}
+                     for name, cell in logistics["palletizer_cells"].items()]
+        cell_rows.append({"Palletizer": "Stretch wrapper",
+                          "Output (pallets/min)": logistics["cases_wrapped_mpm"] / END_OF_LINE_MODEL.CASES_PER_PALLET,
+                          "Availability (%)": 100 * logistics["wrapper_condition"],
+                          "Motor current (A)": logistics["wrapper_motor_current_a"],
+                          "Vibration (mm/s)": 0.0})
+        st.dataframe(pd.DataFrame(cell_rows).round(2), hide_index=True, width="stretch")
+        history = pd.DataFrame(logistics["history"])
+        if not history.empty:
+            left, right = st.columns(2)
+            with left:
+                buffer_fig = px.line(history, x="sim_seconds",
+                    y=["case_buffer_cases", "pallet_buffer_cases", "warehouse_inventory_cases"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Cases", "variable": "Inventory"},
+                    color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
+                buffer_fig.update_layout(title="Cases through the final buffers", uirevision="eol-buffers")
+                st.plotly_chart(buffer_fig, width="stretch")
+            with right:
+                temp_fig = px.line(history, x="sim_seconds", y="cold_store_temperature_c",
+                    labels={"sim_seconds": "Simulated seconds", "cold_store_temperature_c": "Temperature (°C)"},
+                    color_discrete_sequence=["#9b5de5"])
+                temp_fig.add_hline(y=8.0, line_dash="dash", line_color="#d1495b",
+                                   annotation_text="Simulated product limit")
+                temp_fig.update_layout(title="Warmest cold-room temperature", uirevision="eol-temperature")
+                st.plotly_chart(temp_fig, width="stretch")
+        else:
+            st.info("Advance the factory or run the cold-store outage scenario to build logistics trends.")
+        st.caption(f"Case-packer acceptance {logistics['case_acceptance_fraction']*100:.0f}% · palletizing {logistics['cases_palletized_mpm']:.1f} cases/min · wrapping {logistics['cases_wrapped_mpm']:.1f} cases/min · accumulated warm-product exposure {logistics['cold_store_temperature_exposure_case_h']:.1f} case·h")
+        st.markdown("**Fault drill:** run `warehouse-cold-store-outage-and-recovery`. Track the cold-room temperature and case buffers separately: a restored temperature does not erase product's accumulated time above the simulated limit.")
 
 
 

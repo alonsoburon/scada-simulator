@@ -194,6 +194,7 @@ class FactoryUtilities:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
                 boiler_feedwater_delivery_m3h: float = 6.4,
+                downstream_case_service_fraction: float = 1.0,
                 wastewater_available_fraction: float = 1.0,
                 chilled_water_service_fraction: float = 1.0,
                 chilled_water_supply_temperature_c: float = 6.8,
@@ -431,7 +432,9 @@ class FactoryUtilities:
             max(0.0, min(1.0, (20.0 - product_temperature) / 6.0)))
         filler_target = (180.0 * state["filling_air_service"] * filler_target_fraction
                         * product_release_fraction)
-        packer_target = 180.0 * state["filling_air_service"] * state["case_packer_speed_fraction"]
+        packer_target = (180.0 * state["filling_air_service"]
+                         * state["case_packer_speed_fraction"]
+                         * max(0.0, min(1.0, downstream_case_service_fraction)))
         old_product_inventory = state["product_tank_inventory_units"]
         old_package_inventory = state["filling_buffer_inventory_units"]
         if dt_min > 0:

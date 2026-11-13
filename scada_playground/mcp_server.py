@@ -263,6 +263,17 @@ def get_site_buildings_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_end_of_line_state() -> dict[str, Any]:
+    """Read palletizer and wrapper buffers, dispatch flow, cold-store inventory, and temperature."""
+    data = snapshot()
+    logistics = data.get("end_of_line")
+    if not logistics:
+        raise RuntimeError("End-of-line logistics model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **logistics}
+
+
+@mcp.tool()
 def get_underground_ventilation_state() -> dict[str, Any]:
     """Read mine fan duty, airway flow/pressure, and district gas, oxygen, dust, and temperature."""
     data = snapshot()
