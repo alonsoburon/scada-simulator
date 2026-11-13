@@ -108,6 +108,7 @@ INCIDENTS = {
     "Process upset": "process",
     "Conveyor jam": "jam",
     "Electrical fault": "utility",
+    "Water main leak": "process",
 }
 
 # Fictional road geometry for a teaching site in northern Chile. The coordinate
@@ -1227,6 +1228,11 @@ with st.sidebar:
                                        help="0% is at the source end; 100% is at the far end.")
         primary_breaker_failure = st.checkbox(
             "Simulate failed feeder breaker (test upstream backup relay)", value=False)
+    elif incident_name == "Water main leak":
+        target = "Water distribution"
+        target_asset = st.selectbox("Damaged district main", ["District zone A", "District zone B", "District zone C"])
+        fault_location_pct = 90.0
+        primary_breaker_failure = False
     else:
         target = st.selectbox("Target area", ["Whole factory", *AREAS.keys()])
         target_asset = None

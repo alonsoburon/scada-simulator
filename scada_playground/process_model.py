@@ -52,6 +52,11 @@ class FactoryProcessModel:
             raise ValueError(f"Unknown target asset {target_asset!r} in {area}")
         if name == "Electrical fault" and area != "Grid distribution":
             raise ValueError("Electrical fault must target Grid distribution")
+        if name == "Water main leak" and area != "Water distribution":
+            raise ValueError("Water main leak must target Water distribution")
+        if name == "Water main leak" and target_asset not in {
+                "District zone A", "District zone B", "District zone C"}:
+            raise ValueError("Water main leak must target one named district zone")
         if name == "Electrical fault" and target_asset not in {
                 "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
             raise ValueError("Electrical fault must target one distribution feeder")
@@ -87,6 +92,8 @@ class FactoryProcessModel:
             description += f" on {target_asset} at {fault_location_pct:.0f}% of feeder length"
             if primary_breaker_failure:
                 description += "; feeder breaker failure simulated"
+        if name == "Water main leak":
+            description += f" on {target_asset}"
         if target_tag:
             description += f" on instrument {target_tag}"
         sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": severity.upper(),

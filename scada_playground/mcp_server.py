@@ -341,6 +341,8 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     and target_area (an area name or Whole factory). Electrical fault also requires
     target_asset set to Feeder north/south/east/west. Electrical faults also accept a
     0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
+    Water main leak requires target_area='Water distribution' and target_asset set to
+    District zone A, District zone B, or District zone C; severity sets the simulated break size.
     Signal drift accepts target_tag to bias one analog measurement without changing process state.
     For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
     For maintain_equipment, target_asset must be one of the named concentrator assets; the asset
@@ -371,6 +373,9 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                 raise ValueError("Electrical fault requires Grid distribution and a named feeder target_asset")
             if not 0.0 <= fault_location_pct <= 100.0:
                 raise ValueError("fault_location_pct must be between 0 and 100")
+        if incident_name == "Water main leak" and (target_area != "Water distribution"
+                or target_asset not in {"District zone A", "District zone B", "District zone C"}):
+            raise ValueError("Water main leak requires Water distribution and a named district zone target_asset")
         if target_tag:
             if incident_name != "Signal drift":
                 raise ValueError("target_tag is only valid for Signal drift")

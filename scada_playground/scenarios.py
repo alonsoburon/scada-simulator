@@ -137,6 +137,9 @@ SCENARIOS = {
                                              "target_area": "Water distribution", "duration_seconds": 18_000}),
             ScenarioStep(1_800, "incident", {"incident_name": "Process upset", "severity": "Medium",
                                                "target_area": "Water distribution", "duration_seconds": 3_600}),
+            ScenarioStep(3_600, "incident", {"incident_name": "Water main leak", "severity": "Large",
+                                               "target_area": "Water distribution", "target_asset": "District zone B",
+                                               "duration_seconds": 5_400}),
         ),
         expected_observations=(
             "The elevated tank buffers district demand after its refill pump loses power; tank level declines while the treated-water plant remains available.",
@@ -144,6 +147,8 @@ SCENARIOS = {
             "Pressure-dependent demand curtails service as pressure approaches the district minimum, while chlorine continues to decay with water age.",
             "When feeder power returns, the VFD refill flow ramps up, the elevated tank rebuilds inventory, and district pressure and served demand recover with different lags.",
             "Compare district meters with total leakage and non-revenue water to distinguish customer demand from network loss.",
+            "A large District zone B main break adds a pressure-driven orifice discharge; its demand competes with customer service and depressurizes the branch.",
+            "Pump mechanical degradation reduces refill capability only; it does not change district pipe leakage.",
         ),
     ),
     "chilled-water-loss-and-recovery": ScenarioDefinition(

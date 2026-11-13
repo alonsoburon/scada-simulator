@@ -37,6 +37,8 @@ class WaterDistribution:
     POWER_LOSS = {"Small": 0.75, "Medium": 0.42, "Large": 0.0}
     MECHANICAL_FACTOR = {"Small": 0.90, "Medium": 0.72, "Large": 0.52}
     UPSET_DEMAND_FACTOR = {"Small": 1.08, "Medium": 1.18, "Large": 1.32}
+    BURST_ORIFICE_MM = {"Small": 5.0, "Medium": 15.0, "Large": 32.0}
+    DISCHARGE_COEFFICIENT = 0.62
 
     @classmethod
     def initialize(cls, initial_tank_volume_m3: float | None = None) -> dict:
@@ -132,7 +134,8 @@ class WaterDistribution:
     @classmethod
     def _branch_operating_point(cls, state: dict, name: str, spec: dict,
                                 tank_volume_m3: float, demand_factor: float,
-                                leak_factor: float, supply_head_fraction: float = 1.0) -> dict:
+                                supply_head_fraction: float = 1.0,
+                                burst_orifice_mm: float = 0.0) -> dict:
         tank_level_fraction = max(0.0, min(1.0, tank_volume_m3 / cls.TANK_CAPACITY_M3))
         water_surface = cls.TANK_BASE_ELEVATION_M + tank_level_fraction * cls.TANK_HEIGHT_M
         static_head_m = max(0.0, water_surface - spec["elevation_m"])
@@ -145,8 +148,7 @@ class WaterDistribution:
                 (pressure - spec["minimum_pressure_kpa"])
                 / max(1e-6, spec["design_pressure_kpa"] - spec["minimum_pressure_kpa"]))))
             customer_served = customer_request * service_fraction
-            leak = (spec["reference_leak_m3h"] * leak_factor
-                    * math.sqrt(max(0.0, pressure / spec["design_pressure_kpa"])))
+            leak = cls._leak_flow(spec, pressure, burst_orifice_mm)
             flow_m3s = (customer_served + leak) / 3600.0
             area = math.pi * spec["pipe_diameter_m"] ** 2 / 4.0
             velocity = flow_m3s / area
@@ -166,8 +168,7 @@ class WaterDistribution:
             (pressure - spec["minimum_pressure_kpa"])
             / max(1e-6, spec["design_pressure_kpa"] - spec["minimum_pressure_kpa"]))))
         customer_served = customer_request * service_fraction
-        leak = (spec["reference_leak_m3h"] * leak_factor
-                * math.sqrt(max(0.0, pressure / spec["design_pressure_kpa"])))
+        leak = cls._leak_flow(spec, pressure, burst_orifice_mm)
         total_flow = customer_served + leak
         prv_position = (max(0.0, min(100.0,
             100.0 * (base_pressure - spec["prv_setpoint_kpa"])
@@ -188,6 +189,18 @@ class WaterDistribution:
                 "turbidity_ntu": state["turbidity_ntu"], "water_age_h": water_age_h}
 
     @classmethod
+    def _leak_flow(cls, spec: dict, pressure_kpa: float, burst_orifice_mm: float) -> float:
+        """Baseline leakage plus an orifice leak from a pressure-loaded main break."""
+        pressure = max(0.0, pressure_kpa)
+        background = (spec["reference_leak_m3h"]
+                      * math.sqrt(pressure / spec["design_pressure_kpa"]))
+        diameter_m = max(0.0, burst_orifice_mm) / 1000.0
+        area_m2 = math.pi * diameter_m * diameter_m / 4.0
+        burst = (cls.DISCHARGE_COEFFICIENT * area_m2
+                 * math.sqrt(2.0 * pressure * 1000.0 / 998.0) * 3600.0)
+        return background + burst
+
+    @classmethod
     def advance(cls, state: dict, sim_seconds: int, events: list[dict], *,
                 treated_transfer_m3h: float, source_chlorine_mg_l: float,
                 source_turbidity_ntu: float = 1.0) -> dict:
@@ -203,10 +216,19 @@ class WaterDistribution:
             + volume_available / cls.TANK_CAPACITY_M3 * cls.TANK_HEIGHT_M)
         upset = cls._severity(events, "Process upset")
         demand_factor = cls._daily_demand_factor(sim_seconds) * cls.UPSET_DEMAND_FACTOR.get(upset, 1.0)
-        leak_factor = 1.0 + (1.0 - state["pump_condition_factor"]) * 0.35
+        burst_orifices = {name: 0.0 for name in cls.ZONES}
+        for event in events:
+            if (event.get("name") == "Water main leak"
+                    and event.get("area") == cls.AREA
+                    and event.get("target_asset") in burst_orifices):
+                severity = event.get("severity", "Small")
+                burst_orifices[event["target_asset"]] = max(
+                    burst_orifices[event["target_asset"]],
+                    cls.BURST_ORIFICE_MM.get(severity, 0.0))
         def solve_zones(head_fraction: float) -> dict:
             return {name: {**spec, **cls._branch_operating_point(
-                state, name, spec, volume_available, demand_factor, leak_factor, head_fraction)}
+                state, name, spec, volume_available, demand_factor, head_fraction,
+                burst_orifices[name])}
                 for name, spec in cls.ZONES.items()}
 
         zones = solve_zones(1.0)
@@ -315,7 +337,7 @@ class WaterDistribution:
             add(name, "customer_demand", zone["customer_demand_m3h"], "m³/h", 0, 120, .003)
             add(name, "unmet_demand", zone["unmet_demand_m3h"], "m³/h", 0, 120, .003)
             add(name, "line_pressure", zone["pressure_kpa"], "kPa", 0, 800, .003)
-            add(name, "leak_flow", zone["leak_flow_m3h"], "m³/h", 0, 20, .01)
+            add(name, "leak_flow", zone["leak_flow_m3h"], "m³/h", 0, 200, .01)
             add(name, "chlorine_residual", zone["chlorine_residual_mg_l"], "mg/L", 0, 2, .005)
             add(name, "turbidity", zone["turbidity_ntu"], "NTU", 0, 100, .005)
             add(name, "water_age", zone["water_age_h"], "h", 0, 168, .005)
