@@ -152,6 +152,7 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(by_id["water_supply_network.raw_transfer.flow_rate"]["units"], "m³/h")
         self.assertEqual(by_id["water_supply_network.raw_tank.stored_volume"]["units"], "m³")
         self.assertIn("water_supply_network.intake_pump.pump_running", by_id)
+        self.assertIn("water_supply_network.intake_pump.controller_process_value", by_id)
         self.assertIn("water_supply_network.raw_transfer_valve.valve_position", by_id)
         self.assertIn("water_treatment.filter_train.differential_pressure", by_id)
         self.assertIn("water_supply_network.treated_tank.turbidity", by_id)
@@ -320,6 +321,26 @@ class MineWaterNetworkTests(unittest.TestCase):
         tag = "water_supply_network.raw_tank.tank_level"
         self.assertNotEqual(next(t["value"] for t in first if t["tag"] == tag),
                             next(t["value"] for t in third if t["tag"] == tag))
+
+    def test_drifted_level_transmitter_changes_its_auto_controller_and_water_flow(self):
+        baseline_model = MineWaterNetwork()
+        faulted_model = MineWaterNetwork()
+        baseline = baseline_model.initialize()
+        faulted = faulted_model.initialize()
+        event = {"name": "Signal drift", "area": "Water supply network", "severity": "Large",
+                 "started": 0, "duration": 1_000,
+                 "target_tag": "water_supply_network.raw_tank.tank_level"}
+
+        baseline_model.advance(baseline, 1, [], seed=17)
+        faulted_model.advance(faulted, 1, [event], seed=17)
+
+        baseline_controller = baseline["controllers"]["Intake pump"]
+        faulted_controller = faulted["controllers"]["Intake pump"]
+        self.assertGreater(faulted_controller["process_value_pct"],
+                           baseline_controller["process_value_pct"])
+        self.assertLess(faulted_controller["output_pct"], baseline_controller["output_pct"])
+        self.assertLess(faulted["links"]["raw_transfer"]["inlet_flow_m3h"],
+                        baseline["links"]["raw_transfer"]["inlet_flow_m3h"])
 
     def test_older_session_state_migrates_to_reclaim_circuit(self):
         legacy = self.model.initialize()

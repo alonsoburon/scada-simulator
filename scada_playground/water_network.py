@@ -17,6 +17,10 @@ try:
     from .wastewater import WastewaterTreatmentPlant
 except ImportError:
     from wastewater import WastewaterTreatmentPlant
+try:
+    from .instrumentation import signal_drift_bias, stable_tag_id
+except ImportError:
+    from instrumentation import signal_drift_bias, stable_tag_id
 
 
 class MineWaterNetwork:
@@ -115,7 +119,8 @@ class MineWaterNetwork:
             kp, ki = gains[name]
             controllers[name] = {"mode": "AUTO", "setpoint_pct": spec["setpoint_pct"],
                                  "bias_pct": initial_speed, "kp": kp, "ki": ki,
-                                 "integral": 0.0, "output_pct": initial_speed}
+                                 "integral": 0.0, "output_pct": initial_speed,
+                                 "process_value_pct": nodes[spec["controlled_node"]]["level_pct"]}
         state = {"nodes": nodes,
                 "pumps": pumps, "controllers": controllers,
                 "valves": {name: 92.0 for name in ("Raw transfer valve", "Process feed valve",
@@ -210,6 +215,9 @@ class MineWaterNetwork:
             pump.setdefault("coastdown_time_constant_s", self.PUMPS[name]["coastdown_time_constant_s"])
             pump.setdefault("check_valve_closure_time_s", self.PUMPS[name]["check_valve_closure_time_s"])
             pump.setdefault("check_valve_cracking_head_m", self.PUMPS[name]["check_valve_cracking_head_m"])
+            controller = state["controllers"][name]
+            controller.setdefault("process_value_pct",
+                                 state["nodes"][pump["controlled_node"]]["level_pct"])
         for key in self.LINKS:
             link = state["links"][key]
             if "previous_velocity_m_s" not in link:
@@ -550,9 +558,24 @@ class MineWaterNetwork:
             pump["efficiency"] = degradation
             pump["running"] = pump["enabled"] and utility_factor > 0.01
             controller = state["controllers"][name]
+            controlled_node = pump["controlled_node"]
+            tag_name = f"water_supply_network.{controlled_node}.tank_level"
+            tag_span = 100.0
+            stable_id = stable_tag_id(tag_name)
+            noise_rng = random.Random(seed * 1_000_003 + sim_seconds * 9_176 + stable_id)
+            measured_level = state["nodes"][controlled_node]["level_pct"]
+            measured_level += noise_rng.gauss(0.0, tag_span * 0.0015)
+            drift = next((event for event in active_events
+                          if event.get("name") == "Signal drift"
+                          and event.get("target_tag") == tag_name), None)
+            if drift:
+                measured_level += signal_drift_bias(
+                    tag_name, drift["severity"], drift["duration"],
+                    sim_seconds - drift["started"], tag_span)
+            measured_level = round(min(100.0, max(0.0, measured_level)), 3)
+            controller["process_value_pct"] = measured_level
             if controller["mode"] == "AUTO":
-                level = state["nodes"][pump["controlled_node"]]["level_pct"]
-                error = controller["setpoint_pct"] - level
+                error = controller["setpoint_pct"] - measured_level
                 proposed_integral = controller["integral"] + controller["ki"] * error
                 unconstrained = controller["bias_pct"] + controller["kp"] * error + proposed_integral
                 output = min(100.0, max(0.0, unconstrained))
@@ -917,6 +940,7 @@ class MineWaterNetwork:
             controller = state["controllers"][name]
             add(asset, "level_setpoint", controller["setpoint_pct"], "%", 0, 100)
             add(asset, "controller_output", controller["output_pct"], "%", 0, 100)
+            add(asset, "controller_process_value", controller["process_value_pct"], "%", 0, 100)
             add(asset, "controller_auto", float(controller["mode"] == "AUTO"), "bool", 0, 1)
         for name, opening in state["valves"].items():
             add(name.lower().replace(" ", "_"), "valve_position", opening, "%", 0, 100)

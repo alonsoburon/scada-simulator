@@ -124,16 +124,16 @@ SCENARIOS = {
     "mine-water-level-transmitter-drift": ScenarioDefinition(
         scenario_id="mine-water-level-transmitter-drift",
         name="Water-tank transmitter drift",
-        description="A level transmitter slowly biases while tank inventory and an independent volume measurement remain physical and unchanged by the fault.",
-        duration_seconds=1_800,
+        description="A level transmitter slowly biases; its automatic pump controller follows the bad reading, creating a real inventory and flow deviation that independent measurements reveal.",
+        duration_seconds=7_200,
         steps=(ScenarioStep(300, "incident", {"incident_name": "Signal drift", "severity": "Large",
                                                 "target_area": "Water supply network",
                                                 "target_tag": "water_supply_network.raw_tank.tank_level",
                                                 "duration_seconds": 1_200}),),
         expected_observations=(
-            "The raw-tank level reading ramps away from process truth while stored volume and mass balance continue to evolve normally.",
-            "Compare level, stored volume, nearby flow, and the two signals' independent noise before declaring a tank leak or inflow change.",
-            "The biased reading remains GOOD and returns to its true value when the instrument fault expires.",
+            "The raw-tank level transmitter ramps away from the real level; the intake pump PI loop follows the biased measurement and quickly changes source flow.",
+            "Full-pipe linepack delays the source-flow disturbance before it reaches the raw tank; then delivered flow and stored volume respond, while the independent volume reading exposes transmitter disagreement.",
+            "The biased reading remains GOOD; after the fault expires, normal source flow returns first and the tank inventory recovers only after the transport delay.",
         ),
     ),
     "boiler-header-pressure-and-recovery": ScenarioDefinition(

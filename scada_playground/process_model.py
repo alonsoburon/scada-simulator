@@ -6,6 +6,11 @@ import random
 from dataclasses import dataclass
 from typing import Callable
 
+try:
+    from .instrumentation import signal_drift_bias
+except ImportError:
+    from instrumentation import signal_drift_bias
+
 
 @dataclass
 class ProcessEvent:
@@ -104,12 +109,8 @@ class FactoryProcessModel:
             span = max(0.0, float(tag.get("high", 0.0)) - float(tag.get("low", 0.0)))
             if span <= 0.0:
                 continue
-            magnitude = {"Small": 0.01, "Medium": 0.03, "Large": 0.08}[event.severity]
-            ramp_seconds = max(1.0, event.duration * 0.25)
-            ramp = min(1.0, max(0.0, (tick - event.started) / ramp_seconds))
-            stable_id = sum((index + 1) * ord(char) for index, char in enumerate(tag["tag"]))
-            sign = 1.0 if stable_id % 2 == 0 else -1.0
-            bias = sign * span * magnitude * ramp
+            bias = signal_drift_bias(tag["tag"], event.severity, event.duration,
+                                     tick - event.started, span)
             low, high = float(tag.get("low", 0.0)), float(tag.get("high", 0.0))
             if event.measurement_baseline_tick != tick:
                 event.measurement_baseline = float(tag["value"])

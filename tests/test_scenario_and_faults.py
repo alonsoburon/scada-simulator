@@ -47,6 +47,9 @@ class ScenarioRunnerTests(unittest.TestCase):
         step = definition.steps[0]
         self.assertEqual(step.parameters["incident_name"], "Signal drift")
         self.assertEqual(step.parameters["target_tag"], "water_supply_network.raw_tank.tank_level")
+        self.assertEqual(definition.duration_seconds, 7_200)
+        self.assertTrue(any("linepack" in note.lower()
+                            for note in definition.expected_observations))
         self.assertTrue(any("stored volume" in note.lower()
                             for note in definition.expected_observations))
 
