@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import math
-import random
+
+try:
+    from .instrumentation import correlated_sensor_noise
+except ImportError:
+    from instrumentation import correlated_sensor_noise
 
 
 class ChilledWaterPlant:
@@ -13,6 +17,9 @@ class ChilledWaterPlant:
     STORAGE_CHARGE_LIMIT_KW = 120.0
     CHILLED_WATER_DESIGN_DELTA_T_K = 6.0
     WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
+    SITE_ATMOSPHERIC_PRESSURE_KPA = 70.0
+    COOLING_TOWER_APPROACH_K = 5.0
+    CHILLER_CONDENSER_APPROACH_K = 5.0
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
     PRODUCT_CP_KJ_KG_K = 4.186
@@ -20,9 +27,20 @@ class ChilledWaterPlant:
     SEVERITY = {"Small": 0.20, "Medium": 0.48, "Large": 1.0}
 
     def initialize(self) -> dict:
+        ambient = 25.0
+        humidity = 26.0
+        wet_bulb = self._wet_bulb_temperature_c(ambient, humidity)
+        condenser_entering = wet_bulb + self.COOLING_TOWER_APPROACH_K
+        condenser_saturation = condenser_entering + self.CHILLER_CONDENSER_APPROACH_K
+        evaporating = 6.0 - 3.0
+        initial_cop = max(2.5, min(7.0,
+            0.52 * (evaporating + 273.15) / max(10.0, condenser_saturation - evaporating)))
         return {
             "sim_seconds": 0,
-            "ambient_temperature_c": 25.0,
+            "ambient_temperature_c": ambient,
+            "ambient_relative_humidity_pct": humidity,
+            "wet_bulb_temperature_c": wet_bulb,
+            "condenser_saturation_temperature_c": condenser_saturation,
             "chillers": {name: {"capacity_kw": capacity, "output_kw": capacity * 0.68,
                                 "available_fraction": 1.0, "available_capacity_kw": capacity,
                                 "running": True, "vibration_mm_s": 1.8}
@@ -38,8 +56,8 @@ class ChilledWaterPlant:
             "storage_discharge_capacity_kw": 0.0,
             "supply_temperature_c": 6.0,
             "return_temperature_c": 11.0,
-            "condenser_entering_temperature_c": 30.0,
-            "cop": 5.5,
+            "condenser_entering_temperature_c": condenser_entering,
+            "cop": initial_cop,
             "pump_flow_m3h": 180.0,
             "pump_available_fraction": 1.0,
             "electric_load_mw": 0.24,
@@ -88,15 +106,47 @@ class ChilledWaterPlant:
         return flow * ChilledWaterPlant.PRODUCT_DENSITY_KG_PER_UNIT \
             * ChilledWaterPlant.PRODUCT_CP_KJ_KG_K * delta_t / 60.0
 
+    @classmethod
+    def _wet_bulb_temperature_c(cls, dry_bulb_c: float, relative_humidity_pct: float) -> float:
+        """Solve a ventilated-psychrometer balance at the site's assumed air pressure."""
+        humidity = max(1.0, min(100.0, relative_humidity_pct)) / 100.0
+
+        def saturation_vapor_pressure_kpa(temp_c: float) -> float:
+            return 0.61121 * math.exp((18.678 - temp_c / 234.5)
+                                      * (temp_c / (257.14 + temp_c)))
+
+        vapor_pressure = humidity * saturation_vapor_pressure_kpa(dry_bulb_c)
+        low, high = dry_bulb_c - 60.0, dry_bulb_c
+        for _ in range(32):
+            wet_bulb = (low + high) * 0.5
+            psychrometric_factor = (0.00066 * (1.0 + 0.00115 * wet_bulb)
+                                    * cls.SITE_ATMOSPHERIC_PRESSURE_KPA)
+            estimated_vapor_pressure = (saturation_vapor_pressure_kpa(wet_bulb)
+                                        - psychrometric_factor * (dry_bulb_c - wet_bulb))
+            if estimated_vapor_pressure < vapor_pressure:
+                low = wet_bulb
+            else:
+                high = wet_bulb
+        return max(dry_bulb_c - 60.0, min(dry_bulb_c, (low + high) * 0.5))
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 cooling_demand_kw: float, power_available_fraction: float = 1.0,
                 seed: int = 17) -> None:
         """Advance one second of chiller, pump, cooling-load, and buffer behavior."""
         previous_output = {name: unit["output_kw"] for name, unit in state["chillers"].items()}
         state["sim_seconds"] = sim_seconds
-        ambient = 25.0 + 5.0 * math.sin(2 * math.pi * (sim_seconds % 86_400) / 86_400.0)
-        ambient += random.Random(seed * 1_000_003 + sim_seconds * 9_176 + 431).gauss(0.0, 0.12)
+        day_phase = 2.0 * math.pi * (sim_seconds % 86_400) / 86_400.0
+        ambient = 25.0 + 5.0 * math.sin(day_phase)
+        ambient += correlated_sensor_noise(state, "chilled_water.weather.dry_bulb",
+                                           seed, sim_seconds, 0.15, tau_seconds=300.0)
         state["ambient_temperature_c"] = ambient
+        humidity = 24.0 - 0.9 * (ambient - 25.0) + 2.0 * math.sin(day_phase + math.pi / 2.0)
+        humidity += correlated_sensor_noise(state, "chilled_water.weather.relative_humidity",
+                                            seed, sim_seconds, 1.5, tau_seconds=600.0)
+        humidity = min(95.0, max(5.0, humidity))
+        wet_bulb = self._wet_bulb_temperature_c(ambient, humidity)
+        state["ambient_relative_humidity_pct"] = humidity
+        state["wet_bulb_temperature_c"] = wet_bulb
         power = max(0.0, min(1.0, power_available_fraction))
         global_mechanical = self._severity(events, "Mechanical degradation")
         pump_fault = global_mechanical
@@ -110,11 +160,14 @@ class ChilledWaterPlant:
         pump_fraction *= (1.0 - local_power_loss) * (1.0 - pump_trip) * power
         state["pump_available_fraction"] = pump_fraction
         state["pump_flow_m3h"] = 180.0 * pump_fraction
-        condenser_temp = ambient + 5.0 + 2.0 * (1.0 - pump_fraction)
+        condenser_temp = (wet_bulb + self.COOLING_TOWER_APPROACH_K
+                          + 2.0 * (1.0 - pump_fraction))
         condenser_temp += 12.0 * (1.0 - tower_factor)
         state["condenser_entering_temperature_c"] = condenser_temp
+        condensing_temp = condenser_temp + self.CHILLER_CONDENSER_APPROACH_K
+        state["condenser_saturation_temperature_c"] = condensing_temp
         evaporating_temp = state["supply_temperature_c"] - 3.0
-        lift = max(10.0, condenser_temp - evaporating_temp)
+        lift = max(10.0, condensing_temp - evaporating_temp)
         state["cop"] = max(2.5, min(7.0, 0.52 * (evaporating_temp + 273.15) / lift))
         hydraulic_capacity_kw = (state["pump_flow_m3h"]
                                  * self.WATER_HEAT_CAPACITY_KWH_PER_M3_K
@@ -129,7 +182,7 @@ class ChilledWaterPlant:
                 self._severity(events, "Mechanical degradation", name))
             availability = power * (1.0 - local_power_loss) * (1.0 - unit_loss)
             availability *= max(0.0, 1.0 - 0.65 * unit_degradation)
-            ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, ambient - 25.0)) * tower_factor
+            ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, condensing_temp - 25.0)) * tower_factor
             unit["available_fraction"] = availability
             capacity = unit["capacity_kw"] * availability * ambient_derate * hydraulic_derate
             unit["available_capacity_kw"] = capacity
@@ -191,7 +244,9 @@ class ChilledWaterPlant:
         state["last_advance_seconds"] = sim_seconds
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
-                "sim_seconds", "ambient_temperature_c", "cooling_demand_kw",
+                "sim_seconds", "ambient_temperature_c", "ambient_relative_humidity_pct",
+                "wet_bulb_temperature_c", "condenser_saturation_temperature_c",
+                "cooling_demand_kw",
                 "cooling_production_kw", "cooling_served_kw", "cooling_service_fraction",
                 "storage_mwh", "storage_discharge_capacity_kw",
                 "supply_temperature_c", "return_temperature_c", "cop",
@@ -199,7 +254,6 @@ class ChilledWaterPlant:
             state["history"] = state["history"][-1_440:]
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
-        rng = random.Random(seed * 1_000_003 + state["sim_seconds"] * 9_176 + 619)
         values: dict[tuple[str, str], dict[str, tuple[float, str, float, float]]] = {
             ("Chilled water", "Chilled water header"): {
                 "supply_temperature": (state["supply_temperature_c"], "°C", 0, 25),
@@ -219,7 +273,12 @@ class ChilledWaterPlant:
             },
             ("Chilled water", "Cooling tower"): {
                 "ambient_temperature": (state["ambient_temperature_c"], "°C", -20, 60),
+                "ambient_relative_humidity": (
+                    state["ambient_relative_humidity_pct"], "%", 0, 100),
+                "wet_bulb_temperature": (state["wet_bulb_temperature_c"], "°C", -20, 60),
                 "condenser_entering_temperature": (state["condenser_entering_temperature_c"], "°C", -10, 80),
+                "condenser_saturation_temperature": (
+                    state["condenser_saturation_temperature_c"], "°C", -10, 100),
                 "plant_cop": (state["cop"], "ratio", 0, 10),
                 "electrical_load": (state["electric_load_mw"] * 1_000.0, "kW", 0, 1_000),
             },
@@ -237,7 +296,8 @@ class ChilledWaterPlant:
         for (area, asset), signals in values.items():
             for sensor, (truth, units, low, high) in signals.items():
                 tag_name = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{sensor}"
-                noise = 0.0 if units == "bool" else rng.gauss(0.0, (high - low) * 0.001)
+                noise = (0.0 if units == "bool" else correlated_sensor_noise(
+                    state, tag_name, seed, state["sim_seconds"], (high - low) * 0.001))
                 rows.append({"tag": tag_name, "area": area, "unit": asset, "sensor": sensor,
                     "units": units, "value": round(min(high, max(low, truth + noise)), 3),
                     "quality": "GOOD", "low": low, "high": high, "base": (low + high) / 2,
@@ -246,5 +306,6 @@ class ChilledWaterPlant:
 
     @staticmethod
     def public_state(state: dict) -> dict:
-        return {key: value for key, value in state.items() if key != "history"} | {
+        return {key: value for key, value in state.items()
+                if key not in {"history", "_instrument_noise"}} | {
             "history": state["history"][-600:]}
