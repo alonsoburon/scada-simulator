@@ -22,6 +22,9 @@ class ChilledWaterPlant:
     CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
     CONDENSER_WATER_DESIGN_DELTA_T_K = 5.0
     COOLING_TOWER_APPROACH_K = 5.0
+    COOLING_TOWER_DESIGN_HEAT_REJECTION_KW = 1_650.0
+    COOLING_TOWER_MIN_APPROACH_K = 2.0
+    COOLING_TOWER_MAX_APPROACH_K = 20.0
     CHILLER_CONDENSER_APPROACH_K = 4.0
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
@@ -33,11 +36,12 @@ class ChilledWaterPlant:
         ambient = 25.0
         humidity = 26.0
         wet_bulb = self._wet_bulb_temperature_c(ambient, humidity)
-        condenser_entering = wet_bulb + self.COOLING_TOWER_APPROACH_K
         evaporating = 6.0 - 3.0
         initial_cop = 6.0
         for _ in range(4):
             initial_heat_rejection = 878.0 * (1.0 + 1.0 / initial_cop)
+            tower_approach = self._tower_approach_k(initial_heat_rejection, 1.0)
+            condenser_entering = wet_bulb + tower_approach
             condenser_rise = (initial_heat_rejection
                 / (self.CONDENSER_WATER_DESIGN_FLOW_M3H
                    * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K))
@@ -50,6 +54,7 @@ class ChilledWaterPlant:
             "ambient_temperature_c": ambient,
             "ambient_relative_humidity_pct": humidity,
             "wet_bulb_temperature_c": wet_bulb,
+            "cooling_tower_approach_c": tower_approach,
             "condenser_saturation_temperature_c": condenser_saturation,
             "condenser_heat_rejection_kw": initial_heat_rejection,
             "condenser_pump_available_fraction": 1.0,
@@ -149,6 +154,16 @@ class ChilledWaterPlant:
         lift = max(10.0, condensing_c - evaporating_c)
         return max(2.5, min(7.0, 0.52 * (evaporating_c + 273.15) / lift))
 
+    @classmethod
+    def _tower_approach_k(cls, heat_rejection_kw: float, capacity_factor: float) -> float:
+        if capacity_factor <= 0.01:
+            return cls.COOLING_TOWER_MAX_APPROACH_K
+        load_fraction = max(0.0, heat_rejection_kw) / cls.COOLING_TOWER_DESIGN_HEAT_REJECTION_KW
+        approach = cls.COOLING_TOWER_APPROACH_K * math.sqrt(min(1.5, load_fraction))
+        approach /= max(0.20, capacity_factor)
+        return min(cls.COOLING_TOWER_MAX_APPROACH_K,
+                   max(cls.COOLING_TOWER_MIN_APPROACH_K, approach))
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 cooling_demand_kw: float, power_available_fraction: float = 1.0,
                 seed: int = 17) -> None:
@@ -188,8 +203,10 @@ class ChilledWaterPlant:
         state["condenser_pump_available_fraction"] = condenser_pump_fraction
         condenser_flow = self.CONDENSER_WATER_DESIGN_FLOW_M3H * condenser_pump_fraction
         state["condenser_water_flow_m3h"] = condenser_flow
-        condenser_temp = wet_bulb + self.COOLING_TOWER_APPROACH_K
-        condenser_temp += 12.0 * (1.0 - tower_factor)
+        tower_approach = self._tower_approach_k(
+            state.get("condenser_heat_rejection_kw", 0.0), tower_factor)
+        state["cooling_tower_approach_c"] = tower_approach
+        condenser_temp = wet_bulb + tower_approach
         state["condenser_entering_temperature_c"] = condenser_temp
         prior_heat_rejection = state.get("condenser_heat_rejection_kw", 0.0)
         condenser_water_rise = (prior_heat_rejection /
@@ -296,7 +313,8 @@ class ChilledWaterPlant:
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "ambient_temperature_c", "ambient_relative_humidity_pct",
-                "wet_bulb_temperature_c", "condenser_saturation_temperature_c",
+                "wet_bulb_temperature_c", "cooling_tower_approach_c",
+                "condenser_saturation_temperature_c",
                 "condenser_water_leaving_temperature_c", "condenser_heat_rejection_kw",
                 "cooling_demand_kw",
                 "cooling_production_kw", "cooling_served_kw", "cooling_service_fraction",
@@ -334,6 +352,7 @@ class ChilledWaterPlant:
                 "ambient_relative_humidity": (
                     state["ambient_relative_humidity_pct"], "%", 0, 100),
                 "wet_bulb_temperature": (state["wet_bulb_temperature_c"], "°C", -20, 60),
+                "tower_approach": (state["cooling_tower_approach_c"], "°C", 0, 25),
                 "condenser_entering_temperature": (state["condenser_entering_temperature_c"], "°C", -10, 80),
                 "condenser_saturation_temperature": (
                     state["condenser_saturation_temperature_c"], "°C", -10, 100),
