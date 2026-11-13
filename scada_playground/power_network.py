@@ -405,8 +405,13 @@ class MinePowerNetwork:
         grid_coupling = 0.98 * min(1.0, tie_cap / 44.0)
         grid_coupling_rate = -math.log(max(1e-9, 1.0 - grid_coupling))
         frequency_interval_s = 1.0 / self.FREQUENCY_SUBSTEPS_PER_SCAN
-        connected_load = connected_load_at_tick_start
-        connected_process = max(0.0, connected_process_at_tick_start)
+        # Carry disconnected load through the first disturbed scan, but let a
+        # newly available restoration load enter the frequency balance now.
+        # Using only the previous scan here made a restored grid appear to feed
+        # full load while the frequency model still saw the islanded load, which
+        # caused a fictitious overfrequency spike on reconnection.
+        connected_load = max(connected_load_at_tick_start, state["served_load_mw"])
+        connected_process = max(0.0, connected_process_at_tick_start, served_process)
         ufls_disconnect_this_scan = 0.0
         battery_power_integral_mw_s = 0.0
         for _ in range(self.FREQUENCY_SUBSTEPS_PER_SCAN):
