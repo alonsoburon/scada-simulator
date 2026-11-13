@@ -41,6 +41,7 @@ class PlantController:
             "mode": "RUNNING", "requested_mode": "RUNNING", "sequence_index": len(self.START_ORDER),
             "sequence_timer_s": 0, "last_transition": "Plant initialized in steady operation",
             "permissive_reason": "All startup permissives healthy",
+            "process_water_level_feedback_pct": 60.0,
             "trip_count": 0, "history": [], "scan_seconds": 1,
             "motor_start_transients_mw": {name: 0.0 for name in self.START_ORDER},
             "motor_starting_load_mw": 0.0,
@@ -173,6 +174,7 @@ class PlantController:
                 frequency_hz: float) -> None:
         """Execute one simulated PLC scan, sequence transitions, and latched trips."""
         state["sim_seconds"] = sim_seconds
+        state["process_water_level_feedback_pct"] = process_water_level_pct
         decay = math.exp(-1.0 / self.MOTOR_STARTING_DECAY_S)
         transients = state["motor_start_transients_mw"]
         for name in self.START_ORDER:

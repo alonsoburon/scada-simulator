@@ -35,6 +35,7 @@ class PlantControllerTests(unittest.TestCase):
         self.advance(80)
         self.controller.request(self.state, "START")
         self.advance(30, process_water_level_pct=10.0)
+        self.assertEqual(self.state["process_water_level_feedback_pct"], 10.0)
         self.assertEqual(self.state["equipment"]["tailings_pump"]["state"], "RUNNING")
         self.assertEqual(self.state["equipment"]["flotation"]["state"], "STOPPED")
         self.assertIn("water", self.state["permissive_reason"].lower())

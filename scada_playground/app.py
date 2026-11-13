@@ -629,7 +629,10 @@ def advance(force: bool = False) -> None:
                         utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
                         motor_starting_load_mw=sim["process_control"]["motor_starting_load_mw"],
                         seed=sim["seed"])
-    water_level = sim["water_network"]["nodes"]["process_tank"]["level_pct"]
+    # The concentrator PLC sees the last scanned tank transmitter value, not
+    # the water model's hidden process truth. This lets instrument drift affect
+    # ordinary startup permissives just as it affects the tank-level PI loop.
+    water_level = sim["water_network"]["controllers"]["Process feed pump"]["process_value_pct"]
     trips_before = sim["process_control"]["trip_count"]
     PLANT_CONTROLLER.advance(
         sim["process_control"], sim["tick"], concentrator_events,
@@ -1275,6 +1278,8 @@ def render_dashboard():
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. Motor starts add a decaying electrical load to the mine grid, so large drives can disturb voltage, frequency, and reserves. These aggregate transients are illustrative, not a certified motor-start or protection study. The factory timeline must be running or single-stepped for sequences to progress.")
             st.metric("Motor acceleration load", f"{control['motor_starting_load_mw']:.2f} MW")
+            physical_water_level = sim["water_network"]["nodes"]["process_tank"]["level_pct"]
+            st.caption(f"PLC water-level permissive PV {control['process_water_level_feedback_pct']:.2f}% · physical tank level {physical_water_level:.2f}%")
             state_col, buttons = st.columns([1.1, 2])
             state_col.metric("Process sequence", control["mode"])
             state_col.caption(control["last_transition"])
