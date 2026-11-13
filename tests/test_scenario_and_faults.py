@@ -59,6 +59,19 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertEqual(definition.steps[0].parameters["incident_name"], "Utility loss")
         self.assertTrue(any("CO₂" in note for note in definition.expected_observations))
 
+    def test_underground_ventilation_scenario_overlaps_fan_outage_and_gas_upset(self):
+        definition = ScenarioRunner().definition("underground-ventilation-loss-and-recovery")
+        outage, upset = definition.steps
+        outage_end = outage.at_seconds + outage.parameters["duration_seconds"]
+        upset_end = upset.at_seconds + upset.parameters["duration_seconds"]
+        self.assertEqual(outage.parameters["target_area"], "Underground mining")
+        self.assertEqual(outage.parameters["incident_name"], "Utility loss")
+        self.assertEqual(upset.parameters["incident_name"], "Process upset")
+        self.assertLess(upset.at_seconds, outage_end)
+        self.assertGreater(definition.duration_seconds, max(outage_end, upset_end))
+        self.assertTrue(any("airflow" in note.lower() and "gas" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_mine_grid_support_scenario_has_reserve_and_recovery_evidence(self):
         runner = ScenarioRunner()
         definition = runner.definition("mine-grid-support-and-recovery")

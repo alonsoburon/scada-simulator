@@ -27,6 +27,7 @@ from power_network import MinePowerNetwork
 from plant_controller import PlantController
 from plant_utilities import FactoryUtilities
 from site_buildings import SiteBuildings
+from underground_ventilation import UndergroundVentilation
 
 
 AREAS = {
@@ -185,6 +186,7 @@ POWER_MODEL = MinePowerNetwork()
 UTILITY_MODEL = FactoryUtilities()
 PLANT_CONTROLLER = PlantController()
 BUILDING_MODEL = SiteBuildings()
+VENTILATION_MODEL = UndergroundVentilation()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -233,12 +235,16 @@ def initialize(seed: int = 17) -> None:
         UTILITY_MODEL.advance(utility_state, 0, [], seed=seed)
         buildings_state = BUILDING_MODEL.initialize()
         BUILDING_MODEL.advance(buildings_state, 0, [], seed=seed)
+        ventilation_state = VENTILATION_MODEL.initialize()
+        VENTILATION_MODEL.advance(ventilation_state, 0, [], seed=seed)
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
+        modeled_assets.update(("Underground mining", asset) for asset in
+                              ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
         for tag in modeled_tags:
@@ -258,6 +264,7 @@ def initialize(seed: int = 17) -> None:
         initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
                                      + concentrator_state["crusher_power_mw"] + 1.0)
         initial_water_power_mw = water_state["electrical_load_kw"] / 1000.0
+        initial_process_power_mw += ventilation_state["fan_power_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
                             utility_load_mw=utility_state["electric_load_mw"],
@@ -274,17 +281,23 @@ def initialize(seed: int = 17) -> None:
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in utility_assets]
         tags.extend(UTILITY_MODEL.telemetry(utility_state, seed))
         tags.extend(BUILDING_MODEL.telemetry(buildings_state, seed))
+        ventilation_tags = VENTILATION_MODEL.telemetry(ventilation_state, seed)
+        for tag in ventilation_tags:
+            tag["dynamic_model"] = True
+        tags.extend(ventilation_tags)
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
                                 "power_network": power_state,
                                 "plant_utilities": utility_state,
                                 "site_buildings": buildings_state,
+                                "mine_ventilation": ventilation_state,
                                 "concentrator": concentrator_state,
                                 "process_control": process_control_state,
                                 "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
                                 "building_alarm_states": {},
+                                "ventilation_alarm_states": {},
                                 "concentrator_alarm_states": {},
                                 "haulage_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
@@ -312,15 +325,24 @@ def initialize(seed: int = 17) -> None:
             sim["site_buildings"] = BUILDING_MODEL.initialize()
             BUILDING_MODEL.advance(sim["site_buildings"], sim.get("tick", 0), [], seed=sim["seed"])
         BUILDING_MODEL.migrate(sim["site_buildings"])
+        if "mine_ventilation" not in sim:
+            sim["mine_ventilation"] = VENTILATION_MODEL.initialize()
+            VENTILATION_MODEL.advance(sim["mine_ventilation"], sim.get("tick", 0), [], seed=sim["seed"])
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
+        modeled_assets.update(("Underground mining", asset) for asset in
+                              ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
         for tag in modeled_tags:
+            tag["dynamic_model"] = True
+            sim["tags"].append(tag)
+        ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
+        for tag in ventilation_tags:
             tag["dynamic_model"] = True
             sim["tags"].append(tag)
         if "water_network" not in sim:
@@ -343,7 +365,8 @@ def initialize(seed: int = 17) -> None:
         if "power_network" not in sim:
             sim["power_network"] = POWER_MODEL.initialize()
             process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                               + sim["concentrator"]["crusher_power_mw"] + 1.0)
+                               + sim["concentrator"]["crusher_power_mw"] + 1.0
+                               + sim["mine_ventilation"]["fan_power_kw"] / 1000.0)
             water_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw,
@@ -372,12 +395,15 @@ def initialize(seed: int = 17) -> None:
 def publish_snapshot() -> dict:
     """Publish one atomic local file snapshot for the separate protocol gateway."""
     sim = st.session_state.sim
-    fleet_units = sorted({t["unit"] for t in sim["tags"] if t["area"] == "Mobile fleet"})
+    fleet_units = sorted({t["unit"] for t in sim["tags"]
+                          if t["area"] == "Mobile fleet"
+                          and t["unit"].rsplit(" ", 1)[0] in FLEET_ROUTES})
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
+    ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
     haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
     haulage_frames = {frame["unit"]: frame for frame in HAULAGE_MODEL.positions(sim["haulage"])}
     concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags + haulage_tags}
@@ -385,6 +411,7 @@ def publish_snapshot() -> dict:
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
+    ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
@@ -394,6 +421,8 @@ def publish_snapshot() -> dict:
             tag.update(utility_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
             tag.update(building_by_tag[tag["tag"]])
+        elif tag["tag"] in ventilation_by_tag:
+            tag.update(ventilation_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     PROCESS_MODEL.apply_instrument_faults(sim["tags"], sim["events"], sim["tick"])
@@ -419,6 +448,7 @@ def publish_snapshot() -> dict:
         "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
         "plant_utilities": {key: value for key, value in sim["plant_utilities"].items() if key != "history"},
         "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),
+        "mine_ventilation": VENTILATION_MODEL.public_state(sim["mine_ventilation"]),
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
         "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
@@ -645,7 +675,8 @@ def advance(force: bool = False) -> None:
                     if event.area in ("Water supply network", "Water treatment", "Wastewater", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                             + sim["concentrator"]["crusher_power_mw"] + 1.0)
+                             + sim["concentrator"]["crusher_power_mw"] + 1.0
+                             + sim["mine_ventilation"]["fan_power_kw"] / 1000.0)
     water_power_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
@@ -658,6 +689,38 @@ def advance(force: bool = False) -> None:
     BUILDING_MODEL.advance(
         sim["site_buildings"], sim["tick"], utility_events, seed=sim["seed"],
         power_available_fraction=sim["power_network"]["site_flexible_power_fraction"])
+    moving_trucks = sum(1 for truck in sim["haulage"]["trucks"].values()
+                        if truck["frame"]["speed_kmh"] > 2.0
+                        or truck["frame"]["cycle_state"] == "loading")
+    ventilation_activity = moving_trucks / max(1, len(sim["haulage"]["trucks"]))
+    VENTILATION_MODEL.advance(
+        sim["mine_ventilation"], sim["tick"], utility_events, seed=sim["seed"],
+        power_available_fraction=sim["power_network"]["process_power_fraction"],
+        haulage_activity=ventilation_activity,
+    )
+    ventilation_alarm_states = sim.setdefault("ventilation_alarm_states", {})
+    peak_methane = max(zone["methane_pct"] for zone in sim["mine_ventilation"]["branches"].values())
+    min_oxygen = min(zone["oxygen_pct"] for zone in sim["mine_ventilation"]["branches"].values())
+    ventilation_conditions = (
+        ("airflow", sim["mine_ventilation"]["total_airflow_m3s"]
+         < 0.80 * sim["mine_ventilation"]["required_airflow_m3s"],
+         sim["mine_ventilation"]["total_airflow_m3s"]
+         > 0.90 * sim["mine_ventilation"]["required_airflow_m3s"],
+         "Mine ventilation airflow is below the operating requirement"),
+        ("methane", peak_methane > 1.0, peak_methane < 0.8,
+         "Methane concentration is elevated; inspect ventilation and gas sources"),
+        ("oxygen", min_oxygen < 19.5, min_oxygen > 19.8,
+         "Mine oxygen concentration is below the simulated operating limit"),
+    )
+    for condition, active, cleared, message in ventilation_conditions:
+        if active and not ventilation_alarm_states.get(condition, False):
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Underground mining",
+                "severity": "HIGH", "message": message, "state": "ACTIVE / UNACK"})
+            ventilation_alarm_states[condition] = True
+        elif ventilation_alarm_states.get(condition, False) and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Underground mining",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+            ventilation_alarm_states[condition] = False
     building_alarm_states = sim.setdefault("building_alarm_states", {})
     for name, zone in sim["site_buildings"]["zones"].items():
         slug = name.lower().replace(" ", "_")
@@ -937,10 +1000,12 @@ def advance(force: bool = False) -> None:
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
+    ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
+    ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
                            + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
@@ -953,6 +1018,8 @@ def advance(force: bool = False) -> None:
             tag.update(utility_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
             tag.update(building_by_tag[tag["tag"]])
+        elif tag["tag"] in ventilation_by_tag:
+            tag.update(ventilation_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     if sim["tick"] % 15 == 0:
@@ -1095,7 +1162,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities", "Underground ventilation"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -1711,6 +1778,56 @@ def render_dashboard():
                 fig.update_layout(title="Instrument-air production and demand", uirevision="air-balance-trend")
                 st.plotly_chart(fig, width="stretch")
         st.markdown("**Fault drills:** run `boiler-header-pressure-and-recovery` or inject Utility loss in Boiler house. Compare header pressure with the slower pasteurizer temperature response and diverted-product rate. Run `compressed-air-receiver-and-recovery` and follow receiver pressure, dryer dew point, filler rate, and case-packer rate. Run `packaging-jam-buffer-and-recovery` to watch the conveyor buffer fill, filler slow, pasteurized-product tank fill, and both buffers drain after the jam clears.")
+
+    with tabs[10]:
+        ventilation = sim["mine_ventilation"]
+        st.subheader("Underground mine · primary ventilation and district air quality")
+        st.caption("Parallel exhaust fans operate against a shared airway network. Airflow divides across the two decline districts and ore pass according to branch resistance. Gas, diesel exhaust, dust, oxygen, and heat respond through finite district volumes, so their trends lag fan and airflow changes.")
+        peak_methane = max(zone["methane_pct"] for zone in ventilation["branches"].values())
+        min_oxygen = min(zone["oxygen_pct"] for zone in ventilation["branches"].values())
+        metric_cols = st.columns(5)
+        for col, label, value in zip(metric_cols,
+            ["Total airflow", "Required flow", "Main airway pressure", "Peak methane", "Fan power"],
+            [f"{ventilation['total_airflow_m3s']:.1f} m³/s",
+             f"{ventilation['required_airflow_m3s']:.0f} m³/s",
+             f"{ventilation['network_pressure_pa'] / 1000:.2f} kPa",
+             f"{peak_methane:.3f}% vol", f"{ventilation['fan_power_kw']:.0f} kW"]):
+            col.metric(label, value)
+        fan_rows = [{"Fan": name, "Running": fan["running"],
+                     "Speed (%)": fan["speed_pct"], "Flow (m³/s)": fan["flow_m3s"],
+                     "Power (kW)": fan["power_kw"], "Condition (%)": 100 * fan["condition"],
+                     "Starts": fan["starts"]} for name, fan in ventilation["fans"].items()]
+        st.dataframe(pd.DataFrame(fan_rows).round(2), hide_index=True, width="stretch")
+        district_rows = [{"District": name, "Airflow (m³/s)": zone["airflow_m3s"],
+                          "Airway pressure (Pa)": zone["pressure_pa"],
+                          "Methane (% vol)": zone["methane_pct"], "NOx (ppm)": zone["nox_ppm"],
+                          "Oxygen (% vol)": zone["oxygen_pct"], "Dust (mg/m³)": zone["dust_mg_m3"],
+                          "Air temperature (°C)": zone["temperature_c"]}
+                         for name, zone in ventilation["branches"].items()]
+        st.dataframe(pd.DataFrame(district_rows).round(3), hide_index=True, width="stretch")
+        history = pd.DataFrame(ventilation["history"])
+        if history.empty:
+            st.info("Start or single-step the factory to build ventilation trends.")
+        else:
+            left, right = st.columns(2)
+            with left:
+                airflow = px.line(history, x="sim_seconds", y="airflow_m3s",
+                    labels={"sim_seconds": "Simulated seconds", "airflow_m3s": "Airflow (m³/s)"},
+                    color_discrete_sequence=["#277da1"])
+                airflow.add_hline(y=ventilation["required_airflow_m3s"], line_dash="dash",
+                                  line_color="#d1495b", annotation_text="Requirement")
+                airflow.update_layout(title="Mine ventilation delivery", uirevision="mine-airflow")
+                st.plotly_chart(airflow, width="stretch")
+            with right:
+                gas = px.line(history, x="sim_seconds", y="methane_peak_pct",
+                    labels={"sim_seconds": "Simulated seconds", "methane_peak_pct": "Methane (% vol)"},
+                    color_discrete_sequence=["#e07a5f"])
+                gas.add_hline(y=1.0, line_dash="dash", line_color="#6c757d",
+                              annotation_text="Exercise alarm threshold")
+                gas.update_layout(title="Peak district methane", uirevision="mine-methane")
+                st.plotly_chart(gas, width="stretch")
+        st.caption(f"Minimum district oxygen {min_oxygen:.2f}% vol · electrical demand is included in the mine process load. Exercise alarm limits are illustrative, not safety guidance.")
+        st.markdown("**Fault drill:** run `underground-ventilation-loss-and-recovery`. Confirm airflow alarms first; then compare fan restoration with delayed gas, oxygen, dust, and thermal recovery.")
 
 
 

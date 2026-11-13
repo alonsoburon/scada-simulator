@@ -252,6 +252,17 @@ def get_site_buildings_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_underground_ventilation_state() -> dict[str, Any]:
+    """Read mine fan duty, airway flow/pressure, and district gas, oxygen, dust, and temperature."""
+    data = snapshot()
+    ventilation = data.get("mine_ventilation")
+    if not ventilation:
+        raise RuntimeError("Mine ventilation model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **ventilation}
+
+
+@mcp.tool()
 def get_plant_utilities_state() -> dict[str, Any]:
     """Read steam generation/header pressure and compressed-air storage state."""
     data = snapshot()
