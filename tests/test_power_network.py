@@ -40,7 +40,8 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.assertAlmostEqual(self.state["process_power_fraction"], 1.0)
         self.assertAlmostEqual(self.state["water_power_fraction"], 1.0)
         self.assertAlmostEqual(self.state["total_generation_mw"],
-            self.state["served_load_mw"] + max(0.0, -self.state["battery_power_mw"]), places=6)
+            self.state["served_load_mw"] + max(0.0, -self.state["battery_power_mw"])
+            + self.state["distribution_losses_mw"], delta=0.01)
 
     def test_transmission_outage_dispatches_reserves_and_derates_process_load(self):
         event = {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}

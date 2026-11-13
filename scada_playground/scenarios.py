@@ -36,12 +36,15 @@ SCENARIOS = {
         steps=(
             ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
                                              "target_area": "Grid transmission", "duration_seconds": 3_600}),
+            ScenarioStep(3_905, "process_control", {"process_action": "RESET_TRIPS"}),
+            ScenarioStep(3_910, "process_control", {"process_action": "START"}),
         ),
         expected_observations=(
             "The Large transmission event opens the intertie; the battery responds first, then the diesel generators start and ramp onto the islanded mine bus.",
             "When import and reserves cannot cover demand, noncritical site load sheds first and the process feeder limits concentrator power.",
-            "Mine bus frequency and voltage respond to the supply deficit; water storage temporarily buffers pump-power reductions.",
-            "After the transmission restriction clears, the tie-line recovers, the diesel units ramp down, storage recharges, and process loads recover.",
+            "Mine bus frequency and voltage respond to the supply deficit; ordinary process interlocks latch trips, and water storage temporarily buffers pump-power reductions.",
+            "After the transmission restriction clears and electrical permissives recover, the replay simulates an operator trip reset and orderly process restart.",
+            "The tie-line resumes imports, diesel output ramps down, storage recharges, and throughput recovers after the startup sequence.",
         ),
     ),
     "haulage-crusher-buffer": ScenarioDefinition(

@@ -397,6 +397,17 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
     elif step.action == "protocol_fault":
         PROTOCOL_FAULTS.add(sim, params["protocol"], params["mode"], params["selector_type"],
                             params["target"], params["duration_seconds"])
+    elif step.action == "process_control":
+        control = sim["process_control"]
+        process_action = params["process_action"].upper()
+        if process_action == "RESET_TRIPS":
+            power = sim["power_network"]
+            PLANT_CONTROLLER.reset_trips(
+                control, events=[event.__dict__ for event in sim["events"]],
+                power_fraction=power["process_power_fraction"],
+                voltage_pu=power["voltage_pu"], frequency_hz=power["frequency_hz"])
+        else:
+            PLANT_CONTROLLER.request(control, process_action)
     else:
         raise ValueError(f"Scenario action is not supported: {step.action}")
 

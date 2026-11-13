@@ -104,9 +104,13 @@ class PlantController:
                 cleared.append(name)
         if cleared:
             state["trip_count"] = max(0, state["trip_count"] - len(cleared))
-            state["mode"] = "STOPPED"
             state["requested_mode"] = "STOPPED"
-            state["sequence_index"] = 0
+            # A full electrical trip leaves every unit stopped; partial trips may
+            # leave unaffected equipment running, so finish a real orderly stop
+            # before permitting a process restart.
+            still_running = any(item["state"] != "STOPPED" for item in state["equipment"].values())
+            state["mode"] = "STOPPING" if still_running else "STOPPED"
+            state["sequence_index"] = 0 if still_running else len(self.STOP_ORDER)
             state["last_transition"] = "Operator reset trips: " + ", ".join(self.LABELS[name] for name in cleared)
         return cleared
 

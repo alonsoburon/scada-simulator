@@ -73,6 +73,11 @@ class PlantControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "clear the active jam"):
             self.controller.reset_trips(self.state, events=jam, power_fraction=1, voltage_pu=1, frequency_hz=50)
         self.controller.reset_trips(self.state, events=[], power_fraction=1, voltage_pu=1, frequency_hz=50)
+        self.assertEqual(self.state["mode"], "STOPPING")
+        self.controller.advance(self.state, 4, [], **self.utilities)
+        with self.assertRaisesRegex(ValueError, "Finish the orderly stop"):
+            self.controller.request(self.state, "START")
+        self.advance(80)
         self.assertEqual(self.state["mode"], "STOPPED")
         self.controller.request(self.state, "START")
         self.advance(80)
@@ -89,6 +94,9 @@ class PlantControllerTests(unittest.TestCase):
         self.controller.reset_trips(self.state, events=[], power_fraction=1,
                                     voltage_pu=1, frequency_hz=50)
         self.assertEqual(self.state["trip_count"], 0)
+        self.assertEqual(self.state["mode"], "STOPPING")
+        self.advance(80)
+        self.assertEqual(self.state["mode"], "STOPPED")
         self.controller.request(self.state, "START")
         self.advance(80)
         self.assertEqual(self.state["mode"], "RUNNING")

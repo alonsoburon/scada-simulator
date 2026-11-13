@@ -78,7 +78,7 @@ The sidebar's **Scenario replay** panel and the MCP `run_scenario` tool run a na
 
 Built-in scenarios:
 
-- `mine-grid-support-and-recovery`: a large transmission trip islands the mine grid and exercises battery response, diesel start/ramp, frequency, load shedding, and process recovery.
+- `mine-grid-support-and-recovery`: a large transmission trip islands the mine grid, trips the process sequence, then simulates an operator reset and orderly restart after electrical supply recovers.
 - `haulage-crusher-buffer`: a long crusher conveyor trip lets discrete truck loads fill ROM and pause dispatch; recovery draws the stockpile down until truck loading resumes.
 - `concentrator-mill-degradation`: changing ore hardness, grinding degradation, and a mine power disturbance propagate into grind size, flotation recovery, water demand, and buffered inventories.
 - `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
