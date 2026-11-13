@@ -229,6 +229,17 @@ def get_power_network_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_plant_utilities_state() -> dict[str, Any]:
+    """Read steam generation/header pressure and compressed-air storage state."""
+    data = snapshot()
+    utilities = data.get("plant_utilities")
+    if not utilities:
+        raise RuntimeError("Plant utility model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **utilities}
+
+
+@mcp.tool()
 def list_protocol_faults() -> dict[str, Any]:
     """List active protocol-output faults and their simulation-time expiry."""
     data = snapshot()

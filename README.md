@@ -2,7 +2,7 @@
 
 A local synthetic industrial operations world for developers building, testing, and demoing SCADA monitoring integrations. One simulator publishes the same values through Modbus TCP, OPC UA, MQTT, and MCP, with a small operator UI and a separate live fleet map.
 
-It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, about 200 equipment units, and about 1,550 tags**. The mine electrical network, water network, copper concentrator, and haulage fleet have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
+It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, about 200 equipment units, and about 1,500 tags**. The mine electrical network, water network, copper concentrator, haulage fleet, and factory steam/instrument-air loops have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
 
 > Everything here is simulated. It is not a PLC, a process engineering model, a safety system, or a connection to real equipment.
 
@@ -47,6 +47,7 @@ MCP tag reads show the canonical simulator snapshot. Protocol faults are applied
 - `get_concentrator_state`: read ore buffers, grinding limits, product size, recovery, water use, and power.
 - `get_process_control_state`, `control_process`: inspect the simulated process sequence and request orderly `START`, `STOP`, or `RESET_TRIPS` after the cause clears.
 - `get_power_network_state`: read grid import, diesel/solar/storage dispatch, frequency, voltage, load shedding, and feeder limits.
+- `get_plant_utilities_state`: read boiler output, steam-header pressure, condensate return, compressor output, receiver pressure, dryer dew point, and downstream production.
 - `control_simulation`: `start`, `stop`, `reset`, `acknowledge_alarms`, or `inject_incident` with a selected type, severity, and area.
 - `run_scenario`: reset and replay a named scenario from a seed; same seed replays the same measurements and timing.
 - `step_simulation`: advance a paused run by an exact number of simulated seconds.
@@ -82,6 +83,8 @@ Built-in scenarios:
 - `haulage-crusher-buffer`: a long crusher conveyor trip lets discrete truck loads fill ROM and pause dispatch; recovery draws the stockpile down until truck loading resumes.
 - `concentrator-mill-degradation`: changing ore hardness, grinding degradation, and a mine power disturbance propagate into grind size, flotation recovery, water demand, and buffered inventories.
 - `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
+- `boiler-header-pressure-and-recovery`: boiler capacity loss drains header inventory; pasteurizer temperatures lag the pressure drop and recover after the fault clears.
+- `compressed-air-receiver-and-recovery`: compressor loss draws down receiver pressure, degrades dryer output, and curtails filler and case-packer rates before recovery.
 - `grid-comms-recovery`: simulated network partition in Grid distribution, stale quality, then recovery.
 - `frozen-signal`: freeze one signal while simulation time and other values continue.
 - `mqtt-tag-gap`: omit one tag from MQTT batches temporarily, then restore it.
@@ -101,6 +104,12 @@ The **Water network** tab models a north reservoir, raw-water tank, process-wate
 Use the simulated pump and valve controls to create operating changes. The diagram encodes flow with line width and direction; trends show storage and flows over simulated time. Scenario `mine-water-pump-and-demand` provides a deterministic demand and pump degradation replay.
 
 This remains a compact learning model. Pipe friction and pump curves are simplified steady-state relationships; queues approximate plug flow. It does not model water hammer, elevation profiles along each pipe, changing pipe diameter, cavitation, pump efficiency maps, treatment chemistry, or site-calibrated equipment. Those omissions matter for engineering design and fast transients. The network is intended to provide credible control-loop and telemetry behavior at low compute cost.
+
+## Factory steam and instrument-air utilities
+
+The **Plant utilities** tab models two boilers feeding a finite steam header, a delayed condensate return, two air compressors, a dryer, a receiver plus effective ring-main linepack, and process consumers. Header and receiver inventory buffer outages; boiler/compressor output ramps; low pressure curtails pasteurizer temperature and packaging rates with thermal and pneumatic response lags. Condensate reuse and boiler make-up change after the return delay. Compressor electrical demand is included in the site power request, so a mine-grid limitation can also reduce instrument-air capacity.
+
+These compact inventory and pressure-control models do not calculate combustion, steam tables, compressor maps, air-leak location, or pipe-network design. They provide cross-system failure propagation for SCADA monitoring practice. Run `boiler-header-pressure-and-recovery` and `compressed-air-receiver-and-recovery` to compare stored inventory with downstream response.
 
 ## Copper concentrator process simulation
 

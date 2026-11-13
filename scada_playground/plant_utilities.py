@@ -1,0 +1,309 @@
+"""Low-compute steam and instrument-air dynamics for the synthetic factory."""
+from __future__ import annotations
+
+import random
+
+
+class FactoryUtilities:
+    AREA_ASSETS = {
+        "Boiler house": ["Boiler 01", "Boiler 02", "Feedwater system", "Steam header", "Condensate return"],
+        "Compressed air": ["Compressor A", "Compressor B", "Dryer A", "Receiver 01", "Ring main"],
+        "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02"],
+        "Filling": ["Filler 01"],
+        "Packaging": ["Case packer A"],
+    }
+    SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
+    HEADER_CAPACITY_T = 1.5
+    RECEIVER_VOLUME_M3 = 80.0  # Receiver plus effective ring-main volume.
+    CONDENSATE_CAPACITY_T = 30.0
+
+    def initialize(self) -> dict:
+        return {
+            "sim_seconds": 0,
+            "boilers": {
+                "boiler_01": {"capacity_tph": 22.0, "output_tph": 16.0, "availability": 1.0, "vibration_mm_s": 2.1},
+                "boiler_02": {"capacity_tph": 22.0, "output_tph": 16.0, "availability": 1.0, "vibration_mm_s": 2.0},
+            },
+            "steam_header_inventory_t": 1.0,
+            "steam_header_pressure_bar": 8.0,
+            "steam_generation_tph": 32.0,
+            "steam_demand_tph": 32.0,
+            "steam_consumption_tph": 32.0,
+            "steam_service_fraction": 1.0,
+            "condensate_inventory_t": 12.0,
+            "condensate_return_tph": 25.6,
+            "condensate_reuse_tph": 25.6,
+            "feedwater_makeup_tph": 6.4,
+            "condensate_return_queue": [25.6] * 60,
+            "pasteurizers": {
+                "pasteurizer_01": {"temperature_c": 82.0, "setpoint_c": 82.0, "production_rate": 90.0},
+                "pasteurizer_02": {"temperature_c": 82.0, "setpoint_c": 82.0, "production_rate": 90.0},
+            },
+            "compressors": {
+                "compressor_a": {"capacity_nm3_min": 50.0, "output_nm3_min": 41.0, "availability": 1.0, "vibration_mm_s": 2.2},
+                "compressor_b": {"capacity_nm3_min": 50.0, "output_nm3_min": 37.0, "availability": 1.0, "vibration_mm_s": 2.0},
+            },
+            "air_demand_nm3_min": 78.0,
+            "air_consumption_nm3_min": 78.0,
+            "air_supply_nm3_min": 78.0,
+            "air_inventory_nm3": 560.0,
+            "air_receiver_pressure_bar": 7.0,
+            "air_service_fraction": 1.0,
+            "dryer_available": True,
+            "dryer_dew_point_c": -25.0,
+            "filling_air_service": 1.0,
+            "filler_rate_units_min": 180.0,
+            "packer_rate_cases_min": 60.0,
+            "electric_load_mw": 0.55,
+            "history": [],
+        }
+
+    @staticmethod
+    def _event_severity(events: list[dict], name: str, areas: tuple[str, ...]) -> float:
+        return max((FactoryUtilities.SEVERITY[event["severity"]]
+                    for event in events if event["name"] == name
+                    and event["area"] in (*areas, "Whole factory")), default=0.0)
+
+    def migrate(self, state: dict) -> None:
+        """Add utility state to a paused session created by an older simulator."""
+        defaults = self.initialize()
+        for key, value in defaults.items():
+            if key == "history":
+                state.setdefault(key, [])
+            else:
+                state.setdefault(key, value)
+        for name, equipment in defaults["boilers"].items():
+            state["boilers"].setdefault(name, equipment.copy())
+        for name, equipment in defaults["compressors"].items():
+            state["compressors"].setdefault(name, equipment.copy())
+        for name, unit in defaults["pasteurizers"].items():
+            state["pasteurizers"].setdefault(name, unit.copy())
+
+    def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
+                power_available_fraction: float = 1.0, seed: int = 17) -> None:
+        """Advance boiler/header, condensate, compressed-air, and consumer states."""
+        self.migrate(state)
+        state["sim_seconds"] = sim_seconds
+        power_factor = max(0.0, min(1.0, power_available_fraction))
+
+        boiler_fault = self._event_severity(events, "Utility loss", ("Boiler house",))
+        boiler_mechanical = self._event_severity(events, "Mechanical degradation", ("Boiler house",))
+        steam_demand_fault = self._event_severity(events, "Process upset", ("Thermal processing",))
+        boiler_capacity_factor = max(0.0, 1.0 - boiler_fault)
+        boiler_capacity_factor *= max(0.0, 1.0 - 0.48 * boiler_mechanical)
+        steam_demand = 32.0 * (1.0 + 0.38 * steam_demand_fault)
+        pressure = 5.0 + 4.5 * state["steam_header_inventory_t"] / self.HEADER_CAPACITY_T
+        steam_service = max(0.0, min(1.0, (pressure - 5.5) / 1.8))
+        actual_steam_demand = steam_demand * steam_service
+        pressure_recovery_flow = max(0.0, 8.0 - pressure) * 3.0
+        steam_controller_target = actual_steam_demand + pressure_recovery_flow
+
+        boiler_total = 0.0
+        for index, name in enumerate(("boiler_01", "boiler_02")):
+            boiler = state["boilers"][name]
+            local_factor = boiler_capacity_factor
+            if boiler_mechanical > 0 and index == 0:
+                local_factor *= max(0.0, 1.0 - 0.62 * boiler_mechanical)
+            boiler["availability"] = local_factor * power_factor
+            capacity = boiler["capacity_tph"] * local_factor * power_factor
+            target = min(capacity, steam_controller_target / 2.0)
+            boiler["output_tph"] += max(-0.12, min(0.08, target - boiler["output_tph"]))
+            boiler["vibration_mm_s"] = 2.0 + boiler_mechanical * 7.0 if index == 0 else 2.0
+            boiler_total += boiler["output_tph"]
+
+        condensate_fraction = 0.80
+        if self._event_severity(events, "Mechanical degradation", ("Boiler house",)) > 0:
+            condensate_fraction *= 0.78
+        queued_return = state["condensate_return_queue"].pop(0)
+        state["condensate_return_queue"].append(actual_steam_demand * condensate_fraction)
+        state["condensate_return_tph"] = queued_return
+        state["condensate_reuse_tph"] = min(queued_return, boiler_total * 0.9)
+        state["condensate_inventory_t"] = max(0.0, min(self.CONDENSATE_CAPACITY_T,
+            state["condensate_inventory_t"] + (queued_return - state["condensate_reuse_tph"]) / 3600.0))
+        state["feedwater_makeup_tph"] = max(0.0, boiler_total - state["condensate_reuse_tph"])
+        state["steam_generation_tph"] = boiler_total
+        state["steam_demand_tph"] = steam_demand
+        state["steam_consumption_tph"] = actual_steam_demand
+        state["steam_header_inventory_t"] = max(0.0, min(self.HEADER_CAPACITY_T,
+            state["steam_header_inventory_t"] + (boiler_total - actual_steam_demand) / 3600.0))
+        state["steam_header_pressure_bar"] = (5.0 + 4.5 * state["steam_header_inventory_t"]
+                                               / self.HEADER_CAPACITY_T)
+        state["steam_service_fraction"] = max(0.0, min(1.0,
+            (state["steam_header_pressure_bar"] - 5.5) / 1.8))
+
+        compressor_fault = self._event_severity(events, "Utility loss", ("Compressed air",))
+        compressor_mechanical = self._event_severity(events, "Mechanical degradation", ("Compressed air",))
+        air_demand_fault = max(
+            self._event_severity(events, "Process upset", ("Filling",)),
+            self._event_severity(events, "Process upset", ("Packaging",)))
+        air_demand = 78.0 * (1.0 + 0.32 * air_demand_fault)
+        pressure = max(0.0, state["air_inventory_nm3"] / self.RECEIVER_VOLUME_M3)
+        air_service = max(0.0, min(1.0, (pressure - 4.5) / 2.0))
+        actual_air_demand = air_demand * (0.10 + 0.90 * air_service)
+        receiver_recovery_flow = max(0.0, 7.0 - pressure) * 15.0
+        air_controller_target = actual_air_demand + receiver_recovery_flow
+        air_supply = 0.0
+        for index, name in enumerate(("compressor_a", "compressor_b")):
+            compressor = state["compressors"][name]
+            local_factor = max(0.0, 1.0 - compressor_fault)
+            if compressor_mechanical > 0 and index == 0:
+                local_factor *= max(0.0, 1.0 - 0.62 * compressor_mechanical)
+            compressor["availability"] = local_factor * power_factor
+            target = min(compressor["capacity_nm3_min"] * compressor["availability"],
+                         air_controller_target / 2.0)
+            compressor["output_nm3_min"] += max(-1.5, min(1.0, target - compressor["output_nm3_min"]))
+            compressor["vibration_mm_s"] = 2.1 + compressor_mechanical * 8.0 if index == 0 else 2.0
+            air_supply += compressor["output_nm3_min"]
+
+        state["air_demand_nm3_min"] = air_demand
+        state["air_consumption_nm3_min"] = actual_air_demand
+        state["air_supply_nm3_min"] = air_supply
+        state["air_inventory_nm3"] = max(0.0, min(8.0 * self.RECEIVER_VOLUME_M3,
+            state["air_inventory_nm3"] + (air_supply - actual_air_demand) / 60.0))
+        state["air_receiver_pressure_bar"] = state["air_inventory_nm3"] / self.RECEIVER_VOLUME_M3
+        state["air_service_fraction"] = max(0.0, min(1.0,
+            (state["air_receiver_pressure_bar"] - 4.5) / 2.0))
+        dryer_fault = self._event_severity(events, "Mechanical degradation", ("Compressed air",))
+        dryer_lost = compressor_fault >= self.SEVERITY["Large"] or dryer_fault >= 0.42
+        state["dryer_available"] = not dryer_lost and power_factor >= 0.5
+        state["dryer_dew_point_c"] = -25.0 if state["dryer_available"] else min(25.0, state["dryer_dew_point_c"] + 0.08)
+        if state["dryer_available"]:
+            state["dryer_dew_point_c"] += (-25.0 - state["dryer_dew_point_c"]) * 0.01
+        state["filling_air_service"] = state["air_service_fraction"]
+        state["filler_rate_units_min"] = 180.0 * state["filling_air_service"]
+        state["packer_rate_cases_min"] = 60.0 * state["filling_air_service"]
+        state["electric_load_mw"] = (air_supply * 60.0 * 0.11 / 1000.0 + 0.08)
+
+        for name, pasteurizer in state["pasteurizers"].items():
+            local_steam_service = state["steam_service_fraction"]
+            local_steam_service *= 1.0 - self._event_severity(
+                events, "Utility loss", ("Thermal processing",))
+            target_temperature = 24.0 + 60.0 * local_steam_service
+            pasteurizer["temperature_c"] += (target_temperature - pasteurizer["temperature_c"]) / 360.0
+            thermal_compliance = max(0.0, min(1.0,
+                (pasteurizer["temperature_c"] - 60.0) / (pasteurizer["setpoint_c"] - 60.0)))
+            pasteurizer["production_rate"] = 90.0 * min(local_steam_service, thermal_compliance)
+
+        if sim_seconds > 0 and sim_seconds % 15 == 0:
+            state["history"].append({key: state[key] for key in (
+                "sim_seconds", "steam_header_pressure_bar", "steam_generation_tph",
+                "steam_demand_tph", "steam_service_fraction", "condensate_inventory_t",
+                "air_receiver_pressure_bar", "air_supply_nm3_min", "air_demand_nm3_min",
+                "air_service_fraction", "dryer_dew_point_c",
+                "filler_rate_units_min", "packer_rate_cases_min")}
+                | {"pasteurizer_01_temperature_c": state["pasteurizers"]["pasteurizer_01"]["temperature_c"],
+                   "pasteurizer_02_temperature_c": state["pasteurizers"]["pasteurizer_02"]["temperature_c"],
+                   "pasteurizer_01_rate": state["pasteurizers"]["pasteurizer_01"]["production_rate"],
+                   "pasteurizer_02_rate": state["pasteurizers"]["pasteurizer_02"]["production_rate"]})
+            state["history"] = state["history"][-1_440:]
+
+    def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
+        rng = random.Random(seed * 1_000_003 + state["sim_seconds"] * 9_176)
+        pressure = state["steam_header_pressure_bar"]
+        air_pressure = state["air_receiver_pressure_bar"]
+        steam = state["steam_consumption_tph"]
+        air = state["air_consumption_nm3_min"]
+        values = {
+            ("Boiler house", "Boiler 01"): {
+                "steam_flow": (state["boilers"]["boiler_01"]["output_tph"], "t/h", 0, 25),
+                "outlet_pressure": (pressure, "bar", 0, 20),
+                "stack_temperature": (180 + 2.2 * state["boilers"]["boiler_01"]["output_tph"], "°C", 0, 300),
+                "motor_current": (38 + 85 * state["boilers"]["boiler_01"]["availability"], "A", 0, 200),
+                "vibration_rms": (state["boilers"]["boiler_01"]["vibration_mm_s"], "mm/s", 0, 25),
+            },
+            ("Boiler house", "Boiler 02"): {
+                "steam_flow": (state["boilers"]["boiler_02"]["output_tph"], "t/h", 0, 25),
+                "outlet_pressure": (pressure, "bar", 0, 20),
+                "stack_temperature": (180 + 2.2 * state["boilers"]["boiler_02"]["output_tph"], "°C", 0, 300),
+                "motor_current": (38 + 85 * state["boilers"]["boiler_02"]["availability"], "A", 0, 200),
+                "vibration_rms": (state["boilers"]["boiler_02"]["vibration_mm_s"], "mm/s", 0, 25),
+            },
+            ("Boiler house", "Feedwater system"): {
+                "makeup_flow": (state["feedwater_makeup_tph"], "t/h", 0, 40),
+                "feedwater_pressure": (1_150 * min(1.0, state["steam_generation_tph"] / 32), "kPa", 0, 1_600),
+                "condensate_tank_level": (100 * state["condensate_inventory_t"] / self.CONDENSATE_CAPACITY_T, "%", 0, 100),
+                "pump_current": (42 + 35 * min(1.0, state["steam_generation_tph"] / 32), "A", 0, 150),
+                "conductivity": (28.0 + 2 * state["feedwater_makeup_tph"], "µS/cm", 0, 300),
+            },
+            ("Boiler house", "Steam header"): {
+                "line_pressure": (pressure, "bar", 0, 20), "steam_flow": (steam, "t/h", 0, 50),
+                "steam_temperature": (170 + 5 * pressure, "°C", 0, 250),
+                "header_inventory": (100 * state["steam_header_inventory_t"] / self.HEADER_CAPACITY_T, "%", 0, 100),
+                "service_fraction": (100 * state["steam_service_fraction"], "%", 0, 100),
+            },
+            ("Boiler house", "Condensate return"): {
+                "return_flow": (state["condensate_return_tph"], "t/h", 0, 50),
+                "tank_level": (100 * state["condensate_inventory_t"] / self.CONDENSATE_CAPACITY_T, "%", 0, 100),
+                "return_temperature": (82.0, "°C", 0, 150),
+                "reuse_flow": (state["condensate_reuse_tph"], "t/h", 0, 50),
+                "feedwater_makeup": (state["feedwater_makeup_tph"], "t/h", 0, 50),
+            },
+            ("Compressed air", "Compressor A"): {
+                "air_flow": (state["compressors"]["compressor_a"]["output_nm3_min"], "Nm³/min", 0, 60),
+                "discharge_pressure": (air_pressure + 0.4, "bar", 0, 12),
+                "motor_current": (18 + 6 * state["compressors"]["compressor_a"]["output_nm3_min"], "A", 0, 400),
+                "vibration_rms": (state["compressors"]["compressor_a"]["vibration_mm_s"], "mm/s", 0, 25),
+                "equipment_running": (float(state["compressors"]["compressor_a"]["output_nm3_min"] > 1), "bool", 0, 1),
+            },
+            ("Compressed air", "Compressor B"): {
+                "air_flow": (state["compressors"]["compressor_b"]["output_nm3_min"], "Nm³/min", 0, 60),
+                "discharge_pressure": (air_pressure + 0.4, "bar", 0, 12),
+                "motor_current": (18 + 6 * state["compressors"]["compressor_b"]["output_nm3_min"], "A", 0, 400),
+                "vibration_rms": (state["compressors"]["compressor_b"]["vibration_mm_s"], "mm/s", 0, 25),
+                "equipment_running": (float(state["compressors"]["compressor_b"]["output_nm3_min"] > 1), "bool", 0, 1),
+            },
+            ("Compressed air", "Dryer A"): {
+                "dew_point": (state["dryer_dew_point_c"], "°C", -60, 30),
+                "differential_pressure": (18.0 if state["dryer_available"] else 42.0, "kPa", 0, 120),
+                "air_flow": (state["air_supply_nm3_min"], "Nm³/min", 0, 120),
+                "equipment_running": (float(state["dryer_available"]), "bool", 0, 1),
+            },
+            ("Compressed air", "Receiver 01"): {
+                "receiver_pressure": (air_pressure, "bar", 0, 12),
+                "stored_air": (100 * state["air_inventory_nm3"] / (8 * self.RECEIVER_VOLUME_M3), "%", 0, 100),
+                "inlet_flow": (state["air_supply_nm3_min"], "Nm³/min", 0, 120),
+                "outlet_flow": (air, "Nm³/min", 0, 120),
+            },
+            ("Compressed air", "Ring main"): {
+                "line_pressure": (air_pressure, "bar", 0, 12), "air_demand": (air, "Nm³/min", 0, 150),
+                "air_supply": (state["air_supply_nm3_min"], "Nm³/min", 0, 150),
+                "instrument_air_quality": (float(state["dryer_available"]), "bool", 0, 1),
+            },
+            ("Thermal processing", "Pasteurizer 01"): self._pasteurizer_signals(state, "pasteurizer_01", pressure),
+            ("Thermal processing", "Pasteurizer 02"): self._pasteurizer_signals(state, "pasteurizer_02", pressure),
+            ("Filling", "Filler 01"): {
+                "instrument_air_pressure": (air_pressure, "bar", 0, 12),
+                "production_rate": (state["filler_rate_units_min"], "units/min", 0, 240),
+                "air_service": (100 * state["filling_air_service"], "%", 0, 100),
+                "motor_current": (22 + 0.6 * state["filler_rate_units_min"], "A", 0, 200),
+            },
+            ("Packaging", "Case packer A"): {
+                "instrument_air_pressure": (air_pressure, "bar", 0, 12),
+                "production_rate": (state["packer_rate_cases_min"], "cases/min", 0, 100),
+                "air_service": (100 * state["filling_air_service"], "%", 0, 100),
+                "motor_current": (16 + 0.8 * state["packer_rate_cases_min"], "A", 0, 120),
+            },
+        }
+        rows = []
+        for (area, asset), signals in values.items():
+            for sensor, (truth, units, low, high) in signals.items():
+                tag = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{sensor}"
+                noise = 0.0 if units == "bool" else rng.gauss(0, max(high - low, 1e-9) * 0.001)
+                rows.append({"tag": tag, "area": area, "unit": asset, "sensor": sensor,
+                    "units": units, "value": round(min(high, max(low, truth + noise)), 3),
+                    "quality": "GOOD", "low": low, "high": high, "base": (low + high) / 2,
+                    "phase": 0.0, "last_change": "Factory steam and instrument-air model",
+                    "dynamic_model": True})
+        return rows
+
+    @staticmethod
+    def _pasteurizer_signals(state: dict, name: str, header_pressure: float) -> dict:
+        pasteurizer = state["pasteurizers"][name]
+        return {
+            "process_temperature": (pasteurizer["temperature_c"], "°C", 0, 140),
+            "steam_pressure": (header_pressure, "bar", 0, 20),
+            "production_rate": (pasteurizer["production_rate"], "units/min", 0, 240),
+            "steam_flow": (16.0 * state["steam_service_fraction"], "t/h", 0, 30),
+            "temperature_compliance": (100 * min(1.0,
+                max(0.0, (pasteurizer["temperature_c"] - 60.0) / (pasteurizer["setpoint_c"] - 60.0))), "%", 0, 100),
+        }

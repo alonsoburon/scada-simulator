@@ -25,6 +25,7 @@ from concentrator import CopperConcentrator
 from haulage import HaulTruckFleet
 from power_network import MinePowerNetwork
 from plant_controller import PlantController
+from plant_utilities import FactoryUtilities
 
 
 AREAS = {
@@ -179,6 +180,7 @@ WATER_MODEL = MineWaterNetwork()
 CONCENTRATOR_MODEL = CopperConcentrator()
 HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 POWER_MODEL = MinePowerNetwork()
+UTILITY_MODEL = FactoryUtilities()
 PLANT_CONTROLLER = PlantController()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
@@ -221,6 +223,8 @@ def initialize(seed: int = 17) -> None:
         concentrator_state = CONCENTRATOR_MODEL.initialize()
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
+        utility_state = UTILITY_MODEL.initialize()
+        UTILITY_MODEL.advance(utility_state, 0, [], seed=seed)
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
@@ -239,7 +243,8 @@ def initialize(seed: int = 17) -> None:
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
         initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
-                                     + concentrator_state["crusher_power_mw"] + 1.0)
+                                     + concentrator_state["crusher_power_mw"] + 1.0
+                                     + utility_state["electric_load_mw"])
         initial_water_power_mw = sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw, seed=seed)
@@ -249,9 +254,14 @@ def initialize(seed: int = 17) -> None:
         for tag in power_tags:
             tag["dynamic_model"] = True
         tags.extend(power_tags)
+        utility_assets = {(area, asset) for area, assets in UTILITY_MODEL.AREA_ASSETS.items()
+                          for asset in assets}
+        tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in utility_assets]
+        tags.extend(UTILITY_MODEL.telemetry(utility_state, seed))
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
                                 "power_network": power_state,
+                                "plant_utilities": utility_state,
                                 "concentrator": concentrator_state,
                                 "process_control": process_control_state,
                                 "haulage": haulage_state,
@@ -277,6 +287,9 @@ def initialize(seed: int = 17) -> None:
         CONCENTRATOR_MODEL.migrate(sim["concentrator"])
         if "haulage" not in sim:
             sim["haulage"] = HAULAGE_MODEL.initialize()
+        if "plant_utilities" not in sim:
+            sim["plant_utilities"] = UTILITY_MODEL.initialize()
+        UTILITY_MODEL.migrate(sim["plant_utilities"])
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
@@ -304,7 +317,8 @@ def initialize(seed: int = 17) -> None:
         if "power_network" not in sim:
             sim["power_network"] = POWER_MODEL.initialize()
             process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                               + sim["concentrator"]["crusher_power_mw"] + 1.0)
+                               + sim["concentrator"]["crusher_power_mw"] + 1.0
+                               + sim["plant_utilities"]["electric_load_mw"])
             water_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw, seed=sim["seed"])
@@ -313,6 +327,11 @@ def initialize(seed: int = 17) -> None:
         for tag in POWER_MODEL.telemetry(sim["power_network"]):
             tag["dynamic_model"] = True
             sim["tags"].append(tag)
+        utility_assets = {(area, asset) for area, assets in UTILITY_MODEL.AREA_ASSETS.items()
+                          for asset in assets}
+        sim["tags"] = [tag for tag in sim["tags"]
+                       if (tag["area"], tag["unit"]) not in utility_assets]
+        sim["tags"].extend(UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"]))
 
 
 def publish_snapshot() -> dict:
@@ -322,16 +341,20 @@ def publish_snapshot() -> dict:
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
+    utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
     haulage_frames = {frame["unit"]: frame for frame in HAULAGE_MODEL.positions(sim["haulage"])}
     concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags + haulage_tags}
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
+    utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
         elif tag["tag"] in power_by_tag:
             tag.update(power_by_tag[tag["tag"]])
+        elif tag["tag"] in utility_by_tag:
+            tag.update(utility_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
         comms_fault = next((event for event in sim["events"]
@@ -353,6 +376,7 @@ def publish_snapshot() -> dict:
         "protocol_faults": sim["protocol_faults"],
         "water_network": water_diagram[0],
         "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
+        "plant_utilities": {key: value for key, value in sim["plant_utilities"].items() if key != "history"},
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
         "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
@@ -525,11 +549,16 @@ def advance(force: bool = False) -> None:
         return
     SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
     PROCESS_MODEL.advance(sim, force=force)
+    utility_events = [event.__dict__ for event in sim["events"]]
+    UTILITY_MODEL.advance(sim["plant_utilities"], sim["tick"], utility_events,
+                          power_available_fraction=sim["power_network"]["process_power_fraction"],
+                          seed=sim["seed"])
     water_events = [event.__dict__ for event in sim["events"]
                     if event.area in ("Water supply network", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                             + sim["concentrator"]["crusher_power_mw"] + 1.0)
+                             + sim["concentrator"]["crusher_power_mw"] + 1.0
+                             + sim["plant_utilities"]["electric_load_mw"])
     water_power_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
@@ -672,10 +701,34 @@ def advance(force: bool = False) -> None:
                                      "severity": "INFO", "message": f"{message} cleared",
                                      "state": "CLEARED"})
             power_alarm_states[key] = False
+    utilities = sim["plant_utilities"]
+    utility_alarm_states = sim.setdefault("utility_alarm_states", {})
+    utility_conditions = {
+        "low_steam_header": ("Boiler house", utilities["steam_header_pressure_bar"] < 6.5,
+            utilities["steam_header_pressure_bar"] > 7.0, "Steam header pressure below operating band", "HIGH"),
+        "low_instrument_air": ("Compressed air", utilities["air_receiver_pressure_bar"] < 5.8,
+            utilities["air_receiver_pressure_bar"] > 6.2, "Instrument-air ring pressure below operating band", "HIGH"),
+        "wet_instrument_air": ("Compressed air", utilities["dryer_dew_point_c"] > 0,
+            utilities["dryer_dew_point_c"] < -10, "Instrument-air dryer dew point is high", "HIGH"),
+        "low_condensate_inventory": ("Boiler house", utilities["condensate_inventory_t"] < 3,
+            utilities["condensate_inventory_t"] > 5, "Condensate receiver inventory low", "MEDIUM"),
+    }
+    for key, (area, active, cleared, message, severity) in utility_conditions.items():
+        was_active = utility_alarm_states.get(key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+            utility_alarm_states[key] = True
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+            utility_alarm_states[key] = False
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
+    utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
+    utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
                            + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
@@ -684,6 +737,8 @@ def advance(force: bool = False) -> None:
             tag.update(water_by_tag[tag["tag"]])
         elif tag["tag"] in power_by_tag:
             tag.update(power_by_tag[tag["tag"]])
+        elif tag["tag"] in utility_by_tag:
+            tag.update(utility_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     if sim["tick"] % 15 == 0:
@@ -796,7 +851,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -1182,6 +1237,61 @@ def render_dashboard():
         ]
         for title, description in missions:
             with st.expander(title): st.write(description)
+
+    with tabs[9]:
+        utilities = sim["plant_utilities"]
+        st.subheader("Factory utilities · steam and instrument air")
+        st.caption("Boilers feed a finite steam header and delayed condensate return; compressors feed a finite receiver and ring main. Pressure changes propagate into pasteurizer temperature and packaging rates with separate process lag.")
+        utility_metrics = st.columns(6)
+        for col, label, value in zip(utility_metrics,
+            ["Steam header", "Steam service", "Boiler output", "Instrument air", "Air service", "Compressor power"],
+            [f"{utilities['steam_header_pressure_bar']:.2f} bar",
+             f"{utilities['steam_service_fraction']*100:.0f}%",
+             f"{utilities['steam_generation_tph']:.1f}/{utilities['steam_demand_tph']:.1f} t/h",
+             f"{utilities['air_receiver_pressure_bar']:.2f} bar",
+             f"{utilities['air_service_fraction']*100:.0f}%",
+             f"{utilities['electric_load_mw']:.2f} MW"]):
+            col.metric(label, value)
+        st.caption(f"Air supply/demand {utilities['air_supply_nm3_min']:.1f}/{utilities['air_demand_nm3_min']:.1f} Nm³/min · dryer dew point {utilities['dryer_dew_point_c']:.1f} °C · condensate return {utilities['condensate_return_tph']:.1f} t/h · feedwater makeup {utilities['feedwater_makeup_tph']:.1f} t/h")
+        equipment_rows = [
+            {"Equipment": "Boiler 01", "Output": f"{utilities['boilers']['boiler_01']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_01']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_01']['vibration_mm_s']:.1f} mm/s"},
+            {"Equipment": "Boiler 02", "Output": f"{utilities['boilers']['boiler_02']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_02']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_02']['vibration_mm_s']:.1f} mm/s"},
+            {"Equipment": "Compressor A", "Output": f"{utilities['compressors']['compressor_a']['output_nm3_min']:.1f} Nm³/min", "Availability": f"{utilities['compressors']['compressor_a']['availability']*100:.0f}%", "Condition": f"{utilities['compressors']['compressor_a']['vibration_mm_s']:.1f} mm/s"},
+            {"Equipment": "Compressor B", "Output": f"{utilities['compressors']['compressor_b']['output_nm3_min']:.1f} Nm³/min", "Availability": f"{utilities['compressors']['compressor_b']['availability']*100:.0f}%", "Condition": f"{utilities['compressors']['compressor_b']['vibration_mm_s']:.1f} mm/s"},
+            {"Equipment": "Pasteurizer 01", "Output": f"{utilities['pasteurizers']['pasteurizer_01']['production_rate']:.1f} units/min", "Availability": f"{utilities['steam_service_fraction']*100:.0f}% steam service", "Condition": f"{utilities['pasteurizers']['pasteurizer_01']['temperature_c']:.1f} °C"},
+            {"Equipment": "Filler 01", "Output": f"{utilities['filler_rate_units_min']:.1f} units/min", "Availability": f"{utilities['filling_air_service']*100:.0f}% air service", "Condition": f"{utilities['air_receiver_pressure_bar']:.2f} bar air"},
+        ]
+        st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
+        history = pd.DataFrame(utilities["history"])
+        if history.empty:
+            st.info("Start or single-step the factory to build utility pressure and process-response trends.")
+        else:
+            left, right = st.columns(2)
+            with left:
+                fig = px.line(history, x="sim_seconds", y="steam_header_pressure_bar",
+                    labels={"sim_seconds": "Simulated seconds", "steam_header_pressure_bar": "Steam pressure (bar)"},
+                    color_discrete_sequence=["#e07a5f"])
+                fig.add_hline(y=6.5, line_dash="dash", line_color="#6c757d", annotation_text="Low-pressure alarm")
+                fig.update_layout(title="Steam header pressure", uirevision="steam-header-trend")
+                st.plotly_chart(fig, width="stretch")
+                fig = px.line(history, x="sim_seconds", y=["steam_generation_tph", "steam_demand_tph"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Flow (t/h)", "variable": "Steam"},
+                    color_discrete_sequence=["#277da1", "#f2a541"])
+                fig.update_layout(title="Steam production and demand", uirevision="steam-balance-trend")
+                st.plotly_chart(fig, width="stretch")
+            with right:
+                fig = px.line(history, x="sim_seconds", y="air_receiver_pressure_bar",
+                    labels={"sim_seconds": "Simulated seconds", "air_receiver_pressure_bar": "Receiver pressure (bar)"},
+                    color_discrete_sequence=["#43aa8b"])
+                fig.add_hline(y=5.8, line_dash="dash", line_color="#6c757d", annotation_text="Low-air alarm")
+                fig.update_layout(title="Instrument-air receiver and ring main", uirevision="air-receiver-trend")
+                st.plotly_chart(fig, width="stretch")
+                fig = px.line(history, x="sim_seconds", y=["air_supply_nm3_min", "air_demand_nm3_min"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Flow (Nm³/min)", "variable": "Air"},
+                    color_discrete_sequence=["#9b5de5", "#277da1"])
+                fig.update_layout(title="Instrument-air production and demand", uirevision="air-balance-trend")
+                st.plotly_chart(fig, width="stretch")
+        st.markdown("**Fault drills:** run `boiler-header-pressure-and-recovery` or inject Utility loss in Boiler house. Compare header pressure with the slower pasteurizer temperature response. Run `compressed-air-receiver-and-recovery` and follow receiver pressure, dryer dew point, filler rate, and case-packer rate.")
 
 
 

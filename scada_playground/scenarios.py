@@ -101,6 +101,38 @@ SCENARIOS = {
             "Demand, pump performance, and tank inventory return toward normal after both events clear.",
         ),
     ),
+    "boiler-header-pressure-and-recovery": ScenarioDefinition(
+        scenario_id="boiler-header-pressure-and-recovery",
+        name="Boiler trip, steam header depletion, and recovery",
+        description="A boiler-house utility fault drains steam header inventory, cools pasteurizers with thermal lag, then restores heat and condensate return.",
+        duration_seconds=3_600,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                            "target_area": "Boiler house", "duration_seconds": 1_200}),
+        ),
+        expected_observations=(
+            "Boiler capacity ramps down; finite header inventory delays the pressure decline.",
+            "Low steam pressure reduces pasteurizer heat input, but product temperature falls over several minutes rather than instantly.",
+            "Condensate return lags steam use, so feedwater make-up changes after the header event.",
+            "When boiler capacity returns, pressure control rebuilds header inventory and pasteurizers warm back toward setpoint.",
+        ),
+    ),
+    "compressed-air-receiver-and-recovery": ScenarioDefinition(
+        scenario_id="compressed-air-receiver-and-recovery",
+        name="Compressor loss and instrument-air recovery",
+        description="A compressor-house utility fault draws down receiver and ring-main air inventory, curtails pneumatic production, and then recovers.",
+        duration_seconds=2_400,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                            "target_area": "Compressed air", "duration_seconds": 600}),
+        ),
+        expected_observations=(
+            "The compressors ramp down while the receiver and ring-main linepack buffer pressure for a short time.",
+            "As pressure crosses the instrument-air operating band, filler and case-packer rates fall together.",
+            "Loss of dryer power degrades dew point; the measurement responds more slowly than the pressure drop.",
+            "After compressor capacity returns, the pressure controller recharges the receiver and packaging rates recover.",
+        ),
+    ),
     "grid-comms-recovery": ScenarioDefinition(
         scenario_id="grid-comms-recovery",
         name="Grid communications loss and recovery",
