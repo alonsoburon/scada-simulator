@@ -68,6 +68,22 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.assertGreater(heavy_load["distribution_losses_mw"],
                            light_load["distribution_losses_mw"])
 
+    def test_motor_start_transient_is_included_in_grid_demand_and_telemetry(self):
+        baseline = self.model.initialize()
+        starting = self.model.initialize()
+        self.model.advance(baseline, 1, [], process_load_mw=10.0,
+                           water_load_mw=0.5, seed=17)
+        self.model.advance(starting, 1, [], process_load_mw=10.0,
+                           water_load_mw=0.5, motor_starting_load_mw=3.0, seed=17)
+
+        self.assertAlmostEqual(starting["motor_starting_load_mw"], 3.0)
+        self.assertAlmostEqual(starting["process_requested_mw"]
+                               - baseline["process_requested_mw"], 3.0)
+        self.assertLess(starting["source_voltage_pu"], baseline["source_voltage_pu"])
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(starting)}
+        self.assertAlmostEqual(
+            tags["mine_power_network.process_motor_starts.starting_load"]["value"], 3.0)
+
     def test_capacitor_bank_waits_for_persistent_low_voltage(self):
         outage = {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}
         for tick in range(1, self.model.CAPACITOR_SWITCH_DELAY_S):

@@ -5,6 +5,8 @@ simulated trips are not a certified safety instrumented system.
 """
 from __future__ import annotations
 
+import math
+
 
 class PlantController:
     START_ORDER = ("tailings_pump", "tailings_thickener", "filter_press",
@@ -18,6 +20,14 @@ class PlantController:
     STOP_DELAY_S = {"crusher": 3, "conveyors": 5, "sag_mill": 15,
                     "ball_mill": 10, "flotation": 5, "concentrate_thickener": 10,
                     "filter_press": 8, "tailings_thickener": 12, "tailings_pump": 8}
+    # Additional real-power demand while each motor accelerates. These are
+    # aggregate starter/inrush equivalents, not nameplate or protection values.
+    MOTOR_STARTING_LOAD_MW = {
+        "tailings_pump": 0.35, "tailings_thickener": 0.18, "filter_press": 0.12,
+        "concentrate_thickener": 0.15, "flotation": 0.55, "ball_mill": 2.4,
+        "sag_mill": 3.8, "conveyors": 0.65, "crusher": 1.4,
+    }
+    MOTOR_STARTING_DECAY_S = 2.5
     LABELS = {"tailings_pump": "Tailings pump", "tailings_thickener": "Tailings thickener",
               "filter_press": "Concentrate filter press",
               "concentrate_thickener": "Concentrate thickener", "flotation": "Flotation air and cells",
@@ -32,6 +42,8 @@ class PlantController:
             "sequence_timer_s": 0, "last_transition": "Plant initialized in steady operation",
             "permissive_reason": "All startup permissives healthy",
             "trip_count": 0, "history": [], "scan_seconds": 1,
+            "motor_start_transients_mw": {name: 0.0 for name in self.START_ORDER},
+            "motor_starting_load_mw": 0.0,
             "equipment": {name: {"state": "RUNNING", "elapsed_s": 0,
                                  "trip_reason": "", "starts": 1, "trips": 0}
                           for name in self.START_ORDER},
@@ -50,6 +62,10 @@ class PlantController:
             state.setdefault(key, value)
         state.setdefault("history", [])
         state.setdefault("condition_timers", {})
+        transients = state.setdefault("motor_start_transients_mw", {})
+        for name in self.START_ORDER:
+            transients.setdefault(name, 0.0)
+        state["motor_starting_load_mw"] = sum(transients.values())
         if state["requested_mode"] == "RUNNING" and all(
                 item["state"] == "RUNNING" for item in equipment.values()):
             state["sequence_index"] = len(self.START_ORDER)
@@ -157,6 +173,13 @@ class PlantController:
                 frequency_hz: float) -> None:
         """Execute one simulated PLC scan, sequence transitions, and latched trips."""
         state["sim_seconds"] = sim_seconds
+        decay = math.exp(-1.0 / self.MOTOR_STARTING_DECAY_S)
+        transients = state["motor_start_transients_mw"]
+        for name in self.START_ORDER:
+            transients[name] *= decay
+            if transients[name] < 0.005:
+                transients[name] = 0.0
+        state["motor_starting_load_mw"] = sum(transients.values())
         electrical_trip = (process_power_fraction < 0.70 or voltage_pu < 0.82
                            or frequency_hz < 48.0)
         timers = state["condition_timers"]
@@ -242,6 +265,8 @@ class PlantController:
             state["permissive_reason"] = "Startup permissives healthy"
             if equipment["state"] == "STOPPED":
                 equipment.update(state="STARTING", elapsed_s=0)
+                transients[name] = self.MOTOR_STARTING_LOAD_MW[name]
+                state["motor_starting_load_mw"] = sum(transients.values())
                 state["sequence_timer_s"] = 0
                 state["last_transition"] = f"Starting {self.LABELS[name]}"
             equipment["elapsed_s"] += 1

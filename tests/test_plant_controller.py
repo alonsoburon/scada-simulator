@@ -47,6 +47,21 @@ class PlantControllerTests(unittest.TestCase):
         self.assertEqual(self.state["equipment"]["crusher"]["state"], "STOPPING")
         self.assertTrue(self.controller.availability(self.state)["crusher"])
 
+    def test_ordered_motor_start_adds_a_decaying_grid_load_transient(self):
+        self.controller.request(self.state, "STOP")
+        self.advance(80)
+        self.controller.request(self.state, "START")
+
+        self.controller.advance(self.state, 81, [], **self.utilities)
+        pump_start_load = self.state["motor_starting_load_mw"]
+        self.assertAlmostEqual(pump_start_load,
+                               self.controller.MOTOR_STARTING_LOAD_MW["tailings_pump"])
+        self.assertEqual(self.state["equipment"]["tailings_pump"]["state"], "STARTING")
+
+        self.controller.advance(self.state, 82, [], **self.utilities)
+        self.assertGreater(self.state["motor_starting_load_mw"], 0.0)
+        self.assertLess(self.state["motor_starting_load_mw"], pump_start_load)
+
     def test_orderly_stop_propagates_into_concentrator_rates_and_status_tags(self):
         concentrator = CopperConcentrator()
         process = concentrator.initialize()

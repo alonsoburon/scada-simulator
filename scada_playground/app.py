@@ -616,7 +616,9 @@ def advance(force: bool = False) -> None:
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw,
-                        utility_load_mw=sim["plant_utilities"]["electric_load_mw"], seed=sim["seed"])
+                        utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                        motor_starting_load_mw=sim["process_control"]["motor_starting_load_mw"],
+                        seed=sim["seed"])
     water_level = sim["water_network"]["nodes"]["process_tank"]["level_pct"]
     trips_before = sim["process_control"]["trip_count"]
     PLANT_CONTROLLER.advance(
@@ -1249,7 +1251,8 @@ def render_dashboard():
             col.metric(label, value)
         st.caption(f"Mill feed size classes · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · breakage/pass {plant['coarse_breakage_per_pass']*100:.0f}% coarse, {plant['intermediate_breakage_per_pass']*100:.0f}% intermediate · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
-            st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. It is not a certified safety PLC or safety instrumented system. The factory timeline must be running or single-stepped for sequences to progress.")
+            st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. Motor starts add a decaying electrical load to the mine grid, so large drives can disturb voltage, frequency, and reserves. These aggregate transients are illustrative, not a certified motor-start or protection study. The factory timeline must be running or single-stepped for sequences to progress.")
+            st.metric("Motor acceleration load", f"{control['motor_starting_load_mw']:.2f} MW")
             state_col, buttons = st.columns([1.1, 2])
             state_col.metric("Process sequence", control["mode"])
             state_col.caption(control["last_transition"])

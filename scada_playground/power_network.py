@@ -98,6 +98,7 @@ class MinePowerNetwork:
             "process_power_fraction": 1.0, "water_power_fraction": 1.0,
             "factory_utilities_power_fraction": 1.0,
             "factory_utilities_requested_mw": 0.0, "factory_utilities_load_mw": 0.0,
+            "motor_starting_load_mw": 0.0,
             "ufls_stage": 0, "ufls_restore_timer_s": 0,
             "ufls_pickup_timer_s": 0.0,
             "ufls_shed_mw": 0.0, "ufls_operated_this_scan_mw": 0.0,
@@ -197,7 +198,8 @@ class MinePowerNetwork:
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float,
-                utility_load_mw: float = 0.0, seed: int = 17) -> None:
+                utility_load_mw: float = 0.0, motor_starting_load_mw: float = 0.0,
+                seed: int = 17) -> None:
         """Dispatch sources and allocate power to site, water, and process loads."""
         initial_state = self.initialize()
         for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
@@ -222,8 +224,11 @@ class MinePowerNetwork:
         state.setdefault("ufls_pickup_timer_s", 0.0)
         state.setdefault("ufls_shed_mw", 0.0)
         state.setdefault("ufls_operated_this_scan_mw", 0.0)
-        state.setdefault("process_after_ufls_mw", max(0.0, process_load_mw))
-        self._set_ufls_shed_state(state, process_load_mw)
+        motor_starting_load_mw = max(0.0, motor_starting_load_mw)
+        state["motor_starting_load_mw"] = motor_starting_load_mw
+        process_request = max(0.0, process_load_mw) + motor_starting_load_mw
+        state.setdefault("process_after_ufls_mw", process_request)
+        self._set_ufls_shed_state(state, process_request)
         self._advance_feeder_protection(state, sim_seconds, events)
         connected_load_at_tick_start = state.get("served_load_mw", 34.5)
         connected_process_at_tick_start = state.get("process_load_mw", process_load_mw)
@@ -286,7 +291,7 @@ class MinePowerNetwork:
         solar = (2.2 + 0.65 * math.sin(sim_seconds / 430.0) + 0.22 * math.sin(sim_seconds / 71.0))
         solar = min(3.2, max(0.8, solar)) * generation_factor
         diesel_cap = 8.0 * generation_factor
-        process_request = max(0.0, process_load_mw)
+        process_request = max(0.0, process_load_mw) + motor_starting_load_mw
         water_request = max(0.0, water_load_mw)
         utility_request = max(0.0, utility_load_mw)
         site_request = 6.0
@@ -720,6 +725,11 @@ class MinePowerNetwork:
              "unit": "Water pump station", "sensor": "active_power", "units": "MW",
              "value": round(state["water_load_mw"], 3), "quality": "GOOD", "low": 0, "high": 2,
              "base": .1, "phase": 0.0, "last_change": "Water pump electrical load"},
+            {"tag": "mine_power_network.process_motor_starts.starting_load", "area": "Mine power network",
+             "unit": "Process motor starts", "sensor": "starting_load", "units": "MW",
+             "value": round(state.get("motor_starting_load_mw", 0.0), 3), "quality": "GOOD",
+             "low": 0, "high": 12, "base": 0, "phase": 0.0,
+             "last_change": "PLC motor acceleration transient"},
         ])
         return rows
 

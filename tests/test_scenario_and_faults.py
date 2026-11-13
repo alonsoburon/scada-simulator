@@ -51,6 +51,8 @@ class ScenarioRunnerTests(unittest.TestCase):
                            + definition.steps[0].parameters["duration_seconds"])
         self.assertTrue(any("battery" in note.lower() and "diesel" in note.lower()
                             for note in definition.expected_observations))
+        self.assertTrue(any("motor start" in note.lower()
+                            for note in definition.expected_observations))
 
     def test_scenario_actions_are_dispatched_at_their_simulated_offset(self):
         runner = ScenarioRunner()

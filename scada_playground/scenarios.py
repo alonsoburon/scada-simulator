@@ -44,6 +44,7 @@ SCENARIOS = {
             "When import and reserves cannot cover demand, noncritical site load sheds first and the process feeder limits concentrator power.",
             "Mine bus frequency and voltage respond to the supply deficit; ordinary process interlocks latch trips, and water storage temporarily buffers pump-power reductions.",
             "After the transmission restriction clears and electrical permissives recover, the replay simulates an operator trip reset and orderly process restart.",
+            "Each sequential motor start adds a short, size-dependent load pulse; compare the starting-load tag with mine-bus voltage, frequency, and battery response.",
             "The tie-line resumes imports, diesel output ramps down, storage recharges, and throughput recovers after the startup sequence.",
         ),
     ),
