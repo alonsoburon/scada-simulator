@@ -1127,7 +1127,16 @@ def advance(force: bool = False) -> None:
             utility_alarm_states[key] = False
     chilled = sim["chilled_water"]
     chilled_alarm_states = sim.setdefault("chilled_water_alarm_states", {})
+    design_cooling_flow_m3h = (chilled["cooling_demand_kw"]
+        / (CHILLED_MODEL.WATER_HEAT_CAPACITY_KWH_PER_M3_K
+           * CHILLED_MODEL.CHILLED_WATER_DESIGN_DELTA_T_K)
+        if chilled["cooling_demand_kw"] > 50.0 else 0.0)
     chilled_conditions = (
+        ("low_chilled_water_flow", design_cooling_flow_m3h > 0.0
+         and chilled["pump_flow_m3h"] < 0.90 * design_cooling_flow_m3h,
+         design_cooling_flow_m3h == 0.0
+         or chilled["pump_flow_m3h"] > design_cooling_flow_m3h,
+         "Chilled-water flow is below the rate needed for current cooling duty", "HIGH"),
         ("low_cooling_storage", chilled["storage_mwh"] < 0.20,
          chilled["storage_mwh"] > 0.45,
          "Chilled-water thermal reserve is low; a further chiller loss may warm product cooling", "HIGH"),
