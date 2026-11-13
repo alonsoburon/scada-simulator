@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import math
-import random
+
+try:
+    from .instrumentation import correlated_sensor_noise
+except ImportError:
+    from instrumentation import correlated_sensor_noise
 
 class WastewaterTreatmentPlant:
     EQ_CAPACITY_M3 = 300.0
@@ -330,14 +334,13 @@ class WastewaterTreatmentPlant:
         sample_time = state.get("last_advance_seconds", 0) if sim_seconds is None else sim_seconds
         for (asset, signal), (value, units, low, high) in signals.items():
             tag_id = f"wastewater.{asset}.{signal}"
-            stable_id = sum((index + 1) * ord(char) for index, char in enumerate(tag_id))
-            rng = random.Random(seed * 1_000_003 + sample_time * 9_176 + stable_id)
             noise_fraction = (0.0 if units == "bool" else
                               0.02 if signal == "effluent_tss" else
                               0.005 if signal == "conductivity" else
                               0.002 if units in ("pH", "%") else
                               0.01 if units in ("m³/h", "kg/h") else 0.001)
-            measured = value + rng.gauss(0.0, max(high - low, 1e-9) * noise_fraction)
+            measured = value + correlated_sensor_noise(
+                state, tag_id, seed, sample_time, max(high - low, 1e-9) * noise_fraction)
             rows.append({"tag": f"wastewater.{asset}.{signal}", "area": "Wastewater",
                 "unit": asset.replace("_", " ").title(), "sensor": signal,
                 "value": round(min(high, max(low, measured)), 3), "units": units,

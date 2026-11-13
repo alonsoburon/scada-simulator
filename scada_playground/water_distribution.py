@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import math
-import random
+
+try:
+    from .instrumentation import correlated_sensor_noise
+except ImportError:
+    from instrumentation import correlated_sensor_noise
 
 
 class WaterDistribution:
@@ -319,13 +323,11 @@ class WaterDistribution:
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
         rows = []
-        rng_base = seed * 1_000_003 + state["sim_seconds"] * 9_176
         def add(asset: str, signal: str, value: float, units: str,
                 low: float, high: float, noise_pct: float = 0.0) -> None:
             name = f"water_distribution.{asset.lower().replace(' ', '_')}.{signal}"
-            stable = sum((index + 1) * ord(char) for index, char in enumerate(name))
-            rng = random.Random(rng_base + stable)
-            observed = value + rng.gauss(0.0, (high - low) * noise_pct) if noise_pct else value
+            observed = value + correlated_sensor_noise(
+                state, name, seed, state["sim_seconds"], (high - low) * noise_pct)
             rows.append({"tag": name, "area": self.AREA, "unit": asset,
                          "sensor": signal, "units": units,
                          "value": round(min(high, max(low, observed)), 4),
@@ -358,5 +360,6 @@ class WaterDistribution:
 
     @staticmethod
     def public_state(state: dict) -> dict:
-        return {key: value for key, value in state.items() if key != "history"} | {
+        return {key: value for key, value in state.items()
+                if key not in {"history", "_instrument_noise"}} | {
             "history": state["history"][-600:]}

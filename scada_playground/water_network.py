@@ -6,7 +6,6 @@ are m/kPa. It is an educational network approximation, not a calibrated plant mo
 from __future__ import annotations
 
 import math
-import random
 from collections import deque
 
 try:
@@ -18,9 +17,9 @@ try:
 except ImportError:
     from wastewater import WastewaterTreatmentPlant
 try:
-    from .instrumentation import signal_drift_bias, stable_tag_id
+    from .instrumentation import correlated_sensor_noise, signal_drift_bias
 except ImportError:
-    from instrumentation import signal_drift_bias, stable_tag_id
+    from instrumentation import correlated_sensor_noise, signal_drift_bias
 try:
     from .water_distribution import WaterDistribution
 except ImportError:
@@ -639,10 +638,9 @@ class MineWaterNetwork:
             controlled_node = pump["controlled_node"]
             tag_name = f"water_supply_network.{controlled_node}.tank_level"
             tag_span = 100.0
-            stable_id = stable_tag_id(tag_name)
-            noise_rng = random.Random(seed * 1_000_003 + sim_seconds * 9_176 + stable_id)
             measured_level = state["nodes"][controlled_node]["level_pct"]
-            measured_level += noise_rng.gauss(0.0, tag_span * 0.0015)
+            measured_level += correlated_sensor_noise(
+                state, tag_name, seed, sim_seconds, tag_span * 0.0015)
             drift = next((event for event in active_events
                           if event.get("name") == "Signal drift"
                           and event.get("target_tag") == tag_name), None)
@@ -951,10 +949,8 @@ class MineWaterNetwork:
                 noise_fraction: float = 0.0, last_change: str = "Water network instrument") -> None:
             tag_name = f"water_supply_network.{asset}.{signal}"
             if noise_fraction > 0:
-                stable_id = sum((index + 1) * ord(char) for index, char in enumerate(tag_name))
-                rng = random.Random(state["sensor_rng_seed"] * 1_000_003 +
-                                    state["sim_seconds"] * 9_176 + stable_id)
-                value += rng.gauss(0.0, max(high - low, 1e-9) * noise_fraction)
+                value += correlated_sensor_noise(state, tag_name, state["sensor_rng_seed"],
+                    state["sim_seconds"], max(high - low, 1e-9) * noise_fraction)
             value = min(high, max(low, value))
             rows.append({"tag": tag_name, "area": self.AREA,
                          "unit": asset.replace("_", " ").title(), "sensor": signal, "units": units,
@@ -1055,7 +1051,14 @@ class MineWaterNetwork:
         add("process_demand", "unmet_treated_water_demand", state["unmet_treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         add("process_demand", "treatment_backwash_flow", self.TREATMENT.BACKWASH_FLOW_M3H
             if state["treatment"]["mode"] == "BACKWASH" else 0.0, "m³/h", 0, 30)
-        rows.extend(self.TREATMENT.telemetry(state["treatment"]))
+        treatment_rows = self.TREATMENT.telemetry(state["treatment"])
+        for row in treatment_rows:
+            if row["units"] not in {"bool", "enum"}:
+                span = max(row["high"] - row["low"], 1e-9)
+                row["value"] = round(min(row["high"], max(row["low"],
+                    row["value"] + correlated_sensor_noise(state, row["tag"],
+                        state["sensor_rng_seed"], state["sim_seconds"], span * 0.002))), 3)
+        rows.extend(treatment_rows)
         rows.extend(self.WASTEWATER.telemetry(state["wastewater"], state["sensor_rng_seed"],
                                               state["sim_seconds"]))
         rows.extend(self.DISTRIBUTION.telemetry(state["distribution"], state["sensor_rng_seed"]))
@@ -1106,4 +1109,4 @@ class MineWaterNetwork:
                                            if key != "last_advance_seconds"},
                        "distribution": self.DISTRIBUTION.public_state(state["distribution"]),
                        "wastewater": {key: value for key, value in state["wastewater"].items()
-                                      if key != "history"}}]
+                                      if key not in {"history", "_instrument_noise"}}}]
