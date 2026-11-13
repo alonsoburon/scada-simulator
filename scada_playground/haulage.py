@@ -170,7 +170,14 @@ class HaulTruckFleet:
                               else None)
             tip_arrival = (-elapsed if frame["cycle_state"] in ("tip_queue", "dumping")
                            else None)
+            loading_ore_t = frame["payload_t"] if frame["cycle_state"] == "loading" else 0.0
+            loading_copper_t = loading_ore_t * 0.0062
             truck_states[unit] = {"phase_s": phase, "frame": frame, "total_delivered_t": 0.0,
+                                  "total_delivered_copper_t": 0.0,
+                                  "payload_grade_pct": 0.62,
+                                  "payload_copper_remaining_t": frame["payload_t"] * 0.0062,
+                                  "loading_ore_t": loading_ore_t,
+                                  "loading_copper_t": loading_copper_t,
                                   "engine_hours": 0.0, "fuel_used_l": 0.0,
                                   "fuel_capacity_l": 4_500.0, "refuel_remaining_s": 0,
                                   "refuels_completed": 0,
@@ -183,7 +190,9 @@ class HaulTruckFleet:
                                   "tire_temperature_c": 60.0 + (index % 4) * 1.5,
                                   "brake_temperature_c": 65.0 + (index % 5) * 2.0}
         return {"sim_seconds": 0, "trucks": truck_states, "last_delivery_t": 0.0,
+                "last_delivery_copper_t": 0.0, "delivery_grade_pct": 0.0,
                 "cumulative_delivery_t": 0.0, "recent_deliveries_t": [], "delivery_rate_tph": 0.0,
+                "cumulative_delivery_copper_t": 0.0, "average_delivery_grade_pct": 0.0,
                 "rom_dispatch_paused": False, "measured_mobility_factor": 1.0,
                 "shovel_queue_length": 0, "tip_queue_length": 0,
                 "active_shovel_truck": None, "active_tip_truck": None}
@@ -207,9 +216,15 @@ class HaulTruckFleet:
             return 0.0
         return payload
 
-    def advance(self, state: dict, sim_seconds: int, events: list[dict], rom_inventory_t: float) -> float:
-        """Advance trucks one simulated second and return this tick's ROM delivery tonnes."""
+    def advance(self, state: dict, sim_seconds: int, events: list[dict], rom_inventory_t: float,
+                ore_grade_pct: float = 0.62) -> float:
+        """Advance trucks and report this tick's ROM delivery tonnes and copper mass."""
         state["sim_seconds"] = sim_seconds
+        ore_grade_pct = min(1.2, max(0.25, ore_grade_pct))
+        for key, default in (("last_delivery_copper_t", 0.0), ("delivery_grade_pct", 0.0),
+                             ("cumulative_delivery_copper_t", 0.0),
+                             ("average_delivery_grade_pct", 0.0)):
+            state.setdefault(key, default)
         fleet_fault = self._severity(events, "Mechanical degradation", "Mobile fleet")
         pit_fault = self._severity(events, "Mechanical degradation", "Open-pit mining")
         utility_fault = self._severity(events, "Utility loss", "Mine power network")
@@ -265,12 +280,18 @@ class HaulTruckFleet:
         active_tip = tip_candidates[0] if tip_candidates else None
 
         deliveries = 0.0
+        delivery_copper_t = 0.0
         for unit, truck in state["trucks"].items():
             old_phase = truck["phase_s"]
             old_frame = truck["frame"]
             for key in ("shovel_arrival_s", "loading_queue_since_s", "tip_arrival_s",
                         "dump_queue_since_s"):
                 truck.setdefault(key, None)
+            truck.setdefault("total_delivered_copper_t", truck.get("total_delivered_t", 0.0) * 0.0062)
+            truck.setdefault("payload_grade_pct", 0.62)
+            truck.setdefault("loading_ore_t", 0.0)
+            truck.setdefault("loading_copper_t", 0.0)
+            truck.setdefault("payload_copper_remaining_t", old_frame.get("payload_t", 0.0) * 0.0062)
             at_shovel = old_frame["cycle_state"] in ("pit_queue", "loading")
             refueling = truck["refuel_remaining_s"] > 0
             if not refueling and old_frame["cycle_state"] == "pit_queue" and truck["fuel_used_l"] >= truck["fuel_capacity_l"] * 0.85:
@@ -305,9 +326,31 @@ class HaulTruckFleet:
             else:
                 delta = max(0.0, new_dumped - old_dumped)
             deliveries += delta
+            copper_delta_t = min(truck["payload_copper_remaining_t"],
+                                 delta * truck["payload_grade_pct"] / 100.0)
+            truck["payload_copper_remaining_t"] = max(
+                0.0, truck["payload_copper_remaining_t"] - copper_delta_t)
+            delivery_copper_t += copper_delta_t
             truck["phase_s"] = new_phase
             truck["frame"] = self._frame(unit, new_phase, mobility, paused_rom)
             new_cycle_state = truck["frame"]["cycle_state"]
+            loaded_delta_t = (max(0.0, truck["frame"]["payload_t"] - old_frame["payload_t"])
+                              if old_frame["cycle_state"] == "loading" else 0.0)
+            if loaded_delta_t > 0.0:
+                truck["loading_ore_t"] += loaded_delta_t
+                truck["loading_copper_t"] += loaded_delta_t * ore_grade_pct / 100.0
+                truck["payload_copper_remaining_t"] += loaded_delta_t * ore_grade_pct / 100.0
+                truck["payload_grade_pct"] = (100.0 * truck["loading_copper_t"]
+                                               / max(truck["loading_ore_t"], 1e-9))
+            if old_frame["cycle_state"] == "loading" and new_cycle_state != "loading":
+                if truck["loading_ore_t"] > 1e-9:
+                    truck["payload_grade_pct"] = (100.0 * truck["loading_copper_t"]
+                                                   / truck["loading_ore_t"])
+            elif new_cycle_state == "loading" and old_frame["cycle_state"] != "loading":
+                truck["loading_ore_t"] = 0.0
+                truck["loading_copper_t"] = 0.0
+                truck["payload_copper_remaining_t"] = 0.0
+                truck["payload_grade_pct"] = 0.0
             if new_cycle_state == "pit_queue" and old_frame["cycle_state"] != "pit_queue":
                 truck["shovel_arrival_s"] = sim_seconds
                 truck["loading_queue_since_s"] = None
@@ -334,6 +377,7 @@ class HaulTruckFleet:
                 truck["frame"]["speed_kmh"] = 0.0
                 truck["frame"]["payload_t"] = 0.0
             truck["total_delivered_t"] += delta
+            truck["total_delivered_copper_t"] += copper_delta_t
             cycle_state = truck["frame"]["cycle_state"]
             engine_running = (cycle_state != "pit_queue" or not paused_rom) and not refueling
             if engine_running:
@@ -348,7 +392,14 @@ class HaulTruckFleet:
                 truck["brake_temperature_c"] += (65.0 - truck["brake_temperature_c"]) / 600.0
 
         state["last_delivery_t"] = deliveries
+        state["last_delivery_copper_t"] = delivery_copper_t
+        state["delivery_grade_pct"] = (100.0 * delivery_copper_t / deliveries
+                                        if deliveries > 1e-9 else 0.0)
         state["cumulative_delivery_t"] += deliveries
+        state["cumulative_delivery_copper_t"] += delivery_copper_t
+        state["average_delivery_grade_pct"] = (
+            100.0 * state["cumulative_delivery_copper_t"] / state["cumulative_delivery_t"]
+            if state["cumulative_delivery_t"] > 1e-9 else 0.0)
         state["recent_deliveries_t"].append(deliveries)
         state["recent_deliveries_t"] = state["recent_deliveries_t"][-600:]
         sample_count = max(1, len(state["recent_deliveries_t"]))
@@ -467,6 +518,8 @@ class HaulTruckFleet:
                 "gps_speed": (frame["speed_kmh"], "km/h", 0, 60),
                 "heading": (frame["heading"], "°", 0, 360),
                 "payload": (frame["payload_t"], "t", 0, 250),
+                "payload_grade": (truck.get("payload_grade_pct", 0.62)
+                                  if frame["payload_t"] > 1e-6 else 0.0, "% Cu", 0, 1.2),
                 "payload_target": (frame["payload_target_t"], "t", 0, 250),
                 "road_grade": (frame.get("road_grade_pct", 0.0), "%", -20, 20),
                 "engine_load": (min(100.0, 34.0 + frame["speed_kmh"] * 1.45
@@ -542,5 +595,9 @@ class HaulTruckFleet:
                 "active_tip_truck": state.get("active_tip_truck"),
                 "delivery_rate_tph": state["delivery_rate_tph"],
                 "last_delivery_t": state["last_delivery_t"],
+                "last_delivery_copper_t": state.get("last_delivery_copper_t", 0.0),
+                "delivery_grade_pct": state.get("delivery_grade_pct", 0.0),
                 "cumulative_delivery_t": state["cumulative_delivery_t"],
+                "cumulative_delivery_copper_t": state.get("cumulative_delivery_copper_t", 0.0),
+                "average_delivery_grade_pct": state.get("average_delivery_grade_pct", 0.0),
                 "mean_mobility_factor": state["measured_mobility_factor"]}

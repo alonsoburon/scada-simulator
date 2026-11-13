@@ -386,6 +386,7 @@ class CopperConcentrator:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
                 mine_delivery_t: float | None = None,
+                mine_delivery_copper_t: float | None = None,
                 power_available_fraction: float | None = None,
                 equipment_available: dict[str, bool] | None = None) -> None:
         """Advance coupled ore, comminution, flotation, water and power balances."""
@@ -497,12 +498,18 @@ class CopperConcentrator:
         if mine_delivery_t is None:
             rom_feed = scheduled_rom_feed
             rom_received = min(rom_feed, rom_space_t * 3600.0) / 3600.0
+            rom_received_copper_t = rom_received * mine_grade_pct / 100.0
             curtailed_t = max(0.0, rom_feed * dt_h - rom_received)
             state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_received * 3600.0, 30)
             state["rom_feed_curtailed_tph"] = curtailed_t * 3600.0
         else:
             mine_delivery_t = max(0.0, mine_delivery_t)
             rom_received = min(mine_delivery_t, rom_space_t)
+            offered_copper_t = (mine_delivery_t * mine_grade_pct / 100.0
+                                if mine_delivery_copper_t is None
+                                else max(0.0, mine_delivery_copper_t))
+            rom_received_copper_t = (offered_copper_t * rom_received / mine_delivery_t
+                                     if mine_delivery_t > 1e-9 else 0.0)
             curtailed_t = mine_delivery_t - rom_received
             state["rom_delivery_window_t"].append(rom_received)
             state["rom_curtailed_window_t"].append(curtailed_t)
@@ -512,7 +519,7 @@ class CopperConcentrator:
             state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_feed, 30)
             state["rom_feed_curtailed_tph"] = (sum(state["rom_curtailed_window_t"])
                                                 * 3_600.0 / max(1, len(state["rom_curtailed_window_t"])))
-        state["cumulative_mine_copper_received_t"] += rom_received * mine_grade_pct / 100.0
+        state["cumulative_mine_copper_received_t"] += rom_received_copper_t
         sag_feeder_enabled = (equipment_available.get("sag_mill", True)
                               and equipment_available.get("ball_mill", True))
         sag_feeder_rate = (min(900.0, state["crushed_stockpile_t"] * 3600.0,
@@ -547,7 +554,7 @@ class CopperConcentrator:
                                   if state["crushed_stockpile_t"] > 1e-9 else rom_grade_fraction)
         sag_grade_fraction = (state["sag_bin_copper_inventory_t"] / max(state["sag_bin_t"], 1e-9)
                               if state["sag_bin_t"] > 1e-9 else crushed_grade_fraction)
-        rom_copper = (state["rom_copper_inventory_t"] + rom_received * mine_grade_pct / 100.0
+        rom_copper = (state["rom_copper_inventory_t"] + rom_received_copper_t
                       - rom_discharge * dt_h * rom_grade_fraction)
         crushed_copper = (state["crushed_copper_inventory_t"]
                           + crushed_rate * dt_h * rom_grade_fraction
@@ -890,6 +897,8 @@ class CopperConcentrator:
             "Open-pit mining": {
                 "Pit sector A": {"ore_rate": (state["rom_feed_tph"], "t/h", 0, 2_000),
                     "ore_grade": (state["mine_block_grade_pct"], "% Cu", 0.2, 1.2),
+                    "rom_stockpile_grade": (100.0 * state["rom_copper_inventory_t"]
+                                             / max(state["rom_stockpile_t"], 1e-9), "% Cu", 0.0, 1.2),
                     "rom_stockpile": (state["rom_stockpile_t"], "t", 0, 45_000),
                     "mine_feed_curtailed": (state["rom_feed_curtailed_tph"], "t/h", 0, 2_000)},
             },

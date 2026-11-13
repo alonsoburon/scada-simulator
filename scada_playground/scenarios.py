@@ -83,6 +83,7 @@ SCENARIOS = {
         ),
         expected_observations=(
             "The harder ore signal changes mill energy requirement and P80 with residence-time lag.",
+            "Truck payloads retain the grade blended while each shovel loads them; deliveries reach ROM with travel and tipping delay, so a new block grade cannot teleport into the stockpile.",
             "Mine block grade changes at the ROM stockpile while the blended flotation feed grade moves more slowly as copper-bearing ore turns over through ROM, crushed-ore, and SAG buffers.",
             "Six well-mixed flotation cells hold copper between scans; changes in grind, air, reagent, and residence time alter the kinetic rate before concentrate and tailings assays settle.",
             "Grinding degradation limits fresh-feed capacity and shifts power, cyclone recirculating load, and copper recovery.",

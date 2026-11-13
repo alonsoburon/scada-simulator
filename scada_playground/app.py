@@ -807,12 +807,14 @@ def advance(force: bool = False) -> None:
             "state": "ACTIVE / UNACK"})
     equipment_available = PLANT_CONTROLLER.availability(sim["process_control"])
     mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
-                                             sim["concentrator"]["rom_stockpile_t"])
+                                             sim["concentrator"]["rom_stockpile_t"],
+                                             ore_grade_pct=sim["concentrator"]["mine_block_grade_pct"])
     prior_water_shortage = sim["water_network"].get("concentrator_unmet_m3h",
                                                       sim["water_network"].get("unmet_demand_m3h", 0.0))
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
                                water_shortage_m3h=prior_water_shortage,
                                seed=sim["seed"], mine_delivery_t=mine_delivery_t,
+                               mine_delivery_copper_t=sim["haulage"]["last_delivery_copper_t"],
                                power_available_fraction=sim["power_network"]["process_power_fraction"],
                                equipment_available=equipment_available)
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
