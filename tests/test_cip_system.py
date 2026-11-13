@@ -29,6 +29,18 @@ class CleaningInPlaceTests(unittest.TestCase):
         self.assertFalse(self.state["active"])
         self.assertEqual(self.state["cycles_completed"], 1)
 
+    def test_wastewater_headroom_stalls_water_phases_and_effluent(self):
+        self.model.start(self.state, "pasteurizer_01", sim_seconds=0)
+        self.advance(1, 46)
+        self.assertEqual(self.state["phase"], "PRE_RINSE")
+        elapsed = self.state["phase_elapsed_s"]
+        self.model.advance(self.state, 47, steam_available_fraction=1.0,
+                           water_available_fraction=1.0, power_available_fraction=1.0,
+                           wastewater_available_fraction=0.0)
+        self.assertEqual(self.state["phase_elapsed_s"], elapsed)
+        self.assertEqual(self.state["water_demand_m3h"], 0.0)
+        self.assertEqual(self.state["effluent_m3h"], 0.0)
+
     def test_hot_sanitation_waits_for_steam_and_temperature(self):
         self.model.start(self.state, "pasteurizer_02")
         self.advance(1, 226)

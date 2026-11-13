@@ -27,7 +27,7 @@ class FactoryUtilitiesTests(unittest.TestCase):
         identifiers = {row["tag"] for row in rows}
         self.assertIn("cip.cip_tank_a.temperature", identifiers)
         self.assertIn("cip.cip_supply.water_flow", identifiers)
-        self.assertIn("wastewater.effluent_monitor.effluent_flow", identifiers)
+        self.assertIn("cip.cip_return.effluent_flow", identifiers)
 
     def test_steam_header_buffers_a_boiler_loss_and_temperature_recovers_later(self):
         outage = [{"name": "Utility loss", "area": "Boiler house", "severity": "Large"}]

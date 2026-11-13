@@ -196,6 +196,18 @@ def get_water_network_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_wastewater_state() -> dict[str, Any]:
+    """Read shared wastewater equalization, treatment, effluent quality, reuse, and sludge state."""
+    data = snapshot()
+    network = data.get("water_network")
+    wastewater = network.get("wastewater") if network else None
+    if not wastewater:
+        raise RuntimeError("Wastewater model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **wastewater}
+
+
+@mcp.tool()
 def get_concentrator_state() -> dict[str, Any]:
     """Read ore buffers, mill limits, grind size, flotation recovery, water use, and power."""
     data = snapshot()

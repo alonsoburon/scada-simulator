@@ -17,7 +17,6 @@ class FactoryUtilities:
         "Filling": ["Filler 01"],
         "Packaging": ["Case packer A", "Accumulation conveyor"],
         "CIP": ["CIP tank A", "CIP tank B", "CIP supply", "CIP return", "Chemical dosing"],
-        "Wastewater": ["Effluent monitor"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     HEADER_CAPACITY_T = 1.5
@@ -111,6 +110,7 @@ class FactoryUtilities:
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
+                wastewater_available_fraction: float = 1.0,
                 seed: int = 17) -> None:
         """Advance boiler/header, condensate, compressed-air, and consumer states."""
         had_scan_time = "last_advance_seconds" in state
@@ -127,6 +127,7 @@ class FactoryUtilities:
             steam_available_fraction=state["steam_service_fraction"],
             water_available_fraction=water_available_fraction,
             power_available_fraction=power_factor,
+            wastewater_available_fraction=wastewater_available_fraction,
             mechanical_degradation=cip_mechanical,
         )
         cip_demands = self.CIP_MODEL.demands(state["cip"])
@@ -432,12 +433,6 @@ class FactoryUtilities:
                 "sanitizer_dosing": (state["cip"]["sanitizer_dosing_l_min"], "L/min", 0, 10),
                 "caustic_tank_level": (100.0 * state["cip"]["caustic_inventory_l"] / 500.0, "%", 0, 100),
                 "sanitizer_tank_level": (100.0 * state["cip"]["sanitizer_inventory_l"] / 250.0, "%", 0, 100),
-            },
-            ("Wastewater", "Effluent monitor"): {
-                "effluent_flow": (state["cip_effluent_m3h"], "m³/h", 0, 40),
-                "effluent_ph": (state["cip"]["return_ph"], "pH", 0, 14),
-                "conductivity": (state["cip"]["return_conductivity_us_cm"], "µS/cm", 0, 50_000),
-                "discharge_compliant": (float(6.0 <= state["cip"]["return_ph"] <= 9.0), "bool", 0, 1),
             },
         }
         rows = []

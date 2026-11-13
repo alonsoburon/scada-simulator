@@ -37,6 +37,8 @@ class CleaningInPlaceSystem:
             "water_return_m3h": 0.0,
             "steam_demand_tph": 0.0,
             "effluent_m3h": 0.0,
+            "effluent_generated_m3h": 0.0,
+            "wastewater_available_fraction": 1.0,
             "recirculation_flow_m3h": 0.0,
             "temperature_c": 20.0,
             "return_ph": 7.0,
@@ -79,6 +81,7 @@ class CleaningInPlaceSystem:
 
     def advance(self, state: dict, sim_seconds: int, *, steam_available_fraction: float,
                 water_available_fraction: float, power_available_fraction: float,
+                wastewater_available_fraction: float = 1.0,
                 mechanical_degradation: float = 0.0) -> dict:
         self.migrate(state)
         dt_s = max(0, sim_seconds - state["last_advance_seconds"])
@@ -86,19 +89,23 @@ class CleaningInPlaceSystem:
         state["steam_available_fraction"] = max(0.0, min(1.0, steam_available_fraction))
         state["water_available_fraction"] = max(0.0, min(1.0, water_available_fraction))
         state["power_available_fraction"] = max(0.0, min(1.0, power_available_fraction))
+        state["wastewater_available_fraction"] = max(0.0, min(1.0, wastewater_available_fraction))
 
         if not state["active"]:
             state.update(phase="IDLE", phase_progress_pct=0.0, water_demand_m3h=0.0,
-                         water_return_m3h=0.0, steam_demand_tph=0.0, effluent_m3h=0.0,
+                         water_return_m3h=0.0, steam_demand_tph=0.0,
                          recirculation_flow_m3h=0.0, caustic_dosing_l_min=0.0,
                          sanitizer_dosing_l_min=0.0,
                          temperature_c=max(20.0, state["temperature_c"] - dt_s / 300.0))
+            state["effluent_generated_m3h"] = 0.0
+            state["effluent_m3h"] = 0.0
             return state
 
         (phase, duration, water, steam, target_temp, min_temp, target_ph, target_cond,
          caustic_rate, sanitizer_rate) = self._phase_tuple(state)
         pump_fraction = state["power_available_fraction"] * max(0.0, 1.0 - mechanical_degradation)
-        phase_water = water * pump_fraction
+        wastewater_ready = state["wastewater_available_fraction"] >= 0.80
+        phase_water = water * pump_fraction if wastewater_ready else 0.0
         target_temp = 20.0 + (target_temp - 20.0) * state["steam_available_fraction"]
         state["temperature_c"] += (target_temp - state["temperature_c"]) * (1.0 - math.exp(-dt_s / 90.0))
         state["return_ph"] += (target_ph - state["return_ph"]) * min(1.0, dt_s / 35.0)
@@ -106,7 +113,6 @@ class CleaningInPlaceSystem:
         heat_ready = min_temp <= 0.0 or state["temperature_c"] >= min_temp
         water_ready = water <= 0.0 or state["water_available_fraction"] >= 0.80
         pump_ready = pump_fraction >= 0.75
-        wastewater_ready = state.get("wastewater_available_fraction", 1.0) >= 0.80
         can_advance = heat_ready and water_ready and pump_ready and wastewater_ready
 
         if water > 0 and not water_ready:
@@ -117,7 +123,8 @@ class CleaningInPlaceSystem:
         state["water_demand_m3h"] = phase_water
         state["water_return_m3h"] = phase_water * state["water_available_fraction"]
         state["steam_demand_tph"] = steam if pump_ready else 0.0
-        state["effluent_m3h"] = state["water_return_m3h"] * (0.95 if water > 0 else 0.0)
+        state["effluent_generated_m3h"] = state["water_return_m3h"] * (0.95 if water > 0 else 0.0)
+        state["effluent_m3h"] = state["effluent_generated_m3h"]
         state["recirculation_flow_m3h"] = (30.0 * pump_fraction
             if phase in ("CAUSTIC_WASH", "HOT_SANITIZE") else 0.0)
         state["caustic_dosing_l_min"] = caustic_rate if can_advance else 0.0
@@ -146,7 +153,8 @@ class CleaningInPlaceSystem:
     def demands(self, state: dict) -> dict:
         self.migrate(state)
         if not state["active"]:
-            return {"water_m3h": 0.0, "steam_tph": 0.0, "effluent_m3h": 0.0}
+            return {"water_m3h": 0.0, "steam_tph": 0.0,
+                    "effluent_m3h": state["effluent_m3h"]}
         return {"water_m3h": state["water_demand_m3h"],
                 "steam_tph": state["steam_demand_tph"],
                 "effluent_m3h": state["effluent_m3h"]}

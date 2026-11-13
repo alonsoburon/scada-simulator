@@ -34,9 +34,11 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertGreater(self.state["cumulative_treatment_backwash_m3"], 0.5)
         self.assertEqual(self.state["treatment"]["mode"], "FILTERING")
         self.assertLess(self.state["treatment"]["filter_solids_kg"], 50)
+        self.assertAlmostEqual(self.state["treatment"]["cumulative_backwash_solids_kg"],
+                               self.model.TREATMENT.FILTER_CAPACITY_KG * .92, places=6)
+        self.assertGreater(self.state["wastewater"]["equalization_tss_kg"], 300)
         expected = (initial_storage - self.state["cumulative_process_consumption_m3"]
                     - self.state["cumulative_treated_delivery_m3"]
-                    - self.state["cumulative_treatment_backwash_m3"]
                     - self.state["total_spilled_m3"])
         self.assertAlmostEqual(self.model.total_inventory_m3(self.state), expected, places=6)
 

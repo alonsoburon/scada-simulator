@@ -32,12 +32,15 @@ class CIPPlantIntegrationTests(unittest.TestCase):
 
         expected_inventory = (initial_water_inventory + water["cumulative_concentrator_return_m3"]
             - water["cumulative_process_consumption_m3"] - water["cumulative_treated_delivery_m3"]
-            - water["total_spilled_m3"])
+            - water["total_spilled_m3"] - water["wastewater"]["cumulative_outfall_m3"]
+            - water["wastewater"]["cumulative_bypass_m3"]
+            - water["wastewater"]["cumulative_sludge_cake_water_m3"])
         self.assertFalse(utilities["cip"]["active"])
         self.assertEqual(utilities["cip"]["cycles_completed"], 1)
         self.assertGreater(highest_water_demand, water["base_demand_m3h"] + 200.0)
         self.assertGreater(highest_steam_demand, 40.0)
         self.assertGreater(water["cumulative_factory_cip_effluent_m3"], 1.0)
+        self.assertGreater(water["wastewater"]["cumulative_influent_m3"], 1.0)
         self.assertLess(minimum_filler_rate, 120.0)
         self.assertAlmostEqual(utilities["filler_rate_units_min"], 180.0, delta=1.0)
         self.assertAlmostEqual(utilities["packer_rate_cases_min"], 60.0, delta=1.0)

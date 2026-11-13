@@ -19,6 +19,8 @@ class ServiceWaterTreatment:
             "mode": "FILTERING", "influent_turbidity_ntu": 42.0,
             "effluent_turbidity_ntu": 2.28, "filter_differential_pressure_kpa": 18.0,
             "filter_solids_kg": 0.0, "backwash_remaining_s": 0,
+            "backwash_solids_remaining_kg": 0.0, "backwash_solids_kg_h": 0.0,
+            "cumulative_backwash_solids_kg": 0.0,
             "coagulant_inventory_kg": 1_800.0, "chlorine_inventory_kg": 180.0,
             "coagulant_dose_mg_l": 30.0, "chlorine_dose_mg_l": 1.1,
             "chlorine_residual_mg_l": 0.55, "treatment_power_fraction": 1.0,
@@ -54,6 +56,8 @@ class ServiceWaterTreatment:
         if state["filter_solids_kg"] >= self.FILTER_CAPACITY_KG:
             state["mode"] = "BACKWASH"
             state["backwash_remaining_s"] = self.FILTER_BACKWASH_SECONDS
+            state["backwash_solids_remaining_kg"] = max(
+                0.0, state["filter_solids_kg"] - self.FILTER_CAPACITY_KG * .08)
         elif state["treatment_power_fraction"] < .15:
             state["mode"] = "POWER_HOLD"
         else:
@@ -67,11 +71,22 @@ class ServiceWaterTreatment:
         state["last_advance_seconds"] = sim_seconds
         flow_m3h = max(0.0, flow_m3h)
         if state["mode"] == "BACKWASH":
-            state["cumulative_backwash_m3"] += max(0.0, backwash_water_m3h) * dt / 3600.0
+            backwash_water_m3h = max(0.0, backwash_water_m3h)
+            state["cumulative_backwash_m3"] += backwash_water_m3h * dt / 3600.0
             if backwash_water_m3h >= self.BACKWASH_FLOW_M3H * .8:
-                state["backwash_remaining_s"] = max(0, state["backwash_remaining_s"] - dt)
+                elapsed = min(dt, state["backwash_remaining_s"])
+                solids_removed = (state["backwash_solids_remaining_kg"] * elapsed
+                                  / max(1, state["backwash_remaining_s"]))
+                state["backwash_solids_remaining_kg"] = max(
+                    0.0, state["backwash_solids_remaining_kg"] - solids_removed)
+                state["backwash_solids_kg_h"] = solids_removed * 3600.0 / max(dt, 1)
+                state["cumulative_backwash_solids_kg"] += solids_removed
+                state["backwash_remaining_s"] = max(0, state["backwash_remaining_s"] - elapsed)
+            else:
+                state["backwash_solids_kg_h"] = 0.0
             if state["backwash_remaining_s"] == 0:
                 state["filter_solids_kg"] = self.FILTER_CAPACITY_KG * .08
+                state["backwash_solids_remaining_kg"] = 0.0
                 state["filter_differential_pressure_kpa"] = 18.0 + 52.0 * .08**1.35
                 state["mode"] = "FILTERING"
         elif state["mode"] == "FILTERING":
@@ -83,6 +98,7 @@ class ServiceWaterTreatment:
             solids_kg_m3 = state["influent_turbidity_ntu"] * .0015
             state["filter_solids_kg"] += flow_m3h / 3600.0 * solids_kg_m3 * dt
             state["filter_solids_kg"] = min(self.FILTER_CAPACITY_KG, state["filter_solids_kg"])
+            state["backwash_solids_kg_h"] = 0.0
             state["filter_differential_pressure_kpa"] = 18.0 + 52.0 * (
                 state["filter_solids_kg"] / self.FILTER_CAPACITY_KG) ** 1.35
             water_m3 = flow_m3h * dt / 3600.0
@@ -122,6 +138,7 @@ class ServiceWaterTreatment:
             row("chemical_dosing", "coagulant_inventory", state["coagulant_inventory_kg"], "kg", 0, 2_000),
             row("chemical_dosing", "chlorine_inventory", state["chlorine_inventory_kg"], "kg", 0, 250),
             row("filter_train", "backwash_remaining", state["backwash_remaining_s"], "s", 0, self.FILTER_BACKWASH_SECONDS),
+            row("filter_train", "backwash_solids_rate", state["backwash_solids_kg_h"], "kg/h", 0, 3_000),
             row("treatment_electrical", "motor_power", state["electrical_load_kw"], "kW", 0, 150),
             row("treatment_electrical", "power_available", 100 * state["treatment_power_fraction"], "%", 0, 100),
         ]

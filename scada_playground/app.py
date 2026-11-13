@@ -310,7 +310,7 @@ def initialize(seed: int = 17) -> None:
                                                 + sim["water_network"]["concentrator_demand_m3h"]
                                                 + sim["water_network"].get("factory_cip_demand_m3h", 0.0))
         sim["tags"] = [tag for tag in sim["tags"]
-                       if not tag["tag"].startswith(("water_supply_network.", "water_treatment."))]
+                       if not tag["tag"].startswith(("water_supply_network.", "water_treatment.", "wastewater."))]
         water_tags, _water_diagram = WATER_MODEL.telemetry(sim["water_network"])
         for tag in water_tags:
             tag["dynamic_model"] = True
@@ -568,14 +568,16 @@ def advance(force: bool = False) -> None:
     PROCESS_MODEL.advance(sim, force=force)
     utility_events = [event.__dict__ for event in sim["events"]]
     prior_factory_water_availability = sim["water_network"].get("factory_water_available_fraction", 1.0)
+    prior_wastewater_availability = sim["water_network"].get("wastewater_available_fraction", 1.0)
     UTILITY_MODEL.advance(
         sim["plant_utilities"], sim["tick"], utility_events,
         power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
         water_available_fraction=prior_factory_water_availability,
+        wastewater_available_fraction=prior_wastewater_availability,
         seed=sim["seed"],
     )
     water_events = [event.__dict__ for event in sim["events"]
-                    if event.area in ("Water supply network", "Water treatment", "Mine power network", "Whole factory")]
+                    if event.area in ("Water supply network", "Water treatment", "Wastewater", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
                              + sim["concentrator"]["crusher_power_mw"] + 1.0)
@@ -613,6 +615,8 @@ def advance(force: bool = False) -> None:
                         concentrator_reclaim_m3h=sim["concentrator"]["concentrator_reclaim_m3h"],
                         factory_cip_demand_m3h=sim["plant_utilities"]["cip_water_demand_m3h"],
                         factory_cip_effluent_m3h=sim["plant_utilities"]["cip_effluent_m3h"],
+                        factory_cip_return_ph=sim["plant_utilities"]["cip"]["return_ph"],
+                        factory_cip_conductivity_us_cm=sim["plant_utilities"]["cip"]["return_conductivity_us_cm"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
     water = sim["water_network"]
     conditions = {
@@ -635,6 +639,19 @@ def advance(force: bool = False) -> None:
         "water_treatment_chemical_low": ("Water treatment", water["treatment"]["coagulant_inventory_kg"] < 40
                                           or water["treatment"]["chlorine_inventory_kg"] < 5,
                                           "Water-treatment chemical inventory is low", "MEDIUM"),
+        "wastewater_equalization_high": ("Wastewater", water["wastewater"]["equalization_level_pct"] > 85,
+                                           "Wastewater equalization tank is high; CIP and backwash headroom is limited", "HIGH"),
+        "wastewater_overflow": ("Wastewater", water["wastewater"]["equalization_overflow_m3"] > 0,
+                                 "Wastewater equalization overflow is bypassing treatment", "CRITICAL"),
+        "wastewater_effluent_quality": ("Wastewater",
+            water["wastewater"]["treatment_flow_m3h"] > 0 and not water["wastewater"]["effluent_compliant"],
+            "Wastewater effluent is outside reuse quality limits; reuse is blocked", "HIGH"),
+        "wastewater_chemicals_low": ("Wastewater", min(water["wastewater"]["acid_inventory_kg"],
+            water["wastewater"]["caustic_inventory_kg"], water["wastewater"]["coagulant_inventory_kg"],
+            water["wastewater"]["polymer_inventory_kg"]) < 20,
+            "One or more wastewater treatment chemical inventories are low", "MEDIUM"),
+        "wastewater_sludge_high": ("Wastewater", water["wastewater"]["sludge_hopper_kg"] > 450,
+                                    "Wastewater sludge hopper is near capacity", "HIGH"),
         "raw_tank_high": ("Water supply network", water["nodes"]["raw_tank"]["level_pct"] > 90,
                            "Raw water tank high level", "HIGH"),
         "tank_spill": ("Water supply network", any(node["overflow_m3"] > 0 for node in water["nodes"].values()),
@@ -958,6 +975,19 @@ def render_dashboard():
                    f"{100*treatment['filter_solids_kg']/WATER_MODEL.TREATMENT.FILTER_CAPACITY_KG:.0f}% · "
                    f"coagulant {treatment['coagulant_inventory_kg']:.0f} kg / chlorine "
                    f"{treatment['chlorine_inventory_kg']:.0f} kg")
+        wastewater = water["wastewater"]
+        st.markdown("#### Shared wastewater treatment · CIP + filter backwash")
+        st.caption("CIP return and filter backwash collect in equalization, then pass through pH neutralization, DAF solids removal, and sludge pressing. Only effluent inside the training quality limits returns to the mine reclaim pond; noncompliant flow goes to the modeled outfall.")
+        ww_cols = st.columns(6)
+        for col, label, value in zip(ww_cols,
+            ["Equalization", "Influent", "Treatment", "Effluent pH / TSS", "Reuse / outfall", "Sludge hopper"],
+            [f"{wastewater['equalization_level_pct']:.1f}% · {wastewater['equalization_volume_m3']:.1f} m³",
+             f"{wastewater['influent_flow_m3h']:.1f} m³/h",
+             f"{wastewater['treatment_mode']} · {wastewater['treatment_flow_m3h']:.1f} m³/h",
+             f"{wastewater['effluent_ph']:.2f} · {wastewater['effluent_tss_mg_l']:.0f} mg/L",
+             f"{wastewater['reuse_flow_m3h']:.1f} / {wastewater['outfall_flow_m3h']:.1f} m³/h",
+             f"{wastewater['sludge_hopper_kg']:.1f} / {WATER_MODEL.WASTEWATER.SLUDGE_HOPPER_CAPACITY_KG:.0f} kg"]):
+            col.metric(label, value)
         with st.expander("Operator controls · simulated equipment only"):
             pump_cols = st.columns(4)
             for col, (pump_name, pump) in zip(pump_cols, water["pumps"].items()):
@@ -1069,6 +1099,19 @@ def render_dashboard():
                         color_discrete_sequence=["#277da1", "#f2a541", "#43aa8b"])
             f.update_layout(uirevision="concentrator-water-balance-trend")
             st.plotly_chart(f, width="stretch")
+            st.markdown("**Wastewater quality and reuse · distinct scale traces**")
+            wastewater_fig = make_subplots(specs=[[{"secondary_y": True}]])
+            wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_equalization_level_pct"],
+                name="Equalization level · %", line={"color": "#6A4C93"}), secondary_y=False)
+            wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_effluent_ph"],
+                name="Effluent pH", line={"color": "#E76F51"}), secondary_y=True)
+            wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_effluent_tss_mg_l"],
+                name="Effluent TSS · mg/L", line={"color": "#2A9D8F", "dash": "dash"}), secondary_y=True)
+            wastewater_fig.update_yaxes(title_text="Tank level (%)", range=[0, 100], secondary_y=False)
+            wastewater_fig.update_yaxes(title_text="pH / TSS (mg/L)", secondary_y=True)
+            wastewater_fig.update_layout(height=320, xaxis_title="Simulated seconds",
+                legend={"orientation": "h", "y": 1.18}, uirevision="wastewater-quality-trend")
+            st.plotly_chart(wastewater_fig, width="stretch")
         else:
             st.info("Start or single-step the factory to build level and flow trends.")
         st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")

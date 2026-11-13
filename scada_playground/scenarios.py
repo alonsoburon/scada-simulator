@@ -181,6 +181,23 @@ SCENARIOS = {
             "CIP wastewater appears as a separate effluent flow; the product buffer delays filler slowdown, and normal output returns after release.",
         ),
     ),
+    "cip-wastewater-quality-and-reuse": ScenarioDefinition(
+        scenario_id="cip-wastewater-quality-and-reuse",
+        name="CIP effluent treatment and reuse quality",
+        description="A CIP cleaning cycle sends variable-pH return to a shared wastewater treatment train while a local outage pauses treatment, then recovery tests neutralization, solids removal, and quality-gated reuse.",
+        duration_seconds=4_200,
+        steps=(
+            ScenarioStep(180, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                               "target_area": "Wastewater", "duration_seconds": 900}),
+            ScenarioStep(300, "cip_start", {"target_unit": "pasteurizer_01"}),
+        ),
+        expected_observations=(
+            "CIP return flow carries pH and conductivity from the active cleaning phase into a shared equalization tank.",
+            "The wastewater power loss stops treatment while incoming CIP return raises equalization inventory.",
+            "After power recovers, neutralization, solids removal, sludge pressing, chemical inventories, and effluent quality respond at different rates.",
+            "Only compliant effluent is reused to the mine reclaim pond; the rest leaves through the modeled outfall.",
+        ),
+    ),
     "grid-comms-recovery": ScenarioDefinition(
         scenario_id="grid-comms-recovery",
         name="Grid communications loss and recovery",
