@@ -155,6 +155,8 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertIn("water_supply_network.raw_transfer_valve.valve_position", by_id)
         self.assertIn("water_treatment.filter_train.differential_pressure", by_id)
         self.assertIn("water_supply_network.treated_tank.turbidity", by_id)
+        self.assertIn("water_supply_network.process_feed.wave_midpoint_peak_this_scan", by_id)
+        self.assertIn("water_supply_network.process_feed.wave_destination_min_this_scan", by_id)
         self.assertEqual(len(diagram[0]["nodes"]), 6)
         self.assertEqual(len(diagram[0]["links"]), 5)
         self.assertGreater(diagram[0]["electrical_load_kw"], 0)
@@ -188,32 +190,87 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertGreater(link["inlet_flow_m3h"], 0.0)
         self.assertLess(link["inlet_flow_m3h"], initial_flow)
         self.assertAlmostEqual(pump["speed_pct"], initial_speed * math.exp(-1.0 / 6.0))
-        self.assertGreater(link["surge_pressure_kpa"], 50.0)
-        initial_surge = link["surge_pressure_kpa"]
+        self.assertGreater(link["surge_peak_scan_kpa"], 50.0)
+        self.assertLess(link["surge_min_scan_kpa"], 0.0)
+        early_reflection_peak = link["surge_peak_scan_kpa"]
 
         self.model.advance(self.state, 2, [outage])
-        self.assertGreater(link["surge_pressure_kpa"], 0.0)
+        self.assertGreater(link["surge_peak_scan_kpa"], 0.0)
         self.assertLess(link["inlet_flow_m3h"], initial_flow)
         tags, _ = self.model.telemetry(self.state)
         by_id = {tag["tag"]: tag for tag in tags}
         self.assertIn("water_supply_network.process_feed.water_hammer_surge", by_id)
-        self.assertGreater(by_id["water_supply_network.process_feed.transient_gauge_pressure"]["value"], 0)
+        self.assertGreater(by_id["water_supply_network.process_feed.wave_peak_pressure_this_scan"]["value"], 0)
+        self.assertIn("water_supply_network.process_feed.wave_destination_pressure", by_id)
+        early_reflection_peak = max(early_reflection_peak, link["surge_peak_scan_kpa"])
         peak_check_valve_backflow = 0.0
         for second in range(3, 31):
             self.model.advance(self.state, second, [outage])
+            if second <= 5:
+                early_reflection_peak = max(early_reflection_peak,
+                                            link["surge_peak_scan_kpa"])
             peak_check_valve_backflow = max(
                 peak_check_valve_backflow, link["reverse_flow_m3h"])
-            if second > 3 and link["check_valve_state"] == "CLOSED":
+            if (second > 3 and link["check_valve_state"] == "CLOSED"
+                    and not link["check_valve_closure_complete_this_scan"]):
                 self.assertEqual(link["inlet_flow_m3h"], 0.0)
                 self.assertGreaterEqual(link["outlet_flow_m3h"], 0.0)
         self.assertGreater(peak_check_valve_backflow, 0.0)
         self.assertGreaterEqual(link["check_valve_closure_count"], 1)
         self.assertEqual(link["transport_direction"], 1)
-        self.assertLess(link["surge_pressure_kpa"], initial_surge)
+        # The first reflected wave can exceed the launch peak before friction
+        # attenuates the later pressure envelope.
+        self.assertLess(link["surge_peak_scan_kpa"], early_reflection_peak)
         expected_inventory = (initial_inventory + self.state["cumulative_concentrator_return_m3"]
             - self.state["cumulative_process_consumption_m3"]
             - self.state["cumulative_treated_delivery_m3"] - self.state["total_spilled_m3"])
         self.assertAlmostEqual(self.model.total_inventory_m3(self.state), expected_inventory, places=5)
+
+    def test_characteristic_wave_travels_reflects_and_reverses_sign(self):
+        link = self.state["links"]["raw_transfer"]
+        spec = self.model.LINKS["raw_transfer"]
+        steady_velocity = link["previous_velocity_m_s"]
+        changed_velocity = steady_velocity - 1.0
+        cells = len(link["wave_right"])
+
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=10)
+        peak_cell = max(range(cells), key=lambda index: abs(link["wave_right"][index]))
+        self.assertAlmostEqual(link["wave_right"][peak_cell],
+                               max(link["wave_right"]), places=5)
+        self.assertEqual(peak_cell, 9)
+        self.assertEqual(link["wave_mid_peak_scan_kpa"], 0.0)
+
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=18)
+        self.assertGreater(link["wave_mid_peak_scan_kpa"], 0.0)
+
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=cells - 28)
+        self.assertGreater(link["wave_right"][-1], 0.0)
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=1)
+        self.assertLess(link["wave_left"][-1], 0.0)
+        self.assertLess(link["wave_destination_min_scan_kpa"], 0.0)
+
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=cells - 1)
+        self.assertLess(link["wave_left"][0], 0.0)
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=1)
+        self.assertGreater(link["wave_right"][0], 0.0)
+
+    def test_endpoint_wave_pressure_changes_the_next_hydraulic_flow_solve(self):
+        key = "process_feed"
+        link = self.state["links"][key]
+        spec = self.model.LINKS[key]
+        baseline_flow, _ = self.model._link_reading(self.state, key, spec)
+
+        link["wave_source_pressure_kpa"] = 300.0
+        link["wave_destination_pressure_kpa"] = 0.0
+        source_pressurized_flow, _ = self.model._link_reading(self.state, key, spec)
+        self.assertGreater(link["transient_differential_head_m"], 0.0)
+        self.assertGreater(source_pressurized_flow, baseline_flow)
+
+        link["wave_source_pressure_kpa"] = 0.0
+        link["wave_destination_pressure_kpa"] = 300.0
+        receiver_pressurized_flow, _ = self.model._link_reading(self.state, key, spec)
+        self.assertLess(link["transient_differential_head_m"], 0.0)
+        self.assertLess(receiver_pressurized_flow, baseline_flow)
 
     def test_legacy_pipe_state_migrates_without_a_false_startup_surge(self):
         link = self.state["links"]["process_feed"]
@@ -222,6 +279,9 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertAlmostEqual(link["previous_velocity_m_s"], link["inlet_flow_m3h"] / 3600 / (
             3.141592653589793 * self.model.LINKS["process_feed"]["diameter_m"] ** 2 / 4))
         self.assertEqual(link["surge_pressure_kpa"], 0.0)
+        self.assertEqual(len(link["wave_right"]), round(
+            self.model.LINKS["process_feed"]["length_m"]
+            / (self.model.PIPE_WAVE_SPEED_M_S * self.model.WAVE_TIME_STEP_S)))
 
     def test_measurement_noise_is_seeded_and_repeatable(self):
         first, _ = self.model.telemetry(self.state)

@@ -691,14 +691,14 @@ def advance(force: bool = False) -> None:
                        "Water tank overflow detected", "HIGH"),
         "pipe_surge_overpressure": ("Water supply network", any(
             water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
-            + link["surge_pressure_kpa"] > link["pressure_rating_kpa"]
+            + link["surge_peak_scan_kpa"] > link["pressure_rating_kpa"]
             for key, link in water["links"].items()
             if WATER_MODEL.LINKS[key]["pump"]),
             "Estimated pipe transient pressure exceeds line rating", "CRITICAL"),
         "pipe_surge_low_pressure": ("Water supply network", any(
             WATER_MODEL.SITE_ATMOSPHERIC_PRESSURE_KPA
             + water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
-            + link["surge_pressure_kpa"] <= WATER_MODEL.WATER_VAPOR_PRESSURE_KPA
+            + link["surge_min_scan_kpa"] <= WATER_MODEL.WATER_VAPOR_PRESSURE_KPA
             for key, link in water["links"].items() if WATER_MODEL.LINKS[key]["pump"]),
             "Estimated absolute pressure reached the water vapor-pressure floor; column-separation risk", "HIGH"),
     }
@@ -1035,7 +1035,7 @@ def render_dashboard():
         water = sim["water_network"]
         diagram = published_snapshot["water_network"]
         st.markdown("### Mine water circuit · hydraulic network and level control")
-        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow and water-quality packets, so a pump trip can leave downstream flow running until the line empties. Rapid flow changes also produce a damped pressure-wave estimate and transient pressure alarms.")
+        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow and water-quality packets, so a pump trip can leave downstream flow running until the line empties. Rapid flow changes launch pressure waves that travel and reflect along the pipe; endpoint pressure changes feed the next one-second flow solve. Source, midpoint, receiver, and within-scan pressure peaks are published as signals.")
         metric_cols = st.columns(6)
         for col, label, value in zip(metric_cols, ["Total water demand", "Concentrator make-up", "Concentrator return",
                                                    "Background reclaim loop", "Water in transit", "Unmet demand"],
@@ -1138,6 +1138,26 @@ def render_dashboard():
                                   plot_bgcolor="white", paper_bgcolor="white",
                                   font={"color": "#243746"}, uirevision="water-network")
         st.plotly_chart(network_fig, width="stretch")
+        wave_history = pd.DataFrame(water.get("pressure_wave_history", []))
+        if not wave_history.empty:
+            wave_link = st.selectbox("Pressure-wave line", list(WATER_MODEL.LINKS),
+                format_func=lambda key: WATER_MODEL.LINKS[key]["label"], key="water_wave_link")
+            wave_fig = go.Figure()
+            for point, label, color in (("source", "Pump/source", "#277DA1"),
+                                        ("midpoint", "Midpoint", "#E76F51"),
+                                        ("receiver", "Receiving end", "#2A9D8F")):
+                wave_fig.add_trace(go.Scatter(x=wave_history["time"],
+                    y=wave_history[f"{wave_link}_{point}_peak_kpa"],
+                    name=f"{label} positive peak", line={"color": color}))
+                wave_fig.add_trace(go.Scatter(x=wave_history["time"],
+                    y=wave_history[f"{wave_link}_{point}_min_kpa"],
+                    name=f"{label} negative peak", line={"color": color, "dash": "dash"}))
+            wave_fig.update_layout(height=340,
+                title="Pressure-wave envelope recorded inside each one-second scan",
+                xaxis_title="Simulated seconds", yaxis_title="Transient pressure ΔP (kPa)",
+                legend={"orientation": "h", "y": 1.14},
+                uirevision=f"water-pressure-wave-{wave_link}")
+            st.plotly_chart(wave_fig, width="stretch")
         hist = pd.DataFrame(water["history"])
         if not hist.empty:
             left, right = st.columns(2)

@@ -87,6 +87,8 @@ class MineWaterNetwork:
     }
     WATER_DENSITY_KG_M3 = 998.0
     PIPE_WAVE_SPEED_M_S = 1_000.0
+    WAVE_TIME_STEP_S = 0.02
+    WAVE_STEPS_PER_SCAN = 50
     PIPE_RATING_KPA = 2_500.0
     SITE_ATMOSPHERIC_PRESSURE_KPA = 70.0
     WATER_VAPOR_PRESSURE_KPA = 2.3
@@ -121,10 +123,25 @@ class MineWaterNetwork:
                                                       "Concentrator reclaim valve")},
                 "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True,
                                  "surge_pressure_kpa": 0.0, "surge_peak_kpa": 0.0,
+                                 "surge_peak_scan_kpa": 0.0, "surge_min_scan_kpa": 0.0,
+                                 "wave_source_pressure_kpa": 0.0, "wave_mid_pressure_kpa": 0.0,
+                                 "wave_destination_pressure_kpa": 0.0,
+                                 "wave_source_peak_scan_kpa": 0.0, "wave_source_min_scan_kpa": 0.0,
+                                 "wave_mid_peak_scan_kpa": 0.0, "wave_mid_min_scan_kpa": 0.0,
+                                 "wave_destination_peak_scan_kpa": 0.0,
+                                 "wave_destination_min_scan_kpa": 0.0,
+                                 "transient_differential_head_m": 0.0,
+                                 "wave_right": [0.0] * max(2, round(
+                                     self.LINKS[key]["length_m"] /
+                                     (self.PIPE_WAVE_SPEED_M_S * self.WAVE_TIME_STEP_S))),
+                                 "wave_left": [0.0] * max(2, round(
+                                     self.LINKS[key]["length_m"] /
+                                     (self.PIPE_WAVE_SPEED_M_S * self.WAVE_TIME_STEP_S))),
                                  "minimum_surge_pressure_kpa": 0.0, "previous_velocity_m_s": 0.0,
                                  "transport_direction": 1, "check_valve_state":
                                      "OPEN" if self.LINKS[key]["pump"] else "NOT_INSTALLED",
                                  "check_valve_close_elapsed_s": 0.0,
+                                 "check_valve_closure_complete_this_scan": False,
                                  "check_valve_closure_count": 0, "reverse_flow_m3h": 0.0}
                           for key in self.LINKS},
                 "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
@@ -136,7 +153,8 @@ class MineWaterNetwork:
                 "treated_demand_m3h": 96.0,
                 "unmet_demand_m3h": 0.0, "unmet_treated_demand_m3h": 0.0,
                 "water_recovery_pct": 68.0, "concentrator_recovery_pct": 0.0,
-                "history": [], "total_spilled_m3": 0.0, "cumulative_source_withdrawal_m3": 0.0,
+                "history": [], "pressure_wave_history": [], "total_spilled_m3": 0.0,
+                "cumulative_source_withdrawal_m3": 0.0,
                 "cumulative_process_consumption_m3": 0.0, "cumulative_treated_delivery_m3": 0.0,
                 "cumulative_treatment_backwash_m3": 0.0,
                 "cumulative_concentrator_return_m3": 0.0,
@@ -202,9 +220,29 @@ class MineWaterNetwork:
             link.setdefault("surge_pressure_kpa", 0.0)
             link.setdefault("surge_peak_kpa", 0.0)
             link.setdefault("minimum_surge_pressure_kpa", 0.0)
+            cell_count = max(2, round(self.LINKS[key]["length_m"] /
+                                      (self.PIPE_WAVE_SPEED_M_S * self.WAVE_TIME_STEP_S)))
+            if (len(link.get("wave_right", [])) != cell_count
+                    or len(link.get("wave_left", [])) != cell_count):
+                link["wave_right"] = [0.0] * cell_count
+                link["wave_left"] = [0.0] * cell_count
+                link["surge_pressure_kpa"] = 0.0
+            link.setdefault("surge_peak_scan_kpa", 0.0)
+            link.setdefault("surge_min_scan_kpa", 0.0)
+            link.setdefault("wave_source_pressure_kpa", 0.0)
+            link.setdefault("wave_mid_pressure_kpa", 0.0)
+            link.setdefault("wave_destination_pressure_kpa", 0.0)
+            link.setdefault("wave_source_peak_scan_kpa", 0.0)
+            link.setdefault("wave_source_min_scan_kpa", 0.0)
+            link.setdefault("wave_mid_peak_scan_kpa", 0.0)
+            link.setdefault("wave_mid_min_scan_kpa", 0.0)
+            link.setdefault("wave_destination_peak_scan_kpa", 0.0)
+            link.setdefault("wave_destination_min_scan_kpa", 0.0)
+            link.setdefault("transient_differential_head_m", 0.0)
             link.setdefault("transport_direction", 1)
             link.setdefault("check_valve_state", "OPEN" if self.LINKS[key]["pump"] else "NOT_INSTALLED")
             link.setdefault("check_valve_close_elapsed_s", 0.0)
+            link.setdefault("check_valve_closure_complete_this_scan", False)
             link.setdefault("check_valve_closure_count", 0)
             link.setdefault("reverse_flow_m3h", 0.0)
             link.setdefault("previous_velocity_m_s", 0.0)
@@ -263,11 +301,93 @@ class MineWaterNetwork:
                 + state.get("wastewater", {}).get("equalization_volume_m3", 0.0)
                 + state.get("wastewater", {}).get("treatment_tank_volume_m3", 0.0))
 
+    def _propagate_line_waves(self, link_state: dict, spec: dict, velocity_m_s: float,
+                              valve_opening_pct: float, substeps: int | None = None) -> None:
+        """Propagate linearized pressure waves with characteristic travel and reflection."""
+        right = link_state["wave_right"]
+        left = link_state["wave_left"]
+        cell_count = len(right)
+        dt = self.WAVE_TIME_STEP_S
+        steps = self.WAVE_STEPS_PER_SCAN if substeps is None else max(0, int(substeps))
+        previous_velocity = link_state.get("previous_velocity_m_s", velocity_m_s)
+        # Joukowsky head step at the source boundary: ΔH = -a ΔV/g.
+        injected_head_m = -self.PIPE_WAVE_SPEED_M_S * (velocity_m_s - previous_velocity) / 9.80665
+        diameter = spec["diameter_m"]
+        reference_velocity = max(abs(velocity_m_s), 0.25)
+        reynolds = reference_velocity * diameter / 1.004e-6
+        if reynolds < 2_300:
+            friction = 64.0 / max(reynolds, 1.0)
+        else:
+            relative_roughness = spec["roughness_m"] / (3.7 * diameter)
+            friction = 0.25 / math.log10(relative_roughness + 5.74 / reynolds**0.9) ** 2
+        damping_rate = friction * reference_velocity / (2.0 * diameter)
+        attenuation = math.exp(-damping_rate * dt)
+
+        if valve_opening_pct <= 0:
+            source_reflection = destination_reflection = 1.0
+        else:
+            source_reflection = (1.0 if spec["pump"]
+                and link_state["check_valve_state"] in {"CLOSING", "CLOSED"} else -1.0)
+            destination_reflection = -1.0
+
+        scan_max_kpa = 0.0
+        scan_min_kpa = 0.0
+        source_pressure_kpa = link_state.get("surge_pressure_kpa", 0.0)
+        midpoint_pressure_kpa = link_state.get("wave_mid_pressure_kpa", 0.0)
+        destination_pressure_kpa = link_state.get("wave_destination_pressure_kpa", 0.0)
+        source_peak = source_min = 0.0
+        midpoint_peak = midpoint_min = 0.0
+        destination_peak = destination_min = 0.0
+        for step in range(steps):
+            at_source = left[0]
+            at_destination = right[-1]
+            new_right = [0.0] + right[:-1]
+            new_left = left[1:] + [0.0]
+            new_right[0] += source_reflection * at_source
+            new_left[-1] += destination_reflection * at_destination
+            if step == 0:
+                new_right[0] += injected_head_m
+            right = [value * attenuation for value in new_right]
+            left = [value * attenuation for value in new_left]
+            local_kpa = [(r + l) * self.WATER_DENSITY_KG_M3 * 9.80665 / 1000.0
+                         for r, l in zip(right, left)]
+            scan_max_kpa = max(scan_max_kpa, max(local_kpa, default=0.0))
+            scan_min_kpa = min(scan_min_kpa, min(local_kpa, default=0.0))
+            source_pressure_kpa = local_kpa[0]
+            midpoint_pressure_kpa = local_kpa[cell_count // 2]
+            destination_pressure_kpa = local_kpa[-1]
+            source_peak = max(source_peak, source_pressure_kpa)
+            source_min = min(source_min, source_pressure_kpa)
+            midpoint_peak = max(midpoint_peak, midpoint_pressure_kpa)
+            midpoint_min = min(midpoint_min, midpoint_pressure_kpa)
+            destination_peak = max(destination_peak, destination_pressure_kpa)
+            destination_min = min(destination_min, destination_pressure_kpa)
+
+        link_state["wave_right"] = right
+        link_state["wave_left"] = left
+        link_state["wave_source_pressure_kpa"] = source_pressure_kpa
+        link_state["wave_mid_pressure_kpa"] = midpoint_pressure_kpa
+        link_state["wave_destination_pressure_kpa"] = destination_pressure_kpa
+        link_state["wave_source_peak_scan_kpa"] = source_peak
+        link_state["wave_source_min_scan_kpa"] = source_min
+        link_state["wave_mid_peak_scan_kpa"] = midpoint_peak
+        link_state["wave_mid_min_scan_kpa"] = midpoint_min
+        link_state["wave_destination_peak_scan_kpa"] = destination_peak
+        link_state["wave_destination_min_scan_kpa"] = destination_min
+        link_state["surge_pressure_kpa"] = source_pressure_kpa
+        link_state["surge_peak_scan_kpa"] = scan_max_kpa
+        link_state["surge_min_scan_kpa"] = scan_min_kpa
+        link_state["surge_peak_kpa"] = max(link_state.get("surge_peak_kpa", 0.0), scan_max_kpa)
+        link_state["minimum_surge_pressure_kpa"] = min(
+            link_state.get("minimum_surge_pressure_kpa", 0.0), scan_min_kpa)
+        link_state["previous_velocity_m_s"] = velocity_m_s
+
     def _link_reading(self, state: dict, key: str, spec: dict) -> tuple[float, float]:
         opening_pct = state["valves"][spec["valve"]]
         if opening_pct <= 0:
             return 0.0, 0.0
         link_state = state["links"][key]
+        link_state["check_valve_closure_complete_this_scan"] = False
         if spec["pump"]:
             pump = state["pumps"][spec["pump"]]
             pump["pump_head_m"] = 0.0
@@ -288,7 +408,17 @@ class MineWaterNetwork:
         filter_pressure_kpa = (state.get("treatment", {}).get("filter_differential_pressure_kpa", 18.0)
                                if key == "reclaim_transfer" else 0.0)
         filter_head_loss_m = filter_pressure_kpa / 9.80665
-        head_at_zero = pump_head_at_zero + static_head - destination_head - filter_head_loss_m
+        # Endpoint pressure waves alter the hydraulic head available to the
+        # next one-second flow solve. This couples transient pressure back into
+        # the process while keeping tank levels and controls on their scan rate.
+        source_wave_head_m = (link_state.get("wave_source_pressure_kpa", 0.0) * 1000.0
+                              / (self.WATER_DENSITY_KG_M3 * 9.80665))
+        destination_wave_head_m = (link_state.get("wave_destination_pressure_kpa", 0.0) * 1000.0
+                                   / (self.WATER_DENSITY_KG_M3 * 9.80665))
+        transient_head_m = source_wave_head_m - destination_wave_head_m
+        link_state["transient_differential_head_m"] = transient_head_m
+        head_at_zero = (pump_head_at_zero + static_head - destination_head
+                        - filter_head_loss_m + transient_head_m)
 
         valve_k = spec["valve_loss_k"] / max((opening_pct / 100.0) ** 2, 1e-6)
         area = math.pi * spec["diameter_m"] ** 2 / 4.0
@@ -333,7 +463,10 @@ class MineWaterNetwork:
         if spec["pump"]:
             pump = state["pumps"][spec["pump"]]
             cracking_head = pump["check_valve_cracking_head_m"]
-            if head_at_zero > cracking_head and opening_pct > 0:
+            # Acoustic pressure alone cannot act as a sustained pump source.
+            # Require rotor motion before a seated check valve can reopen.
+            if (head_at_zero > cracking_head and opening_pct > 0
+                    and pump["speed_pct"] > 0.5):
                 link_state["check_valve_state"] = "OPEN"
                 link_state["check_valve_close_elapsed_s"] = 0.0
                 link_state["reverse_flow_m3h"] = 0.0
@@ -357,6 +490,7 @@ class MineWaterNetwork:
                     link_state["check_valve_close_elapsed_s"] = end
                     if end >= close_time:
                         link_state["check_valve_state"] = "CLOSED"
+                        link_state["check_valve_closure_complete_this_scan"] = True
                 else:
                     flow_m3s = 0.0
                     link_state["reverse_flow_m3h"] = 0.0
@@ -502,19 +636,8 @@ class MineWaterNetwork:
                             reverse_flow_m3h=max(0.0, -inlet[key]))
             area = math.pi * self.LINKS[key]["diameter_m"] ** 2 / 4.0
             velocity = inlet[key] / 3600.0 / area
-            # Joukowsky gives the pressure step for a rapid velocity change.
-            # At the one-second simulator scan, acoustic reflections are represented
-            # by a damped wave with a length-dependent round-trip time.
-            delta_velocity = velocity - link.get("previous_velocity_m_s", velocity)
-            wave_step_kpa = -self.WATER_DENSITY_KG_M3 * self.PIPE_WAVE_SPEED_M_S * delta_velocity / 1000.0
-            round_trip_s = max(0.5, 2.0 * self.LINKS[key]["length_m"] / self.PIPE_WAVE_SPEED_M_S)
-            decay = math.exp(-1.0 / round_trip_s)
-            surge = link.get("surge_pressure_kpa", 0.0) * decay + wave_step_kpa
-            link["surge_pressure_kpa"] = surge
-            link["surge_peak_kpa"] = max(link.get("surge_peak_kpa", 0.0), surge)
-            link["minimum_surge_pressure_kpa"] = min(
-                link.get("minimum_surge_pressure_kpa", 0.0), surge)
-            link["previous_velocity_m_s"] = velocity
+            self._propagate_line_waves(link, self.LINKS[key], velocity,
+                                       state["valves"][self.LINKS[key]["valve"]])
 
         transfer("raw_transfer", volumes["north_reservoir"], volumes["raw_tank"])
         raw_available = volumes["raw_tank"] + outlet["raw_transfer"] / 3600.0
@@ -551,6 +674,18 @@ class MineWaterNetwork:
         transfer("reclaim_return", process_available_m3, volumes["reclaim_pond"])
         reclaim_available = volumes["reclaim_pond"] + outlet["reclaim_return"] / 3600.0
         transfer("reclaim_transfer", reclaim_available, volumes["treated_tank"])
+        wave_sample = {"time": sim_seconds}
+        for key, link in state["links"].items():
+            wave_sample[f"{key}_source_peak_kpa"] = link["wave_source_peak_scan_kpa"]
+            wave_sample[f"{key}_source_min_kpa"] = link["wave_source_min_scan_kpa"]
+            wave_sample[f"{key}_midpoint_peak_kpa"] = link["wave_mid_peak_scan_kpa"]
+            wave_sample[f"{key}_midpoint_min_kpa"] = link["wave_mid_min_scan_kpa"]
+            wave_sample[f"{key}_receiver_peak_kpa"] = link["wave_destination_peak_scan_kpa"]
+            wave_sample[f"{key}_receiver_min_kpa"] = link["wave_destination_min_scan_kpa"]
+            wave_sample[f"{key}_line_peak_kpa"] = link["surge_peak_scan_kpa"]
+            wave_sample[f"{key}_line_min_kpa"] = link["surge_min_scan_kpa"]
+        state["pressure_wave_history"].append(wave_sample)
+        state["pressure_wave_history"] = state["pressure_wave_history"][-1_800:]
         treatment_link = state["links"]["reclaim_transfer"]
         quality_queue = treatment_link["quality_transport_queue"]
         quality_queue.append({"turbidity_ntu": state["treatment"]["effluent_turbidity_ntu"],
@@ -724,6 +859,9 @@ class MineWaterNetwork:
                 "bool", 0, 1)
             add(key, "check_valve_closing", float(reading["check_valve_state"] == "CLOSING"),
                 "bool", 0, 1)
+            add(key, "check_valve_closed_this_scan",
+                float(reading["check_valve_closure_complete_this_scan"]), "bool", 0, 1,
+                last_change="Check valve reached its seat during this scan")
             add(key, "check_valve_reverse_flow", reading["reverse_flow_m3h"], "m³/h",
                 0, link["max_flow_m3h"], 0.01)
             add(key, "check_valve_closure_count", reading["check_valve_closure_count"], "count", 0, 10_000)
@@ -733,12 +871,32 @@ class MineWaterNetwork:
             gauge_pressure = steady_discharge + reading["surge_pressure_kpa"]
             absolute_pressure = max(0.0, self.SITE_ATMOSPHERIC_PRESSURE_KPA + gauge_pressure)
             add(key, "transient_gauge_pressure", gauge_pressure, "kPa", -500, 5000, 0.0005,
-                "Joukowsky pressure transient estimate")
+                "Characteristic wave pressure at pump/source end")
             add(key, "water_hammer_surge", reading["surge_pressure_kpa"], "kPa", -5000, 5000,
-                0.0005, "Joukowsky pressure transient estimate")
+                0.0005, "Characteristic wave pressure at pump/source end")
+            add(key, "transient_differential_head", reading["transient_differential_head_m"], "m",
+                -500, 500, 0.0005,
+                "Source-to-receiver wave head applied in the hydraulic flow solve")
+            add(key, "wave_midpoint_pressure", reading["wave_mid_pressure_kpa"], "kPa",
+                -5000, 5000, 0.0005, "Characteristic wave pressure at line midpoint")
+            add(key, "wave_midpoint_peak_this_scan", reading["wave_mid_peak_scan_kpa"], "kPa",
+                0, 5000, 0.0005, "Peak positive pressure wave at midpoint this scan")
+            add(key, "wave_midpoint_min_this_scan", reading["wave_mid_min_scan_kpa"], "kPa",
+                -5000, 0, 0.0005, "Peak negative pressure wave at midpoint this scan")
+            add(key, "wave_destination_pressure", reading["wave_destination_pressure_kpa"], "kPa",
+                -5000, 5000, 0.0005, "Characteristic wave pressure at receiving end")
+            add(key, "wave_destination_peak_this_scan", reading["wave_destination_peak_scan_kpa"], "kPa",
+                0, 5000, 0.0005, "Peak positive pressure wave at receiver this scan")
+            add(key, "wave_destination_min_this_scan", reading["wave_destination_min_scan_kpa"], "kPa",
+                -5000, 0, 0.0005, "Peak negative pressure wave at receiver this scan")
+            add(key, "wave_peak_pressure_this_scan", reading["surge_peak_scan_kpa"], "kPa",
+                0, 5000, 0.0005, "Peak positive wave pressure across the line this scan")
+            add(key, "wave_min_pressure_this_scan", reading["surge_min_scan_kpa"], "kPa",
+                -5000, 0, 0.0005, "Peak negative wave pressure across the line this scan")
             add(key, "transient_absolute_pressure", absolute_pressure, "kPa", 0, 6000, 0.0005,
                 "Estimated line pressure at mine elevation")
             add(key, "pipe_pressure_rating", reading["pressure_rating_kpa"], "kPa", 0, 5000)
+            add(key, "wave_transit_time", link["length_m"] / self.PIPE_WAVE_SPEED_M_S, "s", 0, 10)
             velocity = reading["inlet_flow_m3h"] / 3600 / area
             add(key, "line_velocity", velocity, "m/s", -5, 5, 0.005)
             add(key, "transport_delay", reading["transport_delay_s"], "s", 0, 21_600)
@@ -788,6 +946,12 @@ class MineWaterNetwork:
                   "inlet_flow_m3h": state["links"][key]["inlet_flow_m3h"],
                   "pressure_kpa": state["links"][key]["pressure_kpa"],
                   "surge_pressure_kpa": state["links"][key]["surge_pressure_kpa"],
+                  "source_wave_pressure_kpa": state["links"][key]["wave_source_pressure_kpa"],
+                  "midpoint_wave_pressure_kpa": state["links"][key]["wave_mid_pressure_kpa"],
+                  "receiver_wave_pressure_kpa": state["links"][key]["wave_destination_pressure_kpa"],
+                  "wave_peak_scan_kpa": state["links"][key]["surge_peak_scan_kpa"],
+                  "wave_min_scan_kpa": state["links"][key]["surge_min_scan_kpa"],
+                  "transient_differential_head_m": state["links"][key]["transient_differential_head_m"],
                   "check_valve_state": state["links"][key]["check_valve_state"],
                   "reverse_flow_m3h": state["links"][key]["reverse_flow_m3h"],
                   "transport_delay_s": state["links"][key]["transport_delay_s"],
