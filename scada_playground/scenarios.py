@@ -133,6 +133,22 @@ SCENARIOS = {
             "After compressor capacity returns, the pressure controller recharges the receiver and packaging rates recover.",
         ),
     ),
+    "packaging-jam-buffer-and-recovery": ScenarioDefinition(
+        scenario_id="packaging-jam-buffer-and-recovery",
+        name="Packaging jam, buffer saturation, and line recovery",
+        description="A case-packer jam first fills the accumulation conveyor, then backs up the filler and pasteurized-product tank. The restart clears the jam and downstream pull empties both buffers.",
+        duration_seconds=2_400,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Conveyor jam", "severity": "Large",
+                                            "target_area": "Packaging", "duration_seconds": 600}),
+        ),
+        expected_observations=(
+            "The case packer slows with its drive ramp instead of instantaneously stopping.",
+            "The accumulation conveyor buffers product briefly; when full, the filler slows.",
+            "The pasteurized-product tank then fills and causes upstream product diversion, preserving finite inventory.",
+            "After the jam clears, the packer ramps up and drains buffers before the line returns to steady output.",
+        ),
+    ),
     "grid-comms-recovery": ScenarioDefinition(
         scenario_id="grid-comms-recovery",
         name="Grid communications loss and recovery",

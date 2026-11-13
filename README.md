@@ -2,7 +2,7 @@
 
 A local synthetic industrial operations world for developers building, testing, and demoing SCADA monitoring integrations. One simulator publishes the same values through Modbus TCP, OPC UA, MQTT, and MCP, with a small operator UI and a separate live fleet map.
 
-It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, about 200 equipment units, and about 1,500 tags**. The mine electrical network, water network, copper concentrator, haulage fleet, and factory steam/instrument-air loops have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
+It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, about 200 equipment units, and about 1,540 tags**. The mine electrical network, water network, copper concentrator, haulage fleet, and factory steam/instrument-air/production-line loops have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
 
 > Everything here is simulated. It is not a PLC, a process engineering model, a safety system, or a connection to real equipment.
 
@@ -85,6 +85,7 @@ Built-in scenarios:
 - `mine-water-pump-and-demand`: a process demand surge is followed by pump degradation; tank inventory, return flows, alarms, and recovery respond over time.
 - `boiler-header-pressure-and-recovery`: boiler capacity loss drains header inventory; pasteurizer temperatures lag the pressure drop and recover after the fault clears.
 - `compressed-air-receiver-and-recovery`: compressor loss draws down receiver pressure, degrades dryer output, and curtails filler and case-packer rates before recovery.
+- `packaging-jam-buffer-and-recovery`: a case-packer jam fills the accumulation conveyor, backs the filler up, fills the pasteurized-product tank, and propagates a controlled slowdown back upstream before draining on recovery.
 - `grid-comms-recovery`: simulated network partition in Grid distribution, stale quality, then recovery.
 - `frozen-signal`: freeze one signal while simulation time and other values continue.
 - `mqtt-tag-gap`: omit one tag from MQTT batches temporarily, then restore it.
@@ -107,7 +108,7 @@ This remains a compact learning model. Pipe friction and pump curves are simplif
 
 ## Factory steam and instrument-air utilities
 
-The **Plant utilities** tab models two boilers feeding a finite steam header, a delayed condensate return, two air compressors, a dryer, a receiver plus effective ring-main linepack, and process consumers. Header and receiver inventory buffer outages; boiler/compressor output ramps; low pressure curtails pasteurizer temperature and packaging rates with thermal and pneumatic response lags. Condensate reuse and boiler make-up change after the return delay. Compressor electrical demand is included in the site power request, so a mine-grid limitation can also reduce instrument-air capacity.
+The **Plant utilities** tab models two boilers feeding a finite steam header, a delayed condensate return, two air compressors, a dryer, a receiver plus effective ring-main linepack, and a coupled production line. Pasteurizers only send product above a simulated minimum temperature; colder output is diverted. A finite pasteurized-product tank buffers the fillers, and a finite accumulation conveyor buffers the case packer. Each scan conserves product across those two inventories; when downstream blockage fills them, filler and pasteurizer output back off. A case contains three simulated units. Header, receiver, and product inventory buffer outages; boiler/compressor/packer output ramps; low pressure curtails pasteurizer temperature and packaging rates with thermal and pneumatic response lags. Condensate reuse and boiler make-up change after the return delay. Compressor electrical demand is included in the site power request, so a mine-grid limitation can also reduce instrument-air capacity.
 
 These compact inventory and pressure-control models do not calculate combustion, steam tables, compressor maps, air-leak location, or pipe-network design. They provide cross-system failure propagation for SCADA monitoring practice. Run `boiler-header-pressure-and-recovery` and `compressed-air-receiver-and-recovery` to compare stored inventory with downstream response.
 

@@ -712,6 +712,18 @@ def advance(force: bool = False) -> None:
             utilities["dryer_dew_point_c"] < -10, "Instrument-air dryer dew point is high", "HIGH"),
         "low_condensate_inventory": ("Boiler house", utilities["condensate_inventory_t"] < 3,
             utilities["condensate_inventory_t"] > 5, "Condensate receiver inventory low", "MEDIUM"),
+        "pasteurizer_product_diverted": ("Thermal processing",
+            sum(p["diverted_rate"] for p in utilities["pasteurizers"].values()) > 1,
+            sum(p["diverted_rate"] for p in utilities["pasteurizers"].values()) < 0.1,
+            "Pasteurizer product is being diverted below the temperature limit", "HIGH"),
+        "packaging_accumulation_high": ("Packaging",
+            utilities["filling_buffer_inventory_units"] > UTILITY_MODEL.PACKAGE_BUFFER_CAPACITY_UNITS * 0.9,
+            utilities["filling_buffer_inventory_units"] < UTILITY_MODEL.PACKAGE_BUFFER_CAPACITY_UNITS * 0.7,
+            "Case-packer accumulation conveyor nearing capacity", "HIGH"),
+        "product_tank_high": ("Thermal processing",
+            utilities["product_tank_inventory_units"] > UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS * 0.9,
+            utilities["product_tank_inventory_units"] < UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS * 0.7,
+            "Pasteurized-product tank nearing capacity", "MEDIUM"),
     }
     for key, (area, active, cleared, message, severity) in utility_conditions.items():
         was_active = utility_alarm_states.get(key, False)
@@ -1253,6 +1265,7 @@ def render_dashboard():
              f"{utilities['electric_load_mw']:.2f} MW"]):
             col.metric(label, value)
         st.caption(f"Air supply/demand {utilities['air_supply_nm3_min']:.1f}/{utilities['air_demand_nm3_min']:.1f} Nm³/min · dryer dew point {utilities['dryer_dew_point_c']:.1f} °C · condensate return {utilities['condensate_return_tph']:.1f} t/h · feedwater makeup {utilities['feedwater_makeup_tph']:.1f} t/h")
+        st.caption(f"Product balance tank {utilities['product_tank_inventory_units']:.0f}/{UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS:.0f} units · filling accumulation {utilities['filling_buffer_inventory_units']:.0f}/{UTILITY_MODEL.PACKAGE_BUFFER_CAPACITY_UNITS:.0f} units · approved line rate {utilities['packer_rate_cases_min']:.1f} cases/min · finished cases {utilities['finished_cases_total']:.0f}")
         equipment_rows = [
             {"Equipment": "Boiler 01", "Output": f"{utilities['boilers']['boiler_01']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_01']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_01']['vibration_mm_s']:.1f} mm/s"},
             {"Equipment": "Boiler 02", "Output": f"{utilities['boilers']['boiler_02']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_02']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_02']['vibration_mm_s']:.1f} mm/s"},
@@ -1260,6 +1273,8 @@ def render_dashboard():
             {"Equipment": "Compressor B", "Output": f"{utilities['compressors']['compressor_b']['output_nm3_min']:.1f} Nm³/min", "Availability": f"{utilities['compressors']['compressor_b']['availability']*100:.0f}%", "Condition": f"{utilities['compressors']['compressor_b']['vibration_mm_s']:.1f} mm/s"},
             {"Equipment": "Pasteurizer 01", "Output": f"{utilities['pasteurizers']['pasteurizer_01']['production_rate']:.1f} units/min", "Availability": f"{utilities['steam_service_fraction']*100:.0f}% steam service", "Condition": f"{utilities['pasteurizers']['pasteurizer_01']['temperature_c']:.1f} °C"},
             {"Equipment": "Filler 01", "Output": f"{utilities['filler_rate_units_min']:.1f} units/min", "Availability": f"{utilities['filling_air_service']*100:.0f}% air service", "Condition": f"{utilities['air_receiver_pressure_bar']:.2f} bar air"},
+            {"Equipment": "Product balance tank", "Output": f"{utilities['product_tank_inventory_units']:.0f} units", "Availability": "Finite buffer", "Condition": f"{100*utilities['product_tank_inventory_units']/UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS:.0f}% full"},
+            {"Equipment": "Case packer A", "Output": f"{utilities['packer_rate_cases_min']:.1f} cases/min", "Availability": f"{utilities['case_packer_speed_fraction']*100:.0f}% drive speed", "Condition": f"{utilities['filling_buffer_inventory_units']:.0f} units buffered"},
         ]
         st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
         history = pd.DataFrame(utilities["history"])
@@ -1279,6 +1294,12 @@ def render_dashboard():
                     color_discrete_sequence=["#277da1", "#f2a541"])
                 fig.update_layout(title="Steam production and demand", uirevision="steam-balance-trend")
                 st.plotly_chart(fig, width="stretch")
+                fig = px.line(history, x="sim_seconds",
+                    y=["product_tank_inventory_units", "filling_buffer_inventory_units"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Buffered product (units)", "variable": "Location"},
+                    color_discrete_sequence=["#577590", "#f9844a"])
+                fig.update_layout(title="Finite production-line buffers", uirevision="production-buffer-trend")
+                st.plotly_chart(fig, width="stretch")
             with right:
                 fig = px.line(history, x="sim_seconds", y="air_receiver_pressure_bar",
                     labels={"sim_seconds": "Simulated seconds", "air_receiver_pressure_bar": "Receiver pressure (bar)"},
@@ -1291,7 +1312,7 @@ def render_dashboard():
                     color_discrete_sequence=["#9b5de5", "#277da1"])
                 fig.update_layout(title="Instrument-air production and demand", uirevision="air-balance-trend")
                 st.plotly_chart(fig, width="stretch")
-        st.markdown("**Fault drills:** run `boiler-header-pressure-and-recovery` or inject Utility loss in Boiler house. Compare header pressure with the slower pasteurizer temperature response. Run `compressed-air-receiver-and-recovery` and follow receiver pressure, dryer dew point, filler rate, and case-packer rate.")
+        st.markdown("**Fault drills:** run `boiler-header-pressure-and-recovery` or inject Utility loss in Boiler house. Compare header pressure with the slower pasteurizer temperature response and diverted-product rate. Run `compressed-air-receiver-and-recovery` and follow receiver pressure, dryer dew point, filler rate, and case-packer rate. Run `packaging-jam-buffer-and-recovery` to watch the conveyor buffer fill, filler slow, pasteurized-product tank fill, and both buffers drain after the jam clears.")
 
 
 

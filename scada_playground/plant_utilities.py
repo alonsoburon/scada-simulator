@@ -8,14 +8,18 @@ class FactoryUtilities:
     AREA_ASSETS = {
         "Boiler house": ["Boiler 01", "Boiler 02", "Feedwater system", "Steam header", "Condensate return"],
         "Compressed air": ["Compressor A", "Compressor B", "Dryer A", "Receiver 01", "Ring main"],
-        "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02"],
+        "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02", "Product balance tank"],
         "Filling": ["Filler 01"],
-        "Packaging": ["Case packer A"],
+        "Packaging": ["Case packer A", "Accumulation conveyor"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     HEADER_CAPACITY_T = 1.5
     RECEIVER_VOLUME_M3 = 80.0  # Receiver plus effective ring-main volume.
     CONDENSATE_CAPACITY_T = 30.0
+    PRODUCT_TANK_CAPACITY_UNITS = 450.0
+    PACKAGE_BUFFER_CAPACITY_UNITS = 180.0
+    UNITS_PER_CASE = 3.0
+    PASTEURIZATION_LIMIT_C = 72.0
 
     def initialize(self) -> dict:
         return {
@@ -36,9 +40,21 @@ class FactoryUtilities:
             "feedwater_makeup_tph": 6.4,
             "condensate_return_queue": [25.6] * 60,
             "pasteurizers": {
-                "pasteurizer_01": {"temperature_c": 82.0, "setpoint_c": 82.0, "production_rate": 90.0},
-                "pasteurizer_02": {"temperature_c": 82.0, "setpoint_c": 82.0, "production_rate": 90.0},
+                "pasteurizer_01": {"temperature_c": 82.0, "setpoint_c": 82.0,
+                                   "process_rate": 90.0, "production_rate": 90.0,
+                                   "diverted_rate": 0.0},
+                "pasteurizer_02": {"temperature_c": 82.0, "setpoint_c": 82.0,
+                                   "process_rate": 90.0, "production_rate": 90.0,
+                                   "diverted_rate": 0.0},
             },
+            "product_tank_inventory_units": 180.0,
+            "product_tank_inlet_units_min": 180.0,
+            "filler_rate_units_min": 180.0,
+            "filling_buffer_inventory_units": 90.0,
+            "case_packer_speed_fraction": 1.0,
+            "packer_rate_units_min": 180.0,
+            "finished_cases_total": 0.0,
+            "last_advance_seconds": 0,
             "compressors": {
                 "compressor_a": {"capacity_nm3_min": 50.0, "output_nm3_min": 41.0, "availability": 1.0, "vibration_mm_s": 2.2},
                 "compressor_b": {"capacity_nm3_min": 50.0, "output_nm3_min": 37.0, "availability": 1.0, "vibration_mm_s": 2.0},
@@ -82,7 +98,12 @@ class FactoryUtilities:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, seed: int = 17) -> None:
         """Advance boiler/header, condensate, compressed-air, and consumer states."""
+        had_scan_time = "last_advance_seconds" in state
         self.migrate(state)
+        if not had_scan_time:
+            # A paused browser session can acquire this model mid-run; its first
+            # utility scan must represent one scan, not the entire old uptime.
+            state["last_advance_seconds"] = max(0, sim_seconds - 1)
         state["sim_seconds"] = sim_seconds
         power_factor = max(0.0, min(1.0, power_available_fraction))
 
@@ -170,19 +191,67 @@ class FactoryUtilities:
         if state["dryer_available"]:
             state["dryer_dew_point_c"] += (-25.0 - state["dryer_dew_point_c"]) * 0.01
         state["filling_air_service"] = state["air_service_fraction"]
-        state["filler_rate_units_min"] = 180.0 * state["filling_air_service"]
-        state["packer_rate_cases_min"] = 60.0 * state["filling_air_service"]
         state["electric_load_mw"] = (air_supply * 60.0 * 0.11 / 1000.0 + 0.08)
 
+        dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
+        dt_min = dt_s / 60.0
+        raw_product_rate = 0.0
+        product_tank_headroom_control = max(0.5, 1.0 - 0.5 * max(0.0,
+            (state["product_tank_inventory_units"] - 0.5 * self.PRODUCT_TANK_CAPACITY_UNITS)
+            / (0.5 * self.PRODUCT_TANK_CAPACITY_UNITS)))
         for name, pasteurizer in state["pasteurizers"].items():
             local_steam_service = state["steam_service_fraction"]
             local_steam_service *= 1.0 - self._event_severity(
                 events, "Utility loss", ("Thermal processing",))
             target_temperature = 24.0 + 60.0 * local_steam_service
             pasteurizer["temperature_c"] += (target_temperature - pasteurizer["temperature_c"]) / 360.0
-            thermal_compliance = max(0.0, min(1.0,
-                (pasteurizer["temperature_c"] - 60.0) / (pasteurizer["setpoint_c"] - 60.0)))
-            pasteurizer["production_rate"] = 90.0 * min(local_steam_service, thermal_compliance)
+            pasteurizer["process_rate"] = (90.0 * local_steam_service
+                * product_tank_headroom_control)
+            pasteurizer["steam_service_fraction"] = local_steam_service
+            pasteurizer["production_rate"] = (pasteurizer["process_rate"]
+                if pasteurizer["temperature_c"] >= self.PASTEURIZATION_LIMIT_C else 0.0)
+            pasteurizer["diverted_rate"] = pasteurizer["process_rate"] - pasteurizer["production_rate"]
+            raw_product_rate += pasteurizer["production_rate"]
+
+        jam_severity = self._event_severity(events, "Conveyor jam", ("Packaging",))
+        mechanical_filler = self._event_severity(events, "Mechanical degradation", ("Filling",))
+        mechanical_packer = self._event_severity(events, "Mechanical degradation", ("Packaging",))
+        filler_target_fraction = max(0.0, 1.0 - 0.85 * mechanical_filler)
+        recovery_boost = (1.2 if state["filling_buffer_inventory_units"]
+                          > self.PACKAGE_BUFFER_CAPACITY_UNITS * 0.15 else 1.0)
+        packer_target_fraction = max(0.0, 1.0 - jam_severity - 0.75 * mechanical_packer)
+        packer_target_fraction *= recovery_boost
+        state["case_packer_speed_fraction"] += max(-0.02, min(0.02,
+            packer_target_fraction - state["case_packer_speed_fraction"]))
+        filler_target = 180.0 * state["filling_air_service"] * filler_target_fraction
+        packer_target = 180.0 * state["filling_air_service"] * state["case_packer_speed_fraction"]
+        old_product_inventory = state["product_tank_inventory_units"]
+        old_package_inventory = state["filling_buffer_inventory_units"]
+        if dt_min > 0:
+            # Bound the filler by both pasteurized inventory and downstream accumulation space.
+            filler_rate = min(filler_target,
+                old_product_inventory / dt_min + raw_product_rate,
+                (self.PACKAGE_BUFFER_CAPACITY_UNITS - old_package_inventory) / dt_min + packer_target)
+            # Back off upstream production when the balance tank is full.
+            product_inlet_rate = min(raw_product_rate,
+                (self.PRODUCT_TANK_CAPACITY_UNITS - old_product_inventory) / dt_min + filler_rate)
+            packer_rate = min(packer_target, old_package_inventory / dt_min + filler_rate)
+            state["product_tank_inventory_units"] = max(0.0, min(
+                self.PRODUCT_TANK_CAPACITY_UNITS,
+                old_product_inventory + (product_inlet_rate - filler_rate) * dt_min))
+            state["filling_buffer_inventory_units"] = max(0.0, min(
+                self.PACKAGE_BUFFER_CAPACITY_UNITS,
+                old_package_inventory + (filler_rate - packer_rate) * dt_min))
+            state["product_tank_inlet_units_min"] = product_inlet_rate
+            state["filler_rate_units_min"] = filler_rate
+            state["packer_rate_units_min"] = packer_rate
+            state["finished_cases_total"] += packer_rate * dt_min / self.UNITS_PER_CASE
+        else:
+            state["product_tank_inlet_units_min"] = raw_product_rate
+            state["filler_rate_units_min"] = filler_target
+            state["packer_rate_units_min"] = packer_target
+        state["packer_rate_cases_min"] = state["packer_rate_units_min"] / self.UNITS_PER_CASE
+        state["last_advance_seconds"] = sim_seconds
 
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
@@ -190,7 +259,10 @@ class FactoryUtilities:
                 "steam_demand_tph", "steam_service_fraction", "condensate_inventory_t",
                 "air_receiver_pressure_bar", "air_supply_nm3_min", "air_demand_nm3_min",
                 "air_service_fraction", "dryer_dew_point_c",
-                "filler_rate_units_min", "packer_rate_cases_min")}
+                "filler_rate_units_min", "packer_rate_cases_min",
+                "product_tank_inventory_units", "filling_buffer_inventory_units",
+                "product_tank_inlet_units_min", "packer_rate_units_min",
+                "finished_cases_total")}
                 | {"pasteurizer_01_temperature_c": state["pasteurizers"]["pasteurizer_01"]["temperature_c"],
                    "pasteurizer_02_temperature_c": state["pasteurizers"]["pasteurizer_02"]["temperature_c"],
                    "pasteurizer_01_rate": state["pasteurizers"]["pasteurizer_01"]["production_rate"],
@@ -271,6 +343,12 @@ class FactoryUtilities:
             },
             ("Thermal processing", "Pasteurizer 01"): self._pasteurizer_signals(state, "pasteurizer_01", pressure),
             ("Thermal processing", "Pasteurizer 02"): self._pasteurizer_signals(state, "pasteurizer_02", pressure),
+            ("Thermal processing", "Product balance tank"): {
+                "inventory": (100 * state["product_tank_inventory_units"] / self.PRODUCT_TANK_CAPACITY_UNITS, "%", 0, 100),
+                "inlet_flow": (state["product_tank_inlet_units_min"], "units/min", 0, 240),
+                "outlet_flow": (state["filler_rate_units_min"], "units/min", 0, 240),
+                "product_temperature": (min(p["temperature_c"] for p in state["pasteurizers"].values()), "°C", 0, 140),
+            },
             ("Filling", "Filler 01"): {
                 "instrument_air_pressure": (air_pressure, "bar", 0, 12),
                 "production_rate": (state["filler_rate_units_min"], "units/min", 0, 240),
@@ -282,6 +360,13 @@ class FactoryUtilities:
                 "production_rate": (state["packer_rate_cases_min"], "cases/min", 0, 100),
                 "air_service": (100 * state["filling_air_service"], "%", 0, 100),
                 "motor_current": (16 + 0.8 * state["packer_rate_cases_min"], "A", 0, 120),
+                "drive_speed": (100 * state["case_packer_speed_fraction"], "%", 0, 100),
+            },
+            ("Packaging", "Accumulation conveyor"): {
+                "buffer_inventory": (100 * state["filling_buffer_inventory_units"] / self.PACKAGE_BUFFER_CAPACITY_UNITS, "%", 0, 100),
+                "infeed_rate": (state["filler_rate_units_min"], "units/min", 0, 240),
+                "outfeed_rate": (state["packer_rate_units_min"], "units/min", 0, 240),
+                "blocked": (float(state["filling_buffer_inventory_units"] >= self.PACKAGE_BUFFER_CAPACITY_UNITS - 1e-6), "bool", 0, 1),
             },
         }
         rows = []
@@ -302,8 +387,9 @@ class FactoryUtilities:
         return {
             "process_temperature": (pasteurizer["temperature_c"], "°C", 0, 140),
             "steam_pressure": (header_pressure, "bar", 0, 20),
-            "production_rate": (pasteurizer["production_rate"], "units/min", 0, 240),
-            "steam_flow": (16.0 * state["steam_service_fraction"], "t/h", 0, 30),
-            "temperature_compliance": (100 * min(1.0,
-                max(0.0, (pasteurizer["temperature_c"] - 60.0) / (pasteurizer["setpoint_c"] - 60.0))), "%", 0, 100),
+            "process_rate": (pasteurizer["process_rate"], "units/min", 0, 120),
+            "production_rate": (pasteurizer["production_rate"], "units/min", 0, 120),
+            "diverted_rate": (pasteurizer["diverted_rate"], "units/min", 0, 120),
+            "steam_flow": (16.0 * pasteurizer["steam_service_fraction"], "t/h", 0, 30),
+            "temperature_compliance": (100.0 if pasteurizer["temperature_c"] >= FactoryUtilities.PASTEURIZATION_LIMIT_C else 0.0, "%", 0, 100),
         }
