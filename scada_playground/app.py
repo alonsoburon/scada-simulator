@@ -756,6 +756,11 @@ else:
 def render_dashboard():
     mcp_results = process_mcp_commands()
     sim = st.session_state.sim
+    # Preserve visibility when Streamlit keeps a paused pre-upgrade session alive.
+    power = sim["power_network"]
+    power.setdefault("frequency_nadir_hz", power.get("frequency_hz", 50.0))
+    power.setdefault("frequency_window_nadir_hz", power.get("frequency_hz", 50.0))
+    power.setdefault("distribution_losses_mw", 0.0)
     if sim["running"]:
         # Each heartbeat step is one simulated second; the slider controls the multiplier.
         for _ in range(speed):
@@ -1063,10 +1068,10 @@ def render_dashboard():
         power = sim["power_network"]
         st.subheader("Mine electrical network · dispatch and load response")
         st.caption("Grid import, solar, diesel reserve, and battery storage supply site auxiliaries, water pumps, and the concentrator. Four radial feeders estimate voltage drop, reactive flow, current, and I²R loss with a linearized DistFlow approximation; protection and full AC load-flow behavior are outside this model.")
-        metrics = st.columns(6)
+        metrics = st.columns(7)
         for col, label, value in zip(metrics,
-            ["Mine bus frequency", "Lowest feeder voltage", "Grid import", "Diesel generation", "Battery reserve", "Distribution losses"],
-            [f"{power['frequency_hz']:.2f} Hz", f"{power['voltage_pu']:.3f} pu", f"{power['grid_import_mw']:.1f} MW",
+            ["Mine bus frequency", "Run frequency nadir", "Lowest feeder voltage", "Grid import", "Diesel generation", "Battery reserve", "Distribution losses"],
+            [f"{power['frequency_hz']:.2f} Hz", f"{power['frequency_nadir_hz']:.2f} Hz", f"{power['voltage_pu']:.3f} pu", f"{power['grid_import_mw']:.1f} MW",
              f"{power['diesel_mw']:.1f} MW", f"{power['battery_soc_pct']:.1f}%", f"{power['distribution_losses_mw']:.2f} MW"]):
             col.metric(label, value)
         st.caption(f"Solar {power['solar_mw']:.1f} MW · battery {power['battery_power_mw']:+.1f} MW (positive = discharging) · requested/served plant load {power['requested_load_mw']:.1f}/{power['served_load_mw']:.1f} MW · shed {power['load_shed_mw']:.1f} MW · process/water feeder limits {power['process_feeder_capacity_mw']:.1f}/{power['water_feeder_capacity_mw']:.1f} MW")
@@ -1117,11 +1122,14 @@ def render_dashboard():
         st.dataframe(pd.DataFrame(feeder_rows).round(2), hide_index=True, width="stretch")
         history = pd.DataFrame(power["history"])
         if not history.empty:
+            if "frequency_window_nadir_hz" not in history:
+                history["frequency_window_nadir_hz"] = history["frequency_hz"]
             left, right = st.columns(2)
             with left:
-                trend = px.line(history, x="sim_seconds", y=["frequency_hz"],
-                    labels={"sim_seconds": "Simulated seconds", "value": "Frequency (Hz)"},
-                    color_discrete_sequence=["#277da1"])
+                trend = px.line(history, x="sim_seconds", y=["frequency_hz", "frequency_window_nadir_hz"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "Frequency (Hz)",
+                            "variable": "Measurement"},
+                    color_discrete_sequence=["#277da1", "#e07a5f"])
                 trend.add_hline(y=49.5, line_dash="dash", line_color="#d1495b", annotation_text="Underfrequency alarm")
                 trend.update_layout(uirevision="power-frequency-trend")
                 st.plotly_chart(trend, width="stretch")

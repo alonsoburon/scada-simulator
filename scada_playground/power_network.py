@@ -31,7 +31,9 @@ class MinePowerNetwork:
 
     def initialize(self) -> dict:
         return {
-            "sim_seconds": 0, "frequency_hz": 50.0, "voltage_pu": 1.0,
+            "sim_seconds": 0, "frequency_hz": 50.0, "frequency_rocof_hz_s": 0.0,
+            "frequency_nadir_hz": 50.0, "frequency_window_nadir_hz": 50.0,
+            "voltage_pu": 1.0,
             "source_voltage_pu": 1.0, "capacitor_bank_stage": 1,
             "capacitor_bank_mvar": 1.2, "distribution_losses_mw": 0.55,
             "distribution_feeders": {name: {"active_power_mw": 0.0, "reactive_power_mvar": 0.0,
@@ -44,6 +46,7 @@ class MinePowerNetwork:
             "diesel_start_timer_s": 0, "diesel_started": False,
             "battery_soc_pct": 82.0, "battery_energy_mwh": 16.4,
             "battery_capacity_mwh": 20.0, "battery_power_mw": 0.0,
+            "battery_discharge_ramp_mw_s": 6.0, "battery_charge_ramp_mw_s": 1.5,
             "transformers": {
                 "grid_a": {"top_oil_c": 58.0, "hotspot_c": 73.0, "cooling_stage": 0},
                 "grid_b": {"top_oil_c": 56.0, "hotspot_c": 70.0, "cooling_stage": 0},
@@ -115,9 +118,18 @@ class MinePowerNetwork:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float, seed: int = 17) -> None:
         """Dispatch sources and allocate power to site, water, and process loads."""
-        for name, initial in self.initialize()["transformers"].items():
+        initial_state = self.initialize()
+        for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
+                    "source_voltage_pu", "capacitor_bank_stage", "capacitor_bank_mvar",
+                    "distribution_feeders", "battery_discharge_ramp_mw_s",
+                    "battery_charge_ramp_mw_s"):
+            state.setdefault(key, initial_state[key])
+        state.setdefault("frequency_nadir_hz", state.get("frequency_hz", 50.0))
+        state.setdefault("frequency_window_nadir_hz", state.get("frequency_hz", 50.0))
+        for name, initial in initial_state["transformers"].items():
             state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
+        connected_load_at_tick_start = state.get("served_load_mw", 34.5)
         faults = [event for event in events if event["name"] == "Utility loss"]
         gen_faults = [event for event in events if event["name"] == "Mechanical degradation"]
 
@@ -159,6 +171,8 @@ class MinePowerNetwork:
         site_request = 6.0
         dispatch_request = (site_request + min(water_request, state["water_feeder_capacity_mw"])
                             + min(process_request, state["process_feeder_capacity_mw"]))
+        estimated_network_losses = max(0.0, state.get("distribution_losses_mw", 0.55))
+        source_request = dispatch_request + estimated_network_losses
         mine_thermal = state["transformers"]
         mine_a_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["mine_a"]["hotspot_c"] - 110.0) / 30.0))
         mine_b_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["mine_b"]["hotspot_c"] - 110.0) / 30.0))
@@ -173,7 +187,7 @@ class MinePowerNetwork:
         tie_cap = min(state["tie_capacity_mw"], state["mine_transformer_capacity_mw"],
                       grid_transformer_limit)
 
-        residual_after_grid_and_solar = max(0.0, dispatch_request - tie_cap - solar)
+        residual_after_grid_and_solar = max(0.0, source_request - tie_cap - solar)
         if residual_after_grid_and_solar > 0.8 and diesel_cap > 0:
             state["diesel_start_timer_s"] += 1
             if state["diesel_start_timer_s"] >= 20:
@@ -186,22 +200,29 @@ class MinePowerNetwork:
             state["diesel_mw"] = 0.0
             state["diesel_started"] = False
 
-        grid_for_load = min(tie_cap, max(0.0, dispatch_request - solar - state["diesel_mw"]))
-        deficit = max(0.0, dispatch_request - solar - state["diesel_mw"] - grid_for_load)
+        grid_for_load = min(tie_cap, max(0.0, source_request - solar - state["diesel_mw"]))
+        deficit = max(0.0, source_request - solar - state["diesel_mw"] - grid_for_load)
         battery_target = min(state["battery_discharge_limit_mw"], deficit,
                              state["battery_energy_mwh"] * 3600.0)
         if deficit <= 1e-9 and state["battery_energy_mwh"] < state["battery_capacity_mwh"]:
             charge_headroom = min(state["battery_charge_limit_mw"], tie_cap - grid_for_load,
                                   (state["battery_capacity_mwh"] - state["battery_energy_mwh"]) * 3600.0)
             battery_target = -max(0.0, charge_headroom)
-        # The storage inverter has a finite ramp and cannot reverse direction instantly.
+        # The inverter responds quickly when increasing discharge to arrest a
+        # deficit; charging and discharge reduction use a slower controlled ramp.
         previous_battery = state["battery_power_mw"]
-        state["battery_power_mw"] = min(previous_battery + 0.8,
-                                         max(previous_battery - 0.8, battery_target))
+        ramp = (state["battery_discharge_ramp_mw_s"] if battery_target > previous_battery
+                else state["battery_charge_ramp_mw_s"])
+        state["battery_power_mw"] = min(previous_battery + ramp,
+                                         max(previous_battery - ramp, battery_target))
         if state["battery_power_mw"] > state["battery_energy_mwh"] * 3600.0:
             state["battery_power_mw"] = state["battery_energy_mwh"] * 3600.0
         charge_power = max(0.0, -state["battery_power_mw"])
-        grid_import = min(tie_cap, grid_for_load + charge_power)
+        # The utility interchange balances the realized battery output. The prior
+        # formula added battery charging but forgot to subtract lingering discharge,
+        # creating a false over-frequency surge after an island reconnects.
+        grid_import = min(tie_cap, max(0.0,
+            source_request - solar - state["diesel_mw"] - state["battery_power_mw"]))
         energy_change = 0.0 if sim_seconds == 0 else -state["battery_power_mw"] / 3600.0
         state["battery_energy_mwh"] = min(state["battery_capacity_mwh"], max(0.0,
             state["battery_energy_mwh"] + energy_change))
@@ -211,7 +232,7 @@ class MinePowerNetwork:
         state["grid_import_mw"] = grid_import
         state["total_generation_mw"] = grid_import + solar + state["diesel_mw"] + max(0.0, state["battery_power_mw"])
 
-        available = state["total_generation_mw"]
+        available = max(0.0, state["total_generation_mw"] - charge_power - estimated_network_losses)
         # Preserve 3 MW of essential mine services, then prioritize process water
         # and the concentrator before shedding the remaining 3 MW of site auxiliaries.
         served_critical_site = min(3.0, available)
@@ -228,6 +249,7 @@ class MinePowerNetwork:
         state["water_load_mw"] = served_water
         state["site_load_mw"] = served_site
         state["requested_load_mw"] = dispatch_request
+        state["source_requested_mw"] = source_request
         state["served_load_mw"] = served_site + served_water + served_process
         state["load_shed_mw"] = max(0.0, site_request - served_site)
         state["unserved_load_mw"] = max(0.0, dispatch_request - state["served_load_mw"] - charge_power)
@@ -237,19 +259,28 @@ class MinePowerNetwork:
                                           if water_request > 1e-6 else 1.0)
         state["power_deficit"] = state["unserved_load_mw"] > 0.05
 
-        # Aggregate swing response with primary damping; shed site auxiliaries first.
-        # Frequency responds to demand requested at the start of this tick. Process
-        # derating feeds back on the next tick, so a sudden deficit causes a real
-        # short transient before motor loads settle to the available supply.
-        net = state["total_generation_mw"] - max(0.0, dispatch_request - state["load_shed_mw"]) - charge_power
+        # Aggregate swing response with primary damping. Evaluate against the load
+        # connected at scan start so this tick's automatic shedding acts with a delay.
+        net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
+               - estimated_network_losses)
         if state["frequency_hz"] < 49.55 and state["load_shed_mw"] < 3.0:
             extra_shed = min(3.0 - state["load_shed_mw"], max(0.0, 1.5 - state["load_shed_mw"]))
             state["load_shed_mw"] += extra_shed
             state["site_load_mw"] = max(3.0, state["site_load_mw"] - extra_shed)
             state["served_load_mw"] = state["site_load_mw"] + served_water + served_process
-            net = state["total_generation_mw"] - max(0.0, dispatch_request - state["load_shed_mw"]) - charge_power
-        state["frequency_hz"] = min(51.0, max(47.0,
-            state["frequency_hz"] + 0.035 * net - 0.16 * (state["frequency_hz"] - 50.0)))
+            net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
+                   - estimated_network_losses)
+        previous_frequency = state["frequency_hz"]
+        state["frequency_hz"] += 0.035 * net - 0.16 * (state["frequency_hz"] - 50.0)
+        # A closed utility intertie is a stiff frequency reference. This compact
+        # model does not simulate phase matching, so a restored tie re-locks the
+        # mine bus to nominal instead of inventing an islanded frequency overshoot.
+        grid_coupling = 0.98 * min(1.0, tie_cap / 44.0)
+        state["frequency_hz"] += grid_coupling * (50.0 - state["frequency_hz"])
+        state["frequency_rocof_hz_s"] = state["frequency_hz"] - previous_frequency
+        state["frequency_nadir_hz"] = min(state.get("frequency_nadir_hz", 50.0), state["frequency_hz"])
+        state["frequency_window_nadir_hz"] = min(
+            state.get("frequency_window_nadir_hz", 50.0), state["frequency_hz"])
         source_voltage = min(1.08, max(0.78,
             1.0 - max(0.0, dispatch_request - state["total_generation_mw"]) * 0.012
             - state["load_shed_mw"] * 0.004))
@@ -281,12 +312,15 @@ class MinePowerNetwork:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "frequency_hz", "voltage_pu", "grid_import_mw", "solar_mw",
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
-                "load_shed_mw", "process_power_fraction", "water_power_fraction")}
+                "load_shed_mw", "process_power_fraction", "water_power_fraction",
+                "frequency_rocof_hz_s", "frequency_nadir_hz",
+                "frequency_window_nadir_hz", "distribution_losses_mw")}
                 | {f"{name}_{measurement}": transformer[name][field]
                    for name in ("mine_a", "mine_b")
                    for measurement, field in (("oil_c", "top_oil_c"),
                                               ("hotspot_c", "hotspot_c"))})
             state["history"] = state["history"][-1_440:]
+            state["frequency_window_nadir_hz"] = state["frequency_hz"]
 
     def telemetry(self, state: dict) -> list[dict]:
         """Publish simulated grid and mine electrical measurements as SCADA tags."""
@@ -309,7 +343,7 @@ class MinePowerNetwork:
                 "Transmission line B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "line_current": (grid * .48 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
                 "Grid substation A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "reactive_power": (grid * .18, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_a"]["cooling_stage"], "stage", 0, 2)},
                 "Grid substation B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "reactive_power": (grid * .16, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_b"]["cooling_stage"], "stage", 0, 2)},
-                "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * source_v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
+                "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * source_v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "frequency_rocof": (state["frequency_rocof_hz_s"], "Hz/s", -5, 5), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
             },
             "Grid distribution": {
                 "Feeder north": {"active_power": (state["distribution_feeders"]["north"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["north"]["voltage_pu"], "kV", 25, 40), "line_current": (state["distribution_feeders"]["north"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["north"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["process_power_fraction"] > .05), "bool", 0, 1)},
@@ -319,8 +353,8 @@ class MinePowerNetwork:
                 "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-state["capacitor_bank_mvar"], "MVAr", -10, 10), "line_voltage": (33 * source_v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
             },
             "Mine power network": {
-                "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_a"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
-                "Mine substation B": {"active_power": (mine * .46, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .17, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_b"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
+                "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * source_v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_a"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
+                "Mine substation B": {"active_power": (mine * .46, "MW", 0, 40), "line_voltage": (33 * source_v, "kV", 25, 40), "reactive_power": (mine * .17, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_b"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
                 "Pit distribution": {"active_power": (3.6 * state["water_power_fraction"], "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (110.0 * state["water_power_fraction"], "A", 0, 3000), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
                 "Underground feeders": {"active_power": (4.2, "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (125.0, "A", 0, 3000), "breaker_state": (1.0, "bool", 0, 1)},
                 "Emergency generation": {"active_power": (0.0, "MW", 0, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (0.0, "bool", 0, 1), "equipment_running": (0.0, "bool", 0, 1)},
