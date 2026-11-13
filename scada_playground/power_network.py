@@ -29,7 +29,11 @@ class MinePowerNetwork:
     NOMINAL_FREQUENCY_HZ = 50.0
     DIESEL_DROOP_MW_PER_HZ = 2.67
     BATTERY_DROOP_MW_PER_HZ = 2.4
+    FREQUENCY_SUBSTEPS_PER_SCAN = 10
+    FREQUENCY_SWING_GAIN_HZ_PER_MW_S = 0.035
+    FREQUENCY_DAMPING_PER_S = 0.16
     UFLS_STAGES = ((49.2, 0.10), (48.8, 0.10), (48.4, 0.15))
+    UFLS_PICKUP_DELAY_S = 0.2
     UFLS_RESTORE_FREQUENCY_HZ = 49.7
     UFLS_RESTORE_DELAY_S = 30
     DISTRIBUTION_FEEDERS = {
@@ -92,7 +96,9 @@ class MinePowerNetwork:
             "factory_utilities_power_fraction": 1.0,
             "factory_utilities_requested_mw": 0.0, "factory_utilities_load_mw": 0.0,
             "ufls_stage": 0, "ufls_restore_timer_s": 0,
-            "ufls_shed_mw": 0.0, "process_after_ufls_mw": 28.0,
+            "ufls_pickup_timer_s": 0.0,
+            "ufls_shed_mw": 0.0, "ufls_operated_this_scan_mw": 0.0,
+            "process_after_ufls_mw": 28.0,
             "unserved_load_mw": 0.0, "power_deficit": False,
             "history": [], "seed": 17,
         }
@@ -152,26 +158,39 @@ class MinePowerNetwork:
         thermal["hotspot_c"] += (target_hotspot - thermal["hotspot_c"]) * (1.0 - math.exp(-seconds / 300.0))
 
     @classmethod
-    def _advance_underfrequency_shedding(cls, state: dict, process_request_mw: float) -> None:
-        """Trip process load in frequency stages; restore one block after stable recovery."""
+    def _set_ufls_shed_state(cls, state: dict, process_request_mw: float) -> None:
+        """Calculate the requested process load and block total for the latched UFLS stage."""
         stage = max(0, min(len(cls.UFLS_STAGES), int(state.get("ufls_stage", 0))))
-        frequency = state["frequency_hz"]
-        if stage < len(cls.UFLS_STAGES) and frequency <= cls.UFLS_STAGES[stage][0]:
-            stage += 1
-            state["ufls_restore_timer_s"] = 0
-        elif stage > 0 and frequency >= cls.UFLS_RESTORE_FREQUENCY_HZ:
-            state["ufls_restore_timer_s"] += 1
-            if state["ufls_restore_timer_s"] >= cls.UFLS_RESTORE_DELAY_S:
-                stage -= 1
-                state["ufls_restore_timer_s"] = 0
-        else:
-            state["ufls_restore_timer_s"] = 0
-
+        state["ufls_stage"] = stage
         shed_fraction = sum(block_mw_fraction for _, block_mw_fraction
                             in cls.UFLS_STAGES[:stage])
-        state["ufls_stage"] = stage
         state["ufls_shed_mw"] = max(0.0, process_request_mw) * shed_fraction
         state["process_after_ufls_mw"] = max(0.0, process_request_mw - state["ufls_shed_mw"])
+
+    @classmethod
+    def _advance_ufls_relay(cls, state: dict, process_request_mw: float,
+                            interval_s: float) -> None:
+        """Integrate UFLS pickup/restoration timers at the frequency substep rate."""
+        stage = state["ufls_stage"]
+        frequency = state["frequency_hz"]
+        if stage < len(cls.UFLS_STAGES) and frequency <= cls.UFLS_STAGES[stage][0]:
+            state["ufls_pickup_timer_s"] = round(state["ufls_pickup_timer_s"] + interval_s, 6)
+            state["ufls_restore_timer_s"] = 0.0
+            if state["ufls_pickup_timer_s"] + 1e-9 >= cls.UFLS_PICKUP_DELAY_S:
+                stage += 1
+                state["ufls_pickup_timer_s"] = 0.0
+        elif stage > 0 and frequency >= cls.UFLS_RESTORE_FREQUENCY_HZ:
+            state["ufls_pickup_timer_s"] = 0.0
+            state["ufls_restore_timer_s"] = round(
+                state["ufls_restore_timer_s"] + interval_s, 6)
+            if state["ufls_restore_timer_s"] + 1e-9 >= cls.UFLS_RESTORE_DELAY_S:
+                stage -= 1
+                state["ufls_restore_timer_s"] = 0.0
+        else:
+            state["ufls_pickup_timer_s"] = 0.0
+            state["ufls_restore_timer_s"] = 0.0
+        state["ufls_stage"] = stage
+        cls._set_ufls_shed_state(state, process_request_mw)
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float,
@@ -195,11 +214,14 @@ class MinePowerNetwork:
         state["sim_seconds"], state["seed"] = sim_seconds, seed
         state.setdefault("ufls_stage", 0)
         state.setdefault("ufls_restore_timer_s", 0)
+        state.setdefault("ufls_pickup_timer_s", 0.0)
         state.setdefault("ufls_shed_mw", 0.0)
+        state.setdefault("ufls_operated_this_scan_mw", 0.0)
         state.setdefault("process_after_ufls_mw", max(0.0, process_load_mw))
-        self._advance_underfrequency_shedding(state, process_load_mw)
+        self._set_ufls_shed_state(state, process_load_mw)
         self._advance_feeder_protection(state, sim_seconds, events)
         connected_load_at_tick_start = state.get("served_load_mw", 34.5)
+        connected_process_at_tick_start = state.get("process_load_mw", process_load_mw)
         faults = [event for event in events if event["name"] == "Utility loss"]
         gen_faults = [event for event in events if event["name"] == "Mechanical degradation"]
 
@@ -378,32 +400,50 @@ class MinePowerNetwork:
             if utility_request > 1e-6 else 1.0)
         state["power_deficit"] = state["unserved_load_mw"] > 0.05
 
-        # Aggregate swing response with primary damping. Evaluate against the load
-        # connected at scan start so this tick's automatic shedding acts with a delay.
-        net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
-               - estimated_network_losses)
-        if state["frequency_hz"] < 49.55 and state["load_shed_mw"] < 3.0:
-            extra_shed = min(3.0 - state["load_shed_mw"], max(0.0, 1.5 - state["load_shed_mw"]))
-            state["load_shed_mw"] += extra_shed
-            state["site_load_mw"] = max(3.0, state["site_load_mw"] - extra_shed)
-            state["served_load_mw"] = (state["site_load_mw"] + served_water
-                                        + served_utility + served_process)
-            state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
-            net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
-                   - estimated_network_losses)
+        # Resolve frequency and relay action at 100 ms. The dispatch setpoints
+        # remain one-second controls, while UFLS contacts can trip between scans.
         previous_frequency = state["frequency_hz"]
-        state["frequency_hz"] += 0.035 * net - 0.16 * (
-            state["frequency_hz"] - self.NOMINAL_FREQUENCY_HZ)
-        # A closed utility intertie is a stiff frequency reference. This compact
-        # model does not simulate phase matching, so a restored tie re-locks the
-        # mine bus to nominal instead of inventing an islanded frequency overshoot.
         grid_coupling = 0.98 * min(1.0, tie_cap / 44.0)
-        state["frequency_hz"] += grid_coupling * (
-            self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
-        state["frequency_rocof_hz_s"] = state["frequency_hz"] - previous_frequency
-        state["frequency_nadir_hz"] = min(state.get("frequency_nadir_hz", 50.0), state["frequency_hz"])
-        state["frequency_window_nadir_hz"] = min(
-            state.get("frequency_window_nadir_hz", 50.0), state["frequency_hz"])
+        grid_coupling_rate = -math.log(max(1e-9, 1.0 - grid_coupling))
+        frequency_interval_s = 1.0 / self.FREQUENCY_SUBSTEPS_PER_SCAN
+        connected_load = connected_load_at_tick_start
+        connected_process = max(0.0, connected_process_at_tick_start)
+        ufls_disconnect_this_scan = 0.0
+        for _ in range(self.FREQUENCY_SUBSTEPS_PER_SCAN):
+            net = (state["total_generation_mw"] - connected_load - charge_power
+                   - estimated_network_losses)
+            swing_rate = (self.FREQUENCY_SWING_GAIN_HZ_PER_MW_S * net
+                          - self.FREQUENCY_DAMPING_PER_S
+                          * (state["frequency_hz"] - self.NOMINAL_FREQUENCY_HZ))
+            state["frequency_hz"] += frequency_interval_s * swing_rate
+            # An energized utility intertie is a stiff reference, represented as
+            # a continuous first-order coupling instead of an end-of-scan snap.
+            coupling = 1.0 - math.exp(-grid_coupling_rate * frequency_interval_s)
+            state["frequency_hz"] += coupling * (
+                self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+            previous_ufls_shed = state["ufls_shed_mw"]
+            self._advance_ufls_relay(state, process_request, frequency_interval_s)
+            shed_increment = max(0.0, state["ufls_shed_mw"] - previous_ufls_shed)
+            if shed_increment > 0.0:
+                disconnected = min(shed_increment, connected_process)
+                connected_process -= disconnected
+                connected_load -= disconnected
+                served_process = max(0.0, served_process - disconnected)
+                ufls_disconnect_this_scan += disconnected
+            state["frequency_nadir_hz"] = min(
+                state.get("frequency_nadir_hz", self.NOMINAL_FREQUENCY_HZ),
+                state["frequency_hz"])
+            state["frequency_window_nadir_hz"] = min(
+                state.get("frequency_window_nadir_hz", self.NOMINAL_FREQUENCY_HZ),
+                state["frequency_hz"])
+        state["frequency_rocof_hz_s"] = (state["frequency_hz"] - previous_frequency)
+        state["ufls_operated_this_scan_mw"] = ufls_disconnect_this_scan
+        state["process_load_mw"] = served_process
+        state["served_load_mw"] = served_site + served_water + served_utility + served_process
+        state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
+        state["process_power_fraction"] = (min(1.0, served_process / process_request)
+                                             if process_request > 1e-6 else 1.0)
+        state["power_deficit"] = state["unserved_load_mw"] > 0.05
         reactive_load_mvar = (
             served_process * math.tan(math.acos(0.88))
             + served_water * math.tan(math.acos(0.95))
@@ -504,6 +544,7 @@ class MinePowerNetwork:
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
                 "factory_utilities_load_mw", "factory_utilities_power_fraction",
                 "ufls_stage", "ufls_restore_timer_s", "ufls_shed_mw",
+                "ufls_operated_this_scan_mw",
                 "load_shed_mw", "process_power_fraction", "water_power_fraction",
                 "frequency_rocof_hz_s", "frequency_nadir_hz",
                 "frequency_window_nadir_hz", "distribution_losses_mw")}
@@ -545,6 +586,10 @@ class MinePowerNetwork:
                     "line_current": (state["distribution_incomer"]["current_a"], "A", 0, 10000),
                     "underfrequency_stage": (state["ufls_stage"], "stage", 0, len(self.UFLS_STAGES)),
                     "underfrequency_shed_power": (state["ufls_shed_mw"], "MW", 0, 20),
+                    "underfrequency_operated_this_scan": (
+                        state["ufls_operated_this_scan_mw"], "MW", 0, 20),
+                    "underfrequency_pickup_timer": (
+                        state["ufls_pickup_timer_s"], "s", 0, self.UFLS_PICKUP_DELAY_S),
                     "underfrequency_restore_timer": (state["ufls_restore_timer_s"], "s", 0,
                                                        self.UFLS_RESTORE_DELAY_S),
                     "breaker_state": (float(state["distribution_incomer"]["breaker_closed"]), "bool", 0, 1),

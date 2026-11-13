@@ -118,11 +118,13 @@ class MinePowerNetworkTests(unittest.TestCase):
             1.602, delta=0.02)
 
     def test_underfrequency_sheds_load_in_stages_and_restores_after_stability_delay(self):
-        for tick, frequency in ((1, 49.1), (2, 48.7), (3, 48.3)):
+        interval = 1 / self.model.FREQUENCY_SUBSTEPS_PER_SCAN
+        pickup_steps = round(self.model.UFLS_PICKUP_DELAY_S / interval)
+        for stage, frequency in ((1, 49.1), (2, 48.7), (3, 48.3)):
             self.state["frequency_hz"] = frequency
-            self.model.advance(self.state, tick, [], process_load_mw=28.0,
-                               water_load_mw=0.5, seed=17)
-            self.assertEqual(self.state["ufls_stage"], tick)
+            for _ in range(pickup_steps):
+                self.model._advance_ufls_relay(self.state, 28.0, interval)
+            self.assertEqual(self.state["ufls_stage"], stage)
 
         self.assertAlmostEqual(self.state["ufls_shed_mw"], 9.8)
         self.assertAlmostEqual(self.state["process_after_ufls_mw"], 18.2)
@@ -131,18 +133,33 @@ class MinePowerNetworkTests(unittest.TestCase):
             tags["grid_distribution.distribution_incomer.underfrequency_stage"]["value"],
             3.0, delta=0.02)
 
-        for tick in range(4, 3 + self.model.UFLS_RESTORE_DELAY_S):
+        restore_steps = round(self.model.UFLS_RESTORE_DELAY_S / interval)
+        for _ in range(restore_steps - 1):
             self.state["frequency_hz"] = 49.8
-            self.model.advance(self.state, tick, [], process_load_mw=28.0,
-                               water_load_mw=0.5, seed=17)
+            self.model._advance_ufls_relay(self.state, 28.0, interval)
         self.assertEqual(self.state["ufls_stage"], 3)
-        self.assertEqual(self.state["ufls_restore_timer_s"], self.model.UFLS_RESTORE_DELAY_S - 1)
+        self.assertAlmostEqual(self.state["ufls_restore_timer_s"],
+                               self.model.UFLS_RESTORE_DELAY_S - interval)
 
         self.state["frequency_hz"] = 49.8
-        self.model.advance(self.state, 3 + self.model.UFLS_RESTORE_DELAY_S, [],
-                           process_load_mw=28.0, water_load_mw=0.5, seed=17)
+        self.model._advance_ufls_relay(self.state, 28.0, interval)
         self.assertEqual(self.state["ufls_stage"], 2)
         self.assertEqual(self.state["ufls_restore_timer_s"], 0)
+
+    def test_island_frequency_resolves_within_scan_and_trips_ufls(self):
+        outage = {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}
+        self.model.advance(self.state, 1, [outage], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        first_scan_frequency = self.state["frequency_hz"]
+        self.assertLess(first_scan_frequency, 49.2)
+        self.assertEqual(self.state["ufls_stage"], 0)
+
+        self.model.advance(self.state, 2, [outage], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        self.assertEqual(self.state["ufls_stage"], 1)
+        self.assertGreater(self.state["ufls_operated_this_scan_mw"], 0.0)
+        self.assertGreater(self.state["frequency_hz"], first_scan_frequency)
+        self.assertLessEqual(self.state["frequency_nadir_hz"], first_scan_frequency)
 
     def test_old_power_snapshot_migrates_to_feeder_protection_state(self):
         for feeder in self.state["distribution_feeders"].values():
