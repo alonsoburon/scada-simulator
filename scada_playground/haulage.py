@@ -20,10 +20,17 @@ class HaulTruckFleet:
     ROM_RESUME_AT_T = 34_000.0
     QUEUE_CREEP_SPEED_KMH = 3.0
     SERVICE_POSITION_TOLERANCE_KM = 0.004
-    LOADED_UPHILL_SPEED_SENSITIVITY = 0.045
     DOWNHILL_BRAKING_SENSITIVITY = 0.065
-    LOADED_UPHILL_FUEL_LPH_PER_GRADE_PCT = 34.0
-    EMPTY_UPHILL_FUEL_LPH_PER_GRADE_PCT = 17.0
+    TRUCK_TARE_T = 188.0
+    ENGINE_RATED_POWER_KW = 2_200.0
+    DRIVETRAIN_EFFICIENCY = 0.36
+    HAUL_ROAD_ROLLING_RESISTANCE = 0.025
+    DIESEL_SPECIFIC_CONSUMPTION_L_KWH = 0.24
+    ACCESSORY_POWER_KW = 65.0
+    IDLE_FUEL_LPH = 95.0
+    SERVICE_BRAKE_POWER_SHARE = 0.18
+    BRAKE_SYSTEM_HEAT_CAPACITY_KJ_C = 3_000.0
+    BRAKE_COOLING_TIME_S = 900.0
     STATE_CODE = {"pit_queue": 1, "loading": 2, "travel_loaded": 3,
                   "tip_queue": 4, "dumping": 5, "travel_empty": 6}
 
@@ -51,10 +58,14 @@ class HaulTruckFleet:
             start, end = route[index], route[index + 1]
             distance = self.distance_km((start[1], start[2]), (end[1], end[2]))
             grade_pct = 100.0 * (end[3] - start[3]) / max(distance * 1_000.0, 1.0)
-            grade_factor = (1.0 / (1.0 + grade_pct * self.LOADED_UPHILL_SPEED_SENSITIVITY)
-                            if grade_pct >= 0 else
-                            1.0 / (1.0 + abs(grade_pct) * self.DOWNHILL_BRAKING_SENSITIVITY))
-            speed = loaded_speed * grade_factor
+            if grade_pct >= 0:
+                gross_mass_t = self.TRUCK_TARE_T + payload
+                resistance = self.HAUL_ROAD_ROLLING_RESISTANCE + grade_pct / 100.0
+                power_limited_speed = (self.ENGINE_RATED_POWER_KW * self.DRIVETRAIN_EFFICIENCY
+                                       / max(gross_mass_t * 9.81 * resistance, 1e-9) * 3.6)
+                speed = min(loaded_speed, power_limited_speed)
+            else:
+                speed = loaded_speed / (1.0 + abs(grade_pct) * self.DOWNHILL_BRAKING_SENSITIVITY)
             travel = max(10.0, distance / speed * 3600.0 * 1.5)
             cycle.append({"kind": "travel_loaded", "duration": travel, "from": start, "to": end,
                           "speed_limit_kmh": speed, "distance_km": distance,
@@ -66,12 +77,13 @@ class HaulTruckFleet:
             start, end = route[index], route[(index + 1) % len(route)]
             distance = self.distance_km((start[1], start[2]), (end[1], end[2]))
             grade_pct = 100.0 * (end[3] - start[3]) / max(distance * 1_000.0, 1.0)
-            empty_mass_factor = 0.55
-            grade_factor = (1.0 / (1.0 + grade_pct * self.LOADED_UPHILL_SPEED_SENSITIVITY
-                                   * empty_mass_factor) if grade_pct >= 0 else
-                            1.0 / (1.0 + abs(grade_pct) * self.DOWNHILL_BRAKING_SENSITIVITY
-                                   * empty_mass_factor))
-            speed = empty_speed * grade_factor
+            if grade_pct >= 0:
+                resistance = self.HAUL_ROAD_ROLLING_RESISTANCE + grade_pct / 100.0
+                power_limited_speed = (self.ENGINE_RATED_POWER_KW * self.DRIVETRAIN_EFFICIENCY
+                                       / max(self.TRUCK_TARE_T * 9.81 * resistance, 1e-9) * 3.6)
+                speed = min(empty_speed, power_limited_speed)
+            else:
+                speed = empty_speed / (1.0 + abs(grade_pct) * self.DOWNHILL_BRAKING_SENSITIVITY)
             travel = max(10.0, distance / speed * 3600.0 * 1.5)
             cycle.append({"kind": "travel_empty", "duration": travel, "from": start, "to": end,
                           "speed_limit_kmh": speed, "distance_km": distance,
@@ -100,12 +112,28 @@ class HaulTruckFleet:
     def _fuel_rate_lph(cls, frame: dict) -> float:
         speed = frame["speed_kmh"]
         if speed <= 2.0:
-            return 95.0
-        grade = max(0.0, frame.get("road_grade_pct", 0.0))
-        grade_factor = (cls.LOADED_UPHILL_FUEL_LPH_PER_GRADE_PCT
-                        if frame["cycle_state"] == "travel_loaded"
-                        else cls.EMPTY_UPHILL_FUEL_LPH_PER_GRADE_PCT)
-        return 370.0 + speed * 4.8 + grade * grade_factor
+            return cls.IDLE_FUEL_LPH
+        grade = frame.get("road_grade_pct", 0.0) / 100.0
+        gross_mass_t = cls.TRUCK_TARE_T + max(0.0, frame.get("payload_t", 0.0))
+        resistance = max(0.0, cls.HAUL_ROAD_ROLLING_RESISTANCE + grade)
+        wheel_power_kw = gross_mass_t * 9.81 * resistance * speed / 3.6
+        engine_power_kw = cls.ACCESSORY_POWER_KW + wheel_power_kw / cls.DRIVETRAIN_EFFICIENCY
+        return max(cls.IDLE_FUEL_LPH,
+                   engine_power_kw * cls.DIESEL_SPECIFIC_CONSUMPTION_L_KWH)
+
+    @classmethod
+    def _engine_load_pct(cls, frame: dict) -> float:
+        if frame.get("state", "").startswith("Refueling"):
+            return 0.0
+        speed = frame["speed_kmh"]
+        if speed <= 2.0:
+            return 100.0 * cls.ACCESSORY_POWER_KW / cls.ENGINE_RATED_POWER_KW
+        grade = frame.get("road_grade_pct", 0.0) / 100.0
+        gross_mass_t = cls.TRUCK_TARE_T + max(0.0, frame.get("payload_t", 0.0))
+        resistance = max(0.0, cls.HAUL_ROAD_ROLLING_RESISTANCE + grade)
+        wheel_power_kw = gross_mass_t * 9.81 * resistance * speed / 3.6
+        engine_power_kw = cls.ACCESSORY_POWER_KW + wheel_power_kw / cls.DRIVETRAIN_EFFICIENCY
+        return min(100.0, 100.0 * engine_power_kw / cls.ENGINE_RATED_POWER_KW)
 
     def _segment_at(self, unit: str, phase: float) -> tuple[dict, float]:
         cycle = self.cycles[unit]
@@ -386,10 +414,15 @@ class HaulTruckFleet:
                 truck["fuel_used_l"] += fuel_rate_lph / 3600.0
             speed = truck["frame"]["speed_kmh"]
             truck["tire_temperature_c"] += (58 + speed * .24 - truck["tire_temperature_c"]) / 300.0
-            if old_frame["cycle_state"] == "dumping" or truck["frame"]["cycle_state"] == "dumping":
-                truck["brake_temperature_c"] = min(260.0, truck["brake_temperature_c"] + .03)
-            else:
-                truck["brake_temperature_c"] += (65.0 - truck["brake_temperature_c"]) / 600.0
+            grade = truck["frame"].get("road_grade_pct", 0.0) / 100.0
+            gross_mass_t = self.TRUCK_TARE_T + truck["frame"].get("payload_t", 0.0)
+            braking_resistance = max(0.0, -(grade + self.HAUL_ROAD_ROLLING_RESISTANCE))
+            brake_power_kw = (gross_mass_t * 9.81 * braking_resistance * speed / 3.6
+                              * self.SERVICE_BRAKE_POWER_SHARE)
+            brake_heat_c = brake_power_kw / self.BRAKE_SYSTEM_HEAT_CAPACITY_KJ_C
+            cooled_temperature = (65.0 + (truck["brake_temperature_c"] - 65.0)
+                                  * math.exp(-1.0 / self.BRAKE_COOLING_TIME_S))
+            truck["brake_temperature_c"] = min(400.0, cooled_temperature + brake_heat_c)
 
         state["last_delivery_t"] = deliveries
         state["last_delivery_copper_t"] = delivery_copper_t
@@ -522,11 +555,9 @@ class HaulTruckFleet:
                                   if frame["payload_t"] > 1e-6 else 0.0, "% Cu", 0, 1.2),
                 "payload_target": (frame["payload_target_t"], "t", 0, 250),
                 "road_grade": (frame.get("road_grade_pct", 0.0), "%", -20, 20),
-                "engine_load": (min(100.0, 34.0 + frame["speed_kmh"] * 1.45
-                                     + frame["payload_t"] * .08
-                                     + max(0.0, frame.get("road_grade_pct", 0.0)) * 3.0), "%", 0, 100),
+                "engine_load": (self._engine_load_pct(frame), "%", 0, 100),
                 "fuel_rate": ((0.0 if frame["state"].startswith(("Standby", "Refueling")) else
-                               self._fuel_rate_lph(frame)), "L/h", 0, 700),
+                               self._fuel_rate_lph(frame)), "L/h", 0, 1_000),
                 "fuel_level": (max(0.0, 100.0 - truck["fuel_used_l"] / fuel_capacity * 100), "%", 0, 100),
                 "refuel_status": (float(truck["refuel_remaining_s"] > 0), "bool", 0, 1),
                 "refuels_completed": (truck["refuels_completed"], "count", 0, 100_000),

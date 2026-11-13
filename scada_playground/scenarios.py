@@ -62,7 +62,8 @@ SCENARIOS = {
         expected_observations=(
             "Haul trucks deliver finite payloads after loading and loaded trips; return trips carry no ore.",
             "A single shovel and crusher tip serve FIFO queues; watch queue length and per-truck wait tags as arrival bunching changes cycle time.",
-            "Waypoints have a fictional elevation profile: loaded climbs slow and burn more fuel, while empty return grades produce a different speed response.",
+            "Loaded uphill speed is capped by tractive power for the truck's gross mass and road grade; engine load and fuel use follow the same traction calculation.",
+            "Sustained descents add brake heat in proportion to absorbed gravitational power, then the brakes cool over time; compare loaded and empty returns.",
             "Dispatch holds against ROM plus payload already committed on loaded trucks, reducing stockpile overshoot while late trucks finish their trips.",
             "The crusher conveyor trip stops ROM discharge, so incoming truckloads raise the ROM stockpile while downstream buffers continue feeding the concentrator.",
             "During the long stoppage, ROM reaches the dispatch hold limit; trucks wait at the shovel while downstream buffers feed the plant.",
