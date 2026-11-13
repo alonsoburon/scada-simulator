@@ -28,6 +28,7 @@ class MinePowerNetwork:
     CAPACITOR_SWITCH_DELAY_S = 10
     NOMINAL_FREQUENCY_HZ = 50.0
     DIESEL_DROOP_MW_PER_HZ = 2.67
+    DIESEL_RAMP_MW_PER_S = 0.12
     BATTERY_DROOP_MW_PER_HZ = 2.4
     FREQUENCY_SUBSTEPS_PER_SCAN = 10
     FREQUENCY_SWING_GAIN_HZ_PER_MW_S = 0.035
@@ -76,10 +77,12 @@ class MinePowerNetwork:
             "process_feeder_capacity_mw": 32.0, "water_feeder_capacity_mw": 2.5,
             "solar_mw": 2.2, "diesel_mw": 0.0, "diesel_available_mw": 8.0,
             "diesel_start_timer_s": 0, "diesel_started": False,
-            "diesel_governor_bias_mw": 0.0,
+            "diesel_governor_bias_mw": 0.0, "diesel_dispatch_target_mw": 0.0,
             "battery_soc_pct": 82.0, "battery_energy_mwh": 16.4,
             "battery_capacity_mwh": 20.0, "battery_power_mw": 0.0,
             "battery_frequency_response_mw": 0.0,
+            "battery_dispatch_target_mw": 0.0,
+            "battery_scan_average_power_mw": 0.0,
             "battery_discharge_ramp_mw_s": 6.0, "battery_charge_ramp_mw_s": 1.5,
             "transformers": {
                 "grid_a": {"top_oil_c": 58.0, "hotspot_c": 73.0, "cooling_stage": 0},
@@ -200,7 +203,9 @@ class MinePowerNetwork:
         for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
                     "source_voltage_pu", "capacitor_bank_stage", "capacitor_bank_mvar",
                     "capacitor_control_timer_s",
-                    "diesel_governor_bias_mw", "battery_frequency_response_mw",
+                    "diesel_governor_bias_mw", "diesel_dispatch_target_mw",
+                    "battery_frequency_response_mw", "battery_dispatch_target_mw",
+                    "battery_scan_average_power_mw",
                     "distribution_feeders", "battery_discharge_ramp_mw_s",
                     "battery_charge_ramp_mw_s"):
             state.setdefault(key, initial_state[key])
@@ -319,14 +324,7 @@ class MinePowerNetwork:
             state["diesel_start_timer_s"] = max(0, state["diesel_start_timer_s"] - 2)
         diesel_base_target = (min(diesel_cap, residual_after_grid_and_solar)
                               if state["diesel_started"] else 0.0)
-        diesel_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
-                        * self.DIESEL_DROOP_MW_PER_HZ if state["diesel_started"] else 0.0)
-        diesel_target = min(diesel_cap, max(0.0, diesel_base_target + diesel_droop))
-        state["diesel_governor_bias_mw"] = diesel_target - diesel_base_target
-        state["diesel_mw"] += min(0.12, max(-0.12, diesel_target - state["diesel_mw"]))
-        if state["diesel_mw"] < 0.01 and state["diesel_start_timer_s"] == 0:
-            state["diesel_mw"] = 0.0
-            state["diesel_started"] = False
+        state["diesel_dispatch_target_mw"] = diesel_base_target
 
         grid_for_load = min(tie_cap, max(0.0, source_request - solar - state["diesel_mw"]))
         deficit = max(0.0, source_request - solar - state["diesel_mw"] - grid_for_load)
@@ -336,30 +334,12 @@ class MinePowerNetwork:
             charge_headroom = min(state["battery_charge_limit_mw"], tie_cap - grid_for_load,
                                   (state["battery_capacity_mwh"] - state["battery_energy_mwh"]) * 3600.0)
             battery_base_target = -max(0.0, charge_headroom)
-        battery_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
-                         * self.BATTERY_DROOP_MW_PER_HZ)
-        battery_target = min(state["battery_discharge_limit_mw"], max(
-            -state["battery_charge_limit_mw"], battery_base_target + battery_droop))
-        state["battery_frequency_response_mw"] = battery_target - battery_base_target
-        # The inverter responds quickly when increasing discharge to arrest a
-        # deficit; charging and discharge reduction use a slower controlled ramp.
-        previous_battery = state["battery_power_mw"]
-        ramp = (state["battery_discharge_ramp_mw_s"] if battery_target > previous_battery
-                else state["battery_charge_ramp_mw_s"])
-        state["battery_power_mw"] = min(previous_battery + ramp,
-                                         max(previous_battery - ramp, battery_target))
-        if state["battery_power_mw"] > state["battery_energy_mwh"] * 3600.0:
-            state["battery_power_mw"] = state["battery_energy_mwh"] * 3600.0
+        state["battery_dispatch_target_mw"] = battery_base_target
         charge_power = max(0.0, -state["battery_power_mw"])
-        # The utility interchange balances the realized battery output. The prior
-        # formula added battery charging but forgot to subtract lingering discharge,
-        # creating a false over-frequency surge after an island reconnects.
+        # The utility interchange balances actual, ramp-limited output, including
+        # charging as additional demand.
         grid_import = min(tie_cap, max(0.0,
             source_request - solar - state["diesel_mw"] - state["battery_power_mw"]))
-        energy_change = 0.0 if sim_seconds == 0 else -state["battery_power_mw"] / 3600.0
-        state["battery_energy_mwh"] = min(state["battery_capacity_mwh"], max(0.0,
-            state["battery_energy_mwh"] + energy_change))
-        state["battery_soc_pct"] = 100.0 * state["battery_energy_mwh"] / state["battery_capacity_mwh"]
         state["solar_mw"] = solar
         state["diesel_available_mw"] = diesel_cap
         state["grid_import_mw"] = grid_import
@@ -409,7 +389,58 @@ class MinePowerNetwork:
         connected_load = connected_load_at_tick_start
         connected_process = max(0.0, connected_process_at_tick_start)
         ufls_disconnect_this_scan = 0.0
+        battery_power_integral_mw_s = 0.0
         for _ in range(self.FREQUENCY_SUBSTEPS_PER_SCAN):
+            diesel_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+                            * self.DIESEL_DROOP_MW_PER_HZ if state["diesel_started"] else 0.0)
+            diesel_target = min(diesel_cap, max(0.0, diesel_base_target + diesel_droop))
+            state["diesel_governor_bias_mw"] = diesel_target - diesel_base_target
+            diesel_delta_limit = self.DIESEL_RAMP_MW_PER_S * frequency_interval_s
+            state["diesel_mw"] += min(diesel_delta_limit,
+                max(-diesel_delta_limit, diesel_target - state["diesel_mw"]))
+            if state["diesel_mw"] < 0.01 and state["diesel_start_timer_s"] == 0:
+                state["diesel_mw"] = 0.0
+                state["diesel_started"] = False
+
+            battery_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+                             * self.BATTERY_DROOP_MW_PER_HZ)
+            battery_target = min(state["battery_discharge_limit_mw"], max(
+                -state["battery_charge_limit_mw"],
+                state["battery_dispatch_target_mw"] + battery_droop))
+            state["battery_frequency_response_mw"] = (
+                battery_target - state["battery_dispatch_target_mw"])
+            previous_battery = state["battery_power_mw"]
+            battery_ramp = (state["battery_discharge_ramp_mw_s"]
+                            if battery_target > previous_battery
+                            else state["battery_charge_ramp_mw_s"])
+            battery_delta_limit = battery_ramp * frequency_interval_s
+            state["battery_power_mw"] += min(battery_delta_limit,
+                max(-battery_delta_limit, battery_target - previous_battery))
+            if sim_seconds > 0:
+                if state["battery_power_mw"] > 0.0:
+                    energy_limited_power = (state["battery_energy_mwh"] * 3600.0
+                                            / frequency_interval_s)
+                    state["battery_power_mw"] = min(state["battery_power_mw"],
+                                                     energy_limited_power)
+                elif state["battery_power_mw"] < 0.0:
+                    charge_room_power = ((state["battery_capacity_mwh"]
+                                          - state["battery_energy_mwh"]) * 3600.0
+                                         / frequency_interval_s)
+                    state["battery_power_mw"] = max(state["battery_power_mw"],
+                                                     -charge_room_power)
+                state["battery_energy_mwh"] = min(state["battery_capacity_mwh"], max(0.0,
+                    state["battery_energy_mwh"]
+                    - state["battery_power_mw"] * frequency_interval_s / 3600.0))
+            state["battery_soc_pct"] = (100.0 * state["battery_energy_mwh"]
+                                         / state["battery_capacity_mwh"])
+            battery_power_integral_mw_s += (state["battery_power_mw"]
+                                             * frequency_interval_s)
+            charge_power = max(0.0, -state["battery_power_mw"])
+            grid_import = min(tie_cap, max(0.0,
+                source_request - solar - state["diesel_mw"] - state["battery_power_mw"]))
+            state["grid_import_mw"] = grid_import
+            state["total_generation_mw"] = (grid_import + solar + state["diesel_mw"]
+                                             + max(0.0, state["battery_power_mw"]))
             net = (state["total_generation_mw"] - connected_load - charge_power
                    - estimated_network_losses)
             swing_rate = (self.FREQUENCY_SWING_GAIN_HZ_PER_MW_S * net
@@ -438,11 +469,40 @@ class MinePowerNetwork:
                 state["frequency_hz"])
         state["frequency_rocof_hz_s"] = (state["frequency_hz"] - previous_frequency)
         state["ufls_operated_this_scan_mw"] = ufls_disconnect_this_scan
+        state["battery_scan_average_power_mw"] = battery_power_integral_mw_s
+        # Publish the scan's load allocation against the source output reached
+        # by the end of the 100 ms source-control substeps. This keeps a source
+        # starting/ramping during the scan from appearing unavailable for the
+        # entire scan to downstream plant models.
+        available = max(0.0, state["total_generation_mw"]
+                        - max(0.0, -state["battery_power_mw"])
+                        - estimated_network_losses)
+        served_critical_site = min(3.0 * site_factor, available)
+        available = max(0.0, available - served_critical_site)
+        served_water = min(available_water_request, state["water_feeder_capacity_mw"], available)
+        available = max(0.0, available - served_water)
+        feeder_headroom = max(0.0, state["process_feeder_capacity_mw"])
+        served_utility = min(available_utility_request, feeder_headroom, available)
+        feeder_headroom -= served_utility
+        available = max(0.0, available - served_utility)
+        served_process = min(state["process_after_ufls_mw"] * process_factor,
+                             feeder_headroom, available)
+        available = max(0.0, available - served_process)
+        served_flexible_site = min(3.0 * site_factor, available)
+        served_site = served_critical_site + served_flexible_site
+        state["factory_utilities_load_mw"] = served_utility
+        state["water_load_mw"] = served_water
+        state["site_load_mw"] = served_site
+        state["load_shed_mw"] = max(0.0, site_request - served_site)
         state["process_load_mw"] = served_process
         state["served_load_mw"] = served_site + served_water + served_utility + served_process
         state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
         state["process_power_fraction"] = (min(1.0, served_process / process_request)
                                              if process_request > 1e-6 else 1.0)
+        state["water_power_fraction"] = (min(1.0, served_water / water_request)
+                                          if water_request > 1e-6 else 1.0)
+        state["factory_utilities_power_fraction"] = (min(1.0, served_utility / utility_request)
+            if utility_request > 1e-6 else 1.0)
         state["power_deficit"] = state["unserved_load_mw"] > 0.05
         reactive_load_mvar = (
             served_process * math.tan(math.acos(0.88))
@@ -545,6 +605,7 @@ class MinePowerNetwork:
                 "factory_utilities_load_mw", "factory_utilities_power_fraction",
                 "ufls_stage", "ufls_restore_timer_s", "ufls_shed_mw",
                 "ufls_operated_this_scan_mw",
+                "battery_scan_average_power_mw",
                 "load_shed_mw", "process_power_fraction", "water_power_fraction",
                 "frequency_rocof_hz_s", "frequency_nadir_hz",
                 "frequency_window_nadir_hz", "distribution_losses_mw")}
@@ -568,7 +629,7 @@ class MinePowerNetwork:
                 "Turbine generator 01": {"active_power": (diesel * .6, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .6, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (62 + diesel * 1.7, "°C", 0, 150)},
                 "Turbine generator 02": {"active_power": (diesel * .4, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .4, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (58 + diesel * 1.5, "°C", 0, 150)},
                 "Solar farm": {"active_power": (state["solar_mw"], "MW", 0, 5), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["solar_mw"] > .1), "bool", 0, 1), "power_quality_thd": (2.2, "%", 0, 20)},
-                "Battery storage": {"active_power": (state["battery_power_mw"], "MW", -4, 6), "frequency_response": (state["battery_frequency_response_mw"], "MW", -6, 6), "state_of_charge": (state["battery_soc_pct"], "%", 0, 100), "breaker_state": (1.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53)},
+                "Battery storage": {"active_power": (state["battery_power_mw"], "MW", -4, 6), "scan_average_power": (state["battery_scan_average_power_mw"], "MW", -4, 6), "frequency_response": (state["battery_frequency_response_mw"], "MW", -6, 6), "state_of_charge": (state["battery_soc_pct"], "%", 0, 100), "breaker_state": (1.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53)},
                 "Black start unit": {"active_power": (0.0, "MW", 0, 3), "breaker_state": (0.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "equipment_running": (0.0, "bool", 0, 1)},
             },
             "Grid transmission": {
