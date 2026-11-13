@@ -25,6 +25,7 @@ class ChilledWaterPlant:
     COOLING_TOWER_DESIGN_HEAT_REJECTION_KW = 1_650.0
     COOLING_TOWER_MIN_APPROACH_K = 2.0
     COOLING_TOWER_MAX_APPROACH_K = 20.0
+    COOLING_TOWER_THERMAL_TIME_CONSTANT_S = 120.0
     CHILLER_CONDENSER_APPROACH_K = 4.0
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
@@ -49,6 +50,11 @@ class ChilledWaterPlant:
                                      + self.CHILLER_CONDENSER_APPROACH_K)
             initial_cop = self._cop_from_temperatures(evaporating, condenser_saturation)
         initial_compressor_power_mw = 878.0 / initial_cop / 1_000.0
+        initial_chilled_flow_m3h = 180.0
+        initial_transport_capacity_kw = (initial_chilled_flow_m3h
+            * self.WATER_HEAT_CAPACITY_KWH_PER_M3_K * self.CHILLED_WATER_DESIGN_DELTA_T_K)
+        initial_hydraulic_derate = min(1.0, initial_transport_capacity_kw
+            / sum(self.CHILLER_CAPACITY_KW.values()))
         return {
             "sim_seconds": 0,
             "ambient_temperature_c": ambient,
@@ -61,8 +67,9 @@ class ChilledWaterPlant:
             "condenser_water_flow_m3h": self.CONDENSER_WATER_DESIGN_FLOW_M3H,
             "condenser_water_leaving_temperature_c": (
                 condenser_saturation - self.CHILLER_CONDENSER_APPROACH_K),
-            "chillers": {name: {"capacity_kw": capacity, "output_kw": capacity * 0.68,
-                                "available_fraction": 1.0, "available_capacity_kw": capacity,
+            "chillers": {name: {"capacity_kw": capacity, "output_kw": 439.0,
+                                "available_fraction": 1.0,
+                                "available_capacity_kw": capacity * initial_hydraulic_derate,
                                 "running": True, "vibration_mm_s": 1.8}
                          for name, capacity in self.CHILLER_CAPACITY_KW.items()},
             "cooling_demand_kw": 878.0,
@@ -73,15 +80,16 @@ class ChilledWaterPlant:
             "storage_capacity_mwh": self.STORAGE_CAPACITY_MWH,
             "storage_charge_kw": 0.0,
             "storage_discharge_kw": 0.0,
-            "storage_discharge_capacity_kw": 0.0,
+            "storage_discharge_capacity_kw": max(0.0, initial_transport_capacity_kw - 878.0),
             "supply_temperature_c": 6.0,
             "return_temperature_c": 11.0,
             "condenser_entering_temperature_c": condenser_entering,
             "cop": initial_cop,
             "pump_flow_m3h": 180.0,
             "pump_available_fraction": 1.0,
-            "electric_load_mw": 0.24,
+            "electric_load_mw": initial_compressor_power_mw + 0.085 + 0.12 + 0.035,
             "compressor_starts": 0,
+            "last_advance_seconds": 0,
             "history": [],
         }
 
@@ -169,6 +177,7 @@ class ChilledWaterPlant:
                 seed: int = 17) -> None:
         """Advance one second of chiller, pump, cooling-load, and buffer behavior."""
         previous_output = {name: unit["output_kw"] for name, unit in state["chillers"].items()}
+        elapsed_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
         state["sim_seconds"] = sim_seconds
         day_phase = 2.0 * math.pi * (sim_seconds % 86_400) / 86_400.0
         ambient = 25.0 + 5.0 * math.sin(day_phase)
@@ -203,8 +212,13 @@ class ChilledWaterPlant:
         state["condenser_pump_available_fraction"] = condenser_pump_fraction
         condenser_flow = self.CONDENSER_WATER_DESIGN_FLOW_M3H * condenser_pump_fraction
         state["condenser_water_flow_m3h"] = condenser_flow
-        tower_approach = self._tower_approach_k(
+        target_tower_approach = self._tower_approach_k(
             state.get("condenser_heat_rejection_kw", 0.0), tower_factor)
+        tower_alpha = 1.0 - math.exp(-elapsed_s / self.COOLING_TOWER_THERMAL_TIME_CONSTANT_S)
+        tower_approach = (state.get("cooling_tower_approach_c", target_tower_approach)
+                          + (target_tower_approach
+                             - state.get("cooling_tower_approach_c", target_tower_approach))
+                          * tower_alpha)
         state["cooling_tower_approach_c"] = tower_approach
         condenser_temp = wet_bulb + tower_approach
         state["condenser_entering_temperature_c"] = condenser_temp
@@ -264,7 +278,7 @@ class ChilledWaterPlant:
             remaining_target = max(0.0, remaining_target - target)
 
         production = sum(unit["output_kw"] for unit in state["chillers"].values())
-        dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
+        dt_s = elapsed_s
         deficit_kw = max(0.0, demand - production)
         available_store_kw = (state["storage_mwh"] * 3_600_000.0 / dt_s if dt_s > 0 else 0.0)
         storage_discharge_capacity_kw = max(0.0, hydraulic_capacity_kw - production)
