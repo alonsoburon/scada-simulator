@@ -812,7 +812,8 @@ class MinePowerNetwork:
             feeder["relay_pickup"] = multiple > 1.0 and feeder["breaker_closed"] and incomer["breaker_closed"]
             trip_s = cls.PRIMARY_RELAY_TMS * 0.14 / (multiple ** 0.02 - 1.0) if multiple > 1.0 else 0.0
             feeder["relay_time_to_trip_s"] = trip_s
-            if fault and feeder["breaker_closed"] and incomer["breaker_closed"] and not feeder["lockout"]:
+            if (fault and multiple > 1.0 and feeder["breaker_closed"]
+                    and incomer["breaker_closed"] and not feeder["lockout"]):
                 feeder["relay_timer_s"] += 1
                 if feeder["relay_timer_s"] >= max(1, math.ceil(trip_s)):
                     if not feeder["relay_operated"]:
@@ -835,6 +836,8 @@ class MinePowerNetwork:
                 feeder["relay_operated"] = False
             else:
                 feeder["relay_timer_s"] = 0.0
+                if not feeder["breaker_failure_count"] or not feeder["relay_pickup"]:
+                    feeder["relay_operated"] = False
             feeder["relay_pickup"] = multiple > 1.0 and feeder["breaker_closed"] and incomer["breaker_closed"]
             if fault and feeder["breaker_closed"] and incomer["breaker_closed"]:
                 incomer_fault_current_a += fault_current * spec["nominal_kv"] / 33.0
