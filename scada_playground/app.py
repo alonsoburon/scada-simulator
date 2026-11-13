@@ -8,6 +8,8 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import pandas as pd
 import plotly.express as px
@@ -377,6 +379,16 @@ def publish_snapshot() -> dict:
     return payload
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def live_map_available() -> bool:
+    """Detect whether the separate protocol gateway is serving the live map."""
+    try:
+        with urlopen("http://127.0.0.1:8502/map", timeout=0.3) as response:
+            return response.status == 200
+    except (OSError, URLError):
+        return False
+
+
 def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
     params = step.parameters
     if step.action == "incident":
@@ -734,8 +746,11 @@ with st.sidebar:
                 PROTOCOL_FAULTS.clear(sim)
 
 st.subheader("Live fleet map")
-st.link_button("Open live fleet map", "http://127.0.0.1:8502/map", type="primary")
-st.caption("The dedicated map uses WebSockets. It stays in its own page while the dashboard updates.")
+if live_map_available():
+    st.link_button("Open live fleet map", "http://127.0.0.1:8502/map", type="primary")
+    st.caption("The dedicated map uses WebSockets. It stays in its own page while the dashboard updates.")
+else:
+    st.info("The live map and protocol endpoints are not running. Start the full playground with `./start_playground.sh`.")
 
 @st.fragment(run_every="1s")
 def render_dashboard():
@@ -931,7 +946,7 @@ def render_dashboard():
                               for name, item in control["equipment"].items()]
             st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
             st.caption("Permissive: " + control["permissive_reason"])
-        st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener inventory {plant['tailings_thickener_inventory_t']:.0f} t · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
+        st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener {plant['tailings_thickener_inventory_t']:.0f} t solids + {plant['tailings_thickener_water_inventory_m3']:.0f} m³ water · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
         st.caption(f"Concentrate thickener {plant['concentrate_thickener_inventory_t']:.1f}/{plant['concentrate_thickener_capacity_t']:.0f} t · filter press {plant['filter_press_phase'].lower()} ({plant['filter_press_batch_t']:.2f}/{plant['filter_press_batch_capacity_t']:.1f} t batch) · cake stockpile {plant['concentrate_cake_inventory_t']:.1f}/{plant['concentrate_cake_capacity_t']:.0f} t · concentrate shipped {plant['cumulative_concentrate_shipped_t']:.1f} t")
         flow_stages = [
             ("ROM feed", plant["rom_feed_tph"], "#277da1"),
@@ -975,6 +990,12 @@ def render_dashboard():
                     color_discrete_sequence=["#277da1", "#e07a5f", "#f2a541", "#43aa8b", "#9b5de5", "#d1495b"])
                 trend.update_layout(uirevision="concentrator-inventory-trend")
                 st.plotly_chart(trend, width="stretch")
+                water_trend = px.line(history, x="time", y="tailings_thickener_water_inventory_m3",
+                    labels={"time": "Simulated seconds", "tailings_thickener_water_inventory_m3": "Water held (m³)"},
+                    color_discrete_sequence=["#277da1"])
+                water_trend.update_layout(height=260, uirevision="tailings-thickener-water-trend",
+                                          yaxis={"range": [0, plant["tailings_thickener_water_capacity_m3"]]})
+                st.plotly_chart(water_trend, width="stretch")
         else:
             st.info("Start or single-step the factory to build concentrator trends.")
         st.markdown("**Fault drills:** inject Conveyor jam in Crushing and screening and watch ore buffers absorb the interruption before milling slows. Inject Mechanical degradation in Grinding and flotation to compare vibration, power, circulating load, P80, and recovery. Inject Utility loss in Mine power network to observe power-limited throughput and the coupled water shortfall response.")
@@ -1091,6 +1112,22 @@ def render_dashboard():
                     color_discrete_sequence=["#277da1", "#f2a541", "#e07a5f", "#9b5de5"])
                 trend.update_layout(uirevision="power-dispatch-trend")
                 st.plotly_chart(trend, width="stretch")
+            thermal = go.Figure()
+            for name, label, color in (
+                ("mine_a", "Substation A oil", "#277da1"),
+                ("mine_a", "Substation A winding hot spot", "#43aa8b"),
+                ("mine_b", "Substation B oil", "#f2a541"),
+                ("mine_b", "Substation B winding hot spot", "#d1495b"),
+            ):
+                suffix = "oil_c" if label.endswith("oil") else "hotspot_c"
+                thermal.add_trace(go.Scatter(x=history["sim_seconds"], y=history[f"{name}_{suffix}"],
+                    mode="lines", name=label, line={"color": color}))
+            thermal.add_hline(y=110, line_dash="dash", line_color="#6c757d",
+                              annotation_text="Thermal derating begins")
+            thermal.update_layout(height=300, title="Transformer thermal response",
+                xaxis_title="Simulated seconds", yaxis_title="Temperature (°C)",
+                uirevision="transformer-thermal-trend")
+            st.plotly_chart(thermal, width="stretch")
         else:
             st.info("Start the factory or run the grid disturbance scenario to build dispatch trends.")
         st.markdown("**Fault drills:** run `mine-grid-support-and-recovery`; compare battery response with diesel start delay, watch import limits and process curtailment, then observe source and process recovery when the event expires.")

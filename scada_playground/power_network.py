@@ -28,6 +28,12 @@ class MinePowerNetwork:
             "diesel_start_timer_s": 0, "diesel_started": False,
             "battery_soc_pct": 82.0, "battery_energy_mwh": 16.4,
             "battery_capacity_mwh": 20.0, "battery_power_mw": 0.0,
+            "transformers": {
+                "grid_a": {"top_oil_c": 58.0, "hotspot_c": 73.0, "cooling_stage": 0},
+                "grid_b": {"top_oil_c": 56.0, "hotspot_c": 70.0, "cooling_stage": 0},
+                "mine_a": {"top_oil_c": 64.0, "hotspot_c": 80.0, "cooling_stage": 0},
+                "mine_b": {"top_oil_c": 56.0, "hotspot_c": 70.0, "cooling_stage": 0},
+            },
             "battery_discharge_limit_mw": 6.0, "battery_charge_limit_mw": 3.0,
             "grid_import_mw": 0.0, "total_generation_mw": 0.0,
             "site_load_mw": 6.0, "water_load_mw": 0.5,
@@ -38,9 +44,36 @@ class MinePowerNetwork:
             "history": [], "seed": 17,
         }
 
+    @staticmethod
+    def _advance_transformer(thermal: dict, load_mva: float, rating_mva: float,
+                             seconds: int, ambient_c: float = 25.0) -> None:
+        """Advance a two-mass top-oil/hot-spot model with staged cooling."""
+        load_pu = max(0.0, load_mva / max(rating_mva, 1e-6))
+        if thermal["cooling_stage"] == 0:
+            if thermal["top_oil_c"] >= 72.0:
+                thermal["cooling_stage"] = 1
+        elif thermal["cooling_stage"] == 1:
+            if thermal["top_oil_c"] >= 82.0:
+                thermal["cooling_stage"] = 2
+            elif thermal["top_oil_c"] <= 68.0:
+                thermal["cooling_stage"] = 0
+        elif thermal["top_oil_c"] <= 78.0:
+            thermal["cooling_stage"] = 1
+
+        cooling = (1.0, 1.12, 1.24)[thermal["cooling_stage"]]
+        oil_rise = 55.0 * load_pu**1.6 / cooling
+        target_oil = ambient_c + oil_rise
+        # Top oil responds over hours; winding hot spot responds within minutes.
+        thermal["top_oil_c"] += (target_oil - thermal["top_oil_c"]) * (1.0 - math.exp(-seconds / 14_400.0))
+        winding_rise = 25.0 * load_pu**2.0
+        target_hotspot = thermal["top_oil_c"] + winding_rise
+        thermal["hotspot_c"] += (target_hotspot - thermal["hotspot_c"]) * (1.0 - math.exp(-seconds / 300.0))
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float, seed: int = 17) -> None:
         """Dispatch sources and allocate power to site, water, and process loads."""
+        for name, initial in self.initialize()["transformers"].items():
+            state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
         faults = [event for event in events if event["name"] == "Utility loss"]
         gen_faults = [event for event in events if event["name"] == "Mechanical degradation"]
@@ -83,7 +116,19 @@ class MinePowerNetwork:
         site_request = 6.0
         dispatch_request = (site_request + min(water_request, state["water_feeder_capacity_mw"])
                             + min(process_request, state["process_feeder_capacity_mw"]))
-        tie_cap = min(state["tie_capacity_mw"], state["mine_transformer_capacity_mw"])
+        mine_thermal = state["transformers"]
+        mine_a_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["mine_a"]["hotspot_c"] - 110.0) / 30.0))
+        mine_b_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["mine_b"]["hotspot_c"] - 110.0) / 30.0))
+        mine_transformer_limit = min(24.0 * 0.95 * mine_a_factor / 0.54,
+                                     24.0 * 0.95 * mine_b_factor / 0.46)
+        state["mine_transformer_capacity_mw"] = min(state["mine_transformer_capacity_mw"],
+                                                      mine_transformer_limit)
+        grid_a_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["grid_a"]["hotspot_c"] - 110.0) / 30.0))
+        grid_b_factor = max(0.0, min(1.0, 1.0 - max(0.0, mine_thermal["grid_b"]["hotspot_c"] - 110.0) / 30.0))
+        grid_transformer_limit = min(30.0 * 0.95 * grid_a_factor / 0.52,
+                                     30.0 * 0.95 * grid_b_factor / 0.48)
+        tie_cap = min(state["tie_capacity_mw"], state["mine_transformer_capacity_mw"],
+                      grid_transformer_limit)
 
         residual_after_grid_and_solar = max(0.0, dispatch_request - tie_cap - solar)
         if residual_after_grid_and_solar > 0.8 and diesel_cap > 0:
@@ -166,11 +211,28 @@ class MinePowerNetwork:
             1.0 - max(0.0, dispatch_request - state["total_generation_mw"]) * 0.012
             - state["load_shed_mw"] * 0.004))
         state["power_deficit"] = state["power_deficit"] or state["frequency_hz"] < 49.5
+
+        # Winding temperature responds faster than oil temperature. The thermal
+        # state carries across scans, so sustained loading can trigger cooling
+        # stages and eventually reduce the transformer transfer limit.
+        transformer = state["transformers"]
+        mine_a_mw = state["process_load_mw"] * 0.54 + state["water_load_mw"] * 0.54 + state["site_load_mw"] * 0.54
+        mine_b_mw = state["process_load_mw"] * 0.46 + state["water_load_mw"] * 0.46 + state["site_load_mw"] * 0.46
+        grid_a_mw = state["grid_import_mw"] * 0.52
+        grid_b_mw = state["grid_import_mw"] * 0.48
+        self._advance_transformer(transformer["mine_a"], mine_a_mw * 1.02, 24.0, 1)
+        self._advance_transformer(transformer["mine_b"], mine_b_mw * 1.02, 24.0, 1)
+        self._advance_transformer(transformer["grid_a"], grid_a_mw * 1.02, 30.0, 1)
+        self._advance_transformer(transformer["grid_b"], grid_b_mw * 1.02, 30.0, 1)
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "frequency_hz", "voltage_pu", "grid_import_mw", "solar_mw",
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
-                "load_shed_mw", "process_power_fraction", "water_power_fraction")})
+                "load_shed_mw", "process_power_fraction", "water_power_fraction")}
+                | {f"{name}_{measurement}": thermal[name][field]
+                   for name in ("mine_a", "mine_b")
+                   for measurement, field in (("oil_c", "top_oil_c"),
+                                              ("hotspot_c", "hotspot_c"))})
             state["history"] = state["history"][-1_440:]
 
     def telemetry(self, state: dict) -> list[dict]:
@@ -191,8 +253,8 @@ class MinePowerNetwork:
             "Grid transmission": {
                 "Transmission line A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "line_current": (grid * .52 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 23), "bool", 0, 1)},
                 "Transmission line B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "line_current": (grid * .48 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
-                "Grid substation A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .18, "MVAr", -200, 200), "transformer_oil_temp": (55 + grid * .24, "°C", 0, 150)},
-                "Grid substation B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .16, "MVAr", -200, 200), "transformer_oil_temp": (53 + grid * .22, "°C", 0, 150)},
+                "Grid substation A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .18, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_a"]["cooling_stage"], "stage", 0, 2)},
+                "Grid substation B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .16, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_b"]["cooling_stage"], "stage", 0, 2)},
                 "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
             },
             "Grid distribution": {
@@ -203,8 +265,8 @@ class MinePowerNetwork:
                 "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-3.5 if v < .96 else -1.2, "MVAr", -10, 10), "line_voltage": (33 * v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
             },
             "Mine power network": {
-                "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (56 + mine * .35, "°C", 0, 150), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
-                "Mine substation B": {"active_power": (mine * .46, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .17, "MVAr", -200, 200), "transformer_oil_temp": (54 + mine * .32, "°C", 0, 150), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
+                "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_a"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
+                "Mine substation B": {"active_power": (mine * .46, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .17, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_b"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
                 "Pit distribution": {"active_power": (3.6 * state["water_power_fraction"], "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (110.0 * state["water_power_fraction"], "A", 0, 3000), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
                 "Underground feeders": {"active_power": (4.2, "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (125.0, "A", 0, 3000), "breaker_state": (1.0, "bool", 0, 1)},
                 "Emergency generation": {"active_power": (0.0, "MW", 0, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (0.0, "bool", 0, 1), "equipment_running": (0.0, "bool", 0, 1)},

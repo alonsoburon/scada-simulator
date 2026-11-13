@@ -38,6 +38,16 @@ class CopperConcentrator:
             "crushed_stockpile_t": 3_200.0,
             "sag_bin_t": 410.0, "tailings_thickener_inventory_t": 1_100.0,
             "tailings_thickener_capacity_t": 3_000.0,
+            "tailings_thickener_water_capacity_m3": 3_000.0,
+            "tailings_thickener_water_inventory_m3": 1_100.0 * (32.0 / 68.0),
+            "tailings_thickener_overflow_capacity_m3h": 600.0,
+            "tailings_thickener_overflow_water_m3h": 364.0,
+            "tailings_underflow_water_m3h": 399.5,
+            "tailings_thickener_spill_m3": 0.0,
+            "cumulative_tailings_water_feed_m3": 0.0,
+            "cumulative_tailings_underflow_water_m3": 0.0,
+            "cumulative_tailings_overflow_water_m3": 0.0,
+            "cumulative_tailings_water_spill_m3": 0.0,
             "concentrate_thickener_inventory_t": 28.0,
             "concentrate_thickener_capacity_t": 120.0,
             "filter_press_phase": "FILLING", "filter_press_cycle_s": 0,
@@ -54,13 +64,13 @@ class CopperConcentrator:
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
             "concentrate_grade_pct": 25.0, "p80_microns": 150.0,
             "ore_hardness_kwh_t": 17.0, "ore_hardness_factor": 1.0,
-            "water_makeup_m3h": 452.0, "gross_process_water_m3h": 783.0,
-            "concentrator_reclaim_m3h": 331.0, "tailings_reclaim_water_m3h": 326.0,
+            "water_makeup_m3h": 443.0, "gross_process_water_m3h": 783.0,
+            "concentrator_reclaim_m3h": 340.0, "tailings_reclaim_water_m3h": 335.0,
             "concentrate_thickener_overflow_m3h": 5.0, "filter_press_filtrate_m3h": 0.0,
             "filter_press_batch_filtrate_inventory_m3": 0.0,
             "tailings_water_feed_m3h": 765.0, "tailings_underflow_solids_pct": 68.0,
             "concentrate_water_feed_m3h": 18.0, "water_specific_m3_t": 0.90,
-            "water_model_revision": 2,
+            "water_model_revision": 3,
             "water_available_fraction": 1.0, "water_recovery_pct": 42.0,
             "fresh_water_shortage_m3h": 0.0,
             "sag_power_mw": 15.0, "ball_power_mw": 8.7, "crusher_power_mw": 2.2,
@@ -102,8 +112,15 @@ class CopperConcentrator:
                     "filter_press_filtrate_m3h", "filter_press_batch_filtrate_inventory_m3",
                     "concentrate_thickener_overflow_m3h", "tailings_water_feed_m3h",
                     "tailings_underflow_solids_pct", "concentrate_water_feed_m3h",
-                    "water_model_revision")
-        if all(key in state for key in keys) and state.get("water_model_revision", 0) >= 2:
+                    "water_model_revision", "tailings_thickener_water_capacity_m3",
+                    "tailings_thickener_water_inventory_m3", "tailings_thickener_overflow_capacity_m3h",
+                    "tailings_thickener_overflow_water_m3h", "tailings_underflow_water_m3h",
+                    "tailings_thickener_spill_m3", "cumulative_tailings_water_feed_m3",
+                    "cumulative_tailings_underflow_water_m3", "cumulative_tailings_overflow_water_m3",
+                    "cumulative_tailings_water_spill_m3")
+        for sample in state.get("history", []):
+            sample.setdefault("tailings_thickener_water_inventory_m3", 0.0)
+        if all(key in state for key in keys) and state.get("water_model_revision", 0) >= 3:
             return
         previous_water_revision = state.get("water_model_revision", 0)
         defaults = self.initialize()
@@ -138,7 +155,10 @@ class CopperConcentrator:
                          water_makeup_m3h=max(0.0, gross - recovered),
                          water_recovery_pct=(100.0 * recovered / gross if gross > 1e-9 else 0.0),
                          water_model_revision=2)
-
+        if previous_water_revision < 3:
+            state["tailings_thickener_water_inventory_m3"] = (
+                state["tailings_thickener_inventory_t"] * 32.0 / 68.0)
+            state["water_model_revision"] = 3
     @staticmethod
     def _severity(events: list[dict], name: str, areas: tuple[str, ...]) -> float:
         factors = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
@@ -205,6 +225,11 @@ class CopperConcentrator:
             tailings_backpressure = min(1.0, max(0.0,
                 (0.94 * tailings_capacity_t - state["tailings_thickener_inventory_t"])
                 / max(0.14 * tailings_capacity_t, 1.0)))
+            water_capacity = state["tailings_thickener_water_capacity_m3"]
+            water_backpressure = min(1.0, max(0.0,
+                (0.94 * water_capacity - state["tailings_thickener_water_inventory_m3"])
+                / max(0.14 * water_capacity, 1.0)))
+            tailings_backpressure = min(tailings_backpressure, water_backpressure)
         concentrate_capacity_t = state["concentrate_thickener_capacity_t"]
         concentrate_sink_ready = (equipment_available.get("concentrate_thickener", True)
                                   and equipment_available.get("filter_press", True))
@@ -388,10 +413,32 @@ class CopperConcentrator:
         tailings_water_feed = gross_process_water * tails_fraction
         concentrate_water_feed = gross_process_water - tailings_water_feed
         tailings_underflow_solids = min(70.0, max(55.0, 68.0 - upset * 10.0))
-        tails_underflow_water = tailings * (100.0 - tailings_underflow_solids) / tailings_underflow_solids
-        tailings_overflow_water = max(0.0, tailings_water_feed - tails_underflow_water)
+        underflow_water_ratio = (100.0 - tailings_underflow_solids) / tailings_underflow_solids
+        tailings_underflow_water = tailings_pumped * underflow_water_ratio
+        water_inventory_before_overflow = max(0.0,
+            state["tailings_thickener_water_inventory_m3"]
+            + (tailings_water_feed - tailings_underflow_water) * dt_h)
+        target_water_hold_m3 = state["tailings_thickener_inventory_t"] * underflow_water_ratio
+        excess_water_m3 = max(0.0, water_inventory_before_overflow - target_water_hold_m3)
+        thickener_online = equipment_available.get("tailings_thickener", True)
+        overflow_capacity_m3 = (state["tailings_thickener_overflow_capacity_m3h"] * dt_h
+                                if thickener_online else 0.0)
+        tailings_overflow_m3 = min(excess_water_m3, overflow_capacity_m3)
+        water_after_overflow_m3 = water_inventory_before_overflow - tailings_overflow_m3
+        water_spill_m3 = max(0.0, water_after_overflow_m3
+                             - state["tailings_thickener_water_capacity_m3"])
+        state["tailings_thickener_water_inventory_m3"] = min(
+            state["tailings_thickener_water_capacity_m3"], max(0.0, water_after_overflow_m3))
+        tailings_overflow_water = tailings_overflow_m3 / dt_h
         tailings_return = (tailings_overflow_water * max(0.0, 0.92 - upset * 0.24)
-                           if equipment_available.get("tailings_thickener", True) else 0.0)
+                           if thickener_online else 0.0)
+        state["tailings_thickener_overflow_water_m3h"] = tailings_overflow_water
+        state["tailings_underflow_water_m3h"] = tailings_underflow_water
+        state["tailings_thickener_spill_m3"] = water_spill_m3
+        state["cumulative_tailings_water_feed_m3"] += tailings_water_feed * dt_h
+        state["cumulative_tailings_underflow_water_m3"] += tailings_underflow_water * dt_h
+        state["cumulative_tailings_overflow_water_m3"] += tailings_overflow_m3
+        state["cumulative_tailings_water_spill_m3"] += water_spill_m3
         concentrate_underflow_water = concentrate * (1.0 / 0.60 - 1.0)
         concentrate_overflow = max(0.0, concentrate_water_feed - concentrate_underflow_water)
         concentrate_thickener_return = (concentrate_overflow * 0.92
@@ -444,6 +491,7 @@ class CopperConcentrator:
                 "plant_feed_tph": state["plant_feed_tph"],
                 "copper_recovery_pct": state["copper_recovery_pct"], "p80_microns": state["p80_microns"],
                 "tailings_thickener_inventory_t": state["tailings_thickener_inventory_t"],
+                "tailings_thickener_water_inventory_m3": state["tailings_thickener_water_inventory_m3"],
                 "concentrate_thickener_inventory_t": state["concentrate_thickener_inventory_t"],
                 "concentrate_cake_inventory_t": state["concentrate_cake_inventory_t"],
                 "water_makeup_m3h": state["water_makeup_m3h"],
@@ -520,6 +568,13 @@ class CopperConcentrator:
                 "Tailings thickener": {"feed_rate": (state["tailings_thickener_feed_tph"], "t/h", 0, 2_000),
                     "tank_level": (state["tailings_thickener_inventory_t"]
                                    / state["tailings_thickener_capacity_t"] * 100, "%", 0, 100),
+                    "water_inventory": (state["tailings_thickener_water_inventory_m3"], "m³", 0,
+                                        state["tailings_thickener_water_capacity_m3"]),
+                    "water_level": (state["tailings_thickener_water_inventory_m3"]
+                                    / state["tailings_thickener_water_capacity_m3"] * 100, "%", 0, 100),
+                    "overflow_flow": (state["tailings_thickener_overflow_water_m3h"], "m³/h", 0, 800),
+                    "underflow_water": (state["tailings_underflow_water_m3h"], "m³/h", 0, 800),
+                    "water_spill": (state["tailings_thickener_spill_m3"], "m³", 0, 20),
                     "underflow_rate": (state["tailings_tph"], "t/h", 0, 2_000),
                     "equipment_running": (state["tailings_thickener_motor_running"], "bool", 0, 1)},
                 "Tailings pump station A": {"ore_rate": (state["tailings_tph"], "t/h", 0, 2_000),

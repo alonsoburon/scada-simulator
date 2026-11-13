@@ -70,6 +70,32 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertGreater(state["water_recovery_pct"], 35)
         self.assertLess(state["water_recovery_pct"], 65)
 
+    def test_tailings_thickener_liquid_inventory_conserves_water(self):
+        initial_water = self.state["tailings_thickener_water_inventory_m3"]
+        self.advance(1_800)
+        accounted_water = (initial_water + self.state["cumulative_tailings_water_feed_m3"]
+                           - self.state["cumulative_tailings_underflow_water_m3"]
+                           - self.state["cumulative_tailings_overflow_water_m3"]
+                           - self.state["cumulative_tailings_water_spill_m3"])
+        self.assertAlmostEqual(self.state["tailings_thickener_water_inventory_m3"],
+                               accounted_water, places=6)
+
+    def test_thickener_outage_holds_water_then_flushes_overflow_on_restart(self):
+        self.advance(600)
+        normal_return = self.state["tailings_reclaim_water_m3h"]
+        initial_water = self.state["tailings_thickener_water_inventory_m3"]
+        unavailable = {name: True for name in (
+            "crusher", "conveyors", "sag_mill", "ball_mill", "flotation", "tailings_pump",
+            "tailings_thickener", "concentrate_thickener", "filter_press")}
+        unavailable["tailings_thickener"] = False
+        for tick in range(601, 1_501):
+            self.model.advance(self.state, tick, [], equipment_available=unavailable)
+        self.assertEqual(self.state["tailings_reclaim_water_m3h"], 0.0)
+        self.assertGreater(self.state["tailings_thickener_water_inventory_m3"], initial_water)
+        self.model.advance(self.state, 1_501, [])
+        self.assertGreater(self.state["tailings_reclaim_water_m3h"], normal_return * 1.5)
+        self.assertGreater(self.state["tailings_thickener_overflow_water_m3h"], normal_return)
+
     def test_legacy_state_recalculates_water_metrics_for_new_model_revision(self):
         legacy = self.model.initialize()
         legacy["water_model_revision"] = 1
@@ -77,7 +103,7 @@ class CopperConcentratorTests(unittest.TestCase):
                       concentrator_reclaim_m3h=193.0, water_makeup_m3h=68.0,
                       water_recovery_pct=74.0)
         self.model.migrate(legacy)
-        self.assertEqual(legacy["water_model_revision"], 2)
+        self.assertEqual(legacy["water_model_revision"], 3)
         self.assertAlmostEqual(legacy["water_specific_m3_t"], 0.90)
         self.assertAlmostEqual(legacy["gross_process_water_m3h"],
                                legacy["plant_feed_tph"] * 0.90)
@@ -120,6 +146,8 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertIn("grinding_and_flotation.sag_mill.motor_power", ids)
         self.assertNotIn("mine_power_network.concentrator_substation.active_power", ids)
         self.assertIn("water_supply_network.concentrator_process.water_demand", ids)
+        self.assertIn("tailings_and_reclaim.tailings_thickener.water_inventory", ids)
+        self.assertIn("tailings_and_reclaim.tailings_thickener.overflow_flow", ids)
         self.assertIn("open-pit_mining.pit_sector_a.rom_stockpile", ids)
 
     def test_same_seed_produces_replayable_process_samples(self):
