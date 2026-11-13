@@ -161,13 +161,30 @@ class UndergroundVentilation:
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
         rows = []
-        rng_base = seed * 1_000_003 + state["sim_seconds"] * 9_176
+        telemetry_noise = state.setdefault("telemetry_noise", {})
+        tick = int(state["sim_seconds"])
+        alpha = math.exp(-1.0 / 3.0)  # Three-second transmitter noise correlation.
+
+        def measurement_noise(tag_name: str, standard_deviation: float) -> float:
+            entry = telemetry_noise.setdefault(tag_name, {"tick": tick - 1, "noise": 0.0})
+            if entry["tick"] == tick:
+                return float(entry["noise"])
+            if entry["tick"] > tick:
+                entry.update(tick=tick - 1, noise=0.0)
+            stable_id = sum((i + 1) * ord(char) for i, char in enumerate(tag_name))
+            noise = float(entry["noise"])
+            for sample_tick in range(int(entry["tick"]) + 1, tick + 1):
+                rng = random.Random(seed * 1_000_003 + sample_tick * 9_176 + stable_id)
+                white = rng.gauss(0.0, standard_deviation)
+                noise = alpha * noise + math.sqrt(1.0 - alpha * alpha) * white
+            entry.update(tick=tick, noise=noise)
+            return noise
+
         def add(asset: str, signal: str, value: float, units: str, low: float, high: float,
                 noise_pct: float = 0.0):
             tag_name = f"underground_mining.{asset.lower().replace(' ', '_')}.{signal}"
-            stable_id = sum((i + 1) * ord(char) for i, char in enumerate(tag_name))
-            rng = random.Random(rng_base + stable_id)
-            noisy = value + rng.gauss(0.0, (high - low) * noise_pct) if noise_pct else value
+            noise = measurement_noise(tag_name, (high - low) * noise_pct) if noise_pct else 0.0
+            noisy = value + noise
             rows.append({"tag": tag_name, "area": self.AREA, "unit": asset,
                          "sensor": signal, "units": units, "value": round(min(high, max(low, noisy)), 4),
                          "quality": "GOOD", "low": low, "high": high,
@@ -196,5 +213,6 @@ class UndergroundVentilation:
 
     @staticmethod
     def public_state(state: dict) -> dict:
-        return {key: value for key, value in state.items() if key != "history"} | {
+        return {key: value for key, value in state.items()
+                if key not in {"history", "telemetry_noise"}} | {
             "history": state["history"][-600:]}
