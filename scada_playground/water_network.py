@@ -43,18 +43,22 @@ class MineWaterNetwork:
         "Intake pump": {"shutoff_head_m": 175.0, "rated_flow_m3h": 760.0,
                         "motor_efficiency": 0.91, "hydraulic_efficiency": 0.76,
                         "ramp_pct_per_s": 0.35, "coastdown_time_constant_s": 9.0,
+                        "check_valve_closure_time_s": 1.2, "check_valve_cracking_head_m": 0.4,
                         "controlled_node": "raw_tank", "setpoint_pct": 55.0},
         "Process feed pump": {"shutoff_head_m": 120.0, "rated_flow_m3h": 760.0,
                               "motor_efficiency": 0.92, "hydraulic_efficiency": 0.78,
                               "ramp_pct_per_s": 0.50, "coastdown_time_constant_s": 6.0,
+                              "check_valve_closure_time_s": 0.7, "check_valve_cracking_head_m": 0.4,
                               "controlled_node": "process_tank", "setpoint_pct": 60.0},
         "Reclaim pump": {"shutoff_head_m": 190.0, "rated_flow_m3h": 440.0,
                          "motor_efficiency": 0.90, "hydraulic_efficiency": 0.73,
                          "ramp_pct_per_s": 0.30, "coastdown_time_constant_s": 10.0,
+                         "check_valve_closure_time_s": 1.0, "check_valve_cracking_head_m": 0.4,
                          "controlled_node": "treated_tank", "setpoint_pct": 68.0},
         "Concentrator reclaim pump": {"shutoff_head_m": 95.0, "rated_flow_m3h": 360.0,
                                       "motor_efficiency": 0.91, "hydraulic_efficiency": 0.74,
                                       "ramp_pct_per_s": 0.45, "coastdown_time_constant_s": 5.0,
+                                      "check_valve_closure_time_s": 0.6, "check_valve_cracking_head_m": 0.4,
                                       "controlled_node": "concentrator_reclaim_sump",
                                       "setpoint_pct": 45.0},
     }
@@ -117,7 +121,11 @@ class MineWaterNetwork:
                                                       "Concentrator reclaim valve")},
                 "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True,
                                  "surge_pressure_kpa": 0.0, "surge_peak_kpa": 0.0,
-                                 "minimum_surge_pressure_kpa": 0.0, "previous_velocity_m_s": 0.0}
+                                 "minimum_surge_pressure_kpa": 0.0, "previous_velocity_m_s": 0.0,
+                                 "transport_direction": 1, "check_valve_state":
+                                     "OPEN" if self.LINKS[key]["pump"] else "NOT_INSTALLED",
+                                 "check_valve_close_elapsed_s": 0.0,
+                                 "check_valve_closure_count": 0, "reverse_flow_m3h": 0.0}
                           for key in self.LINKS},
                 "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
                 "factory_cip_demand_m3h": 0.0, "factory_cip_effluent_m3h": 0.0,
@@ -182,6 +190,8 @@ class MineWaterNetwork:
                 state.setdefault(key, value)
         for name, pump in state["pumps"].items():
             pump.setdefault("coastdown_time_constant_s", self.PUMPS[name]["coastdown_time_constant_s"])
+            pump.setdefault("check_valve_closure_time_s", self.PUMPS[name]["check_valve_closure_time_s"])
+            pump.setdefault("check_valve_cracking_head_m", self.PUMPS[name]["check_valve_cracking_head_m"])
         for key in self.LINKS:
             link = state["links"][key]
             if "previous_velocity_m_s" not in link:
@@ -192,6 +202,11 @@ class MineWaterNetwork:
             link.setdefault("surge_pressure_kpa", 0.0)
             link.setdefault("surge_peak_kpa", 0.0)
             link.setdefault("minimum_surge_pressure_kpa", 0.0)
+            link.setdefault("transport_direction", 1)
+            link.setdefault("check_valve_state", "OPEN" if self.LINKS[key]["pump"] else "NOT_INSTALLED")
+            link.setdefault("check_valve_close_elapsed_s", 0.0)
+            link.setdefault("check_valve_closure_count", 0)
+            link.setdefault("reverse_flow_m3h", 0.0)
             link.setdefault("previous_velocity_m_s", 0.0)
             link.setdefault("pressure_rating_kpa", self.PIPE_RATING_KPA)
         if "treatment" not in state:
@@ -252,6 +267,7 @@ class MineWaterNetwork:
         opening_pct = state["valves"][spec["valve"]]
         if opening_pct <= 0:
             return 0.0, 0.0
+        link_state = state["links"][key]
         if spec["pump"]:
             pump = state["pumps"][spec["pump"]]
             pump["pump_head_m"] = 0.0
@@ -273,13 +289,11 @@ class MineWaterNetwork:
                                if key == "reclaim_transfer" else 0.0)
         filter_head_loss_m = filter_pressure_kpa / 9.80665
         head_at_zero = pump_head_at_zero + static_head - destination_head - filter_head_loss_m
-        if head_at_zero <= 0:
-            return 0.0, 0.0
 
         valve_k = spec["valve_loss_k"] / max((opening_pct / 100.0) ** 2, 1e-6)
         area = math.pi * spec["diameter_m"] ** 2 / 4.0
 
-        def losses(flow_m3s: float) -> float:
+        def losses(flow_m3s: float, reverse: bool = False) -> float:
             if flow_m3s <= 1e-12:
                 return 0.0
             velocity = flow_m3s / area
@@ -289,19 +303,24 @@ class MineWaterNetwork:
             else:
                 relative_roughness = spec["roughness_m"] / (3.7 * spec["diameter_m"])
                 friction = 0.25 / math.log10(relative_roughness + 5.74 / reynolds**0.9) ** 2
-            coefficient = friction * spec["length_m"] / spec["diameter_m"] + spec["minor_loss_k"] + valve_k
+            check_loss = 6.0 if reverse and spec["pump"] else 0.0
+            coefficient = (friction * spec["length_m"] / spec["diameter_m"]
+                           + spec["minor_loss_k"] + valve_k + check_loss)
             return coefficient * velocity**2 / (2.0 * 9.80665)
 
-        def residual(flow_m3s: float) -> float:
-            pump_head = pump_head_at_zero - pump_curve_slope * flow_m3s**2
-            return head_at_zero + pump_head - pump_head_at_zero - losses(flow_m3s)
+        def solve_flow(available_head_m: float, reverse: bool = False) -> float:
+            if available_head_m <= 1e-9:
+                return 0.0
+            upper = spec["max_flow_m3h"] / 3600.0
+            if speed and spec["pump"] and not reverse:
+                upper = min(upper, self.PUMPS[spec["pump"]]["rated_flow_m3h"] / 3600.0 * speed)
 
-        upper = spec["max_flow_m3h"] / 3600.0
-        if speed and spec["pump"]:
-            upper = min(upper, self.PUMPS[spec["pump"]]["rated_flow_m3h"] / 3600.0 * speed)
-        if residual(upper) >= 0:
-            flow_m3s = upper
-        else:
+            def residual(flow_m3s: float) -> float:
+                pump_curve_loss = pump_curve_slope * flow_m3s**2 if spec["pump"] and not reverse else 0.0
+                return available_head_m - pump_curve_loss - losses(flow_m3s, reverse)
+
+            if residual(upper) >= 0:
+                return upper
             low, high = 0.0, upper
             for _ in range(28):
                 midpoint = (low + high) / 2.0
@@ -309,12 +328,49 @@ class MineWaterNetwork:
                     low = midpoint
                 else:
                     high = midpoint
-            flow_m3s = (low + high) / 2.0
-        flow_m3h = flow_m3s * 3600.0
-        pressure_drop_kpa = losses(flow_m3s) * 9.80665 + filter_pressure_kpa
+            return (low + high) / 2.0
+
         if spec["pump"]:
-            pump_head = pump_head_at_zero - pump_curve_slope * flow_m3s**2
-            state["pumps"][spec["pump"]]["pump_head_m"] = max(0.0, pump_head)
+            pump = state["pumps"][spec["pump"]]
+            cracking_head = pump["check_valve_cracking_head_m"]
+            if head_at_zero > cracking_head and opening_pct > 0:
+                link_state["check_valve_state"] = "OPEN"
+                link_state["check_valve_close_elapsed_s"] = 0.0
+                link_state["reverse_flow_m3h"] = 0.0
+                flow_m3s = solve_flow(head_at_zero)
+            else:
+                if link_state["check_valve_state"] == "OPEN":
+                    link_state["check_valve_state"] = "CLOSING"
+                    link_state["check_valve_close_elapsed_s"] = 0.0
+                    link_state["check_valve_closure_count"] += 1
+                if link_state["check_valve_state"] == "CLOSING":
+                    close_time = max(0.05, pump["check_valve_closure_time_s"])
+                    elapsed = link_state["check_valve_close_elapsed_s"]
+                    end = min(close_time, elapsed + 1.0)
+                    # Integrate the linearly closing disc's open fraction over this scan.
+                    open_fraction = max(0.0, (end - elapsed)
+                        - (end**2 - elapsed**2) / (2.0 * close_time))
+                    reverse_head = max(0.0, -head_at_zero)
+                    reverse_flow = solve_flow(reverse_head, reverse=True) * 3600.0
+                    flow_m3s = -(reverse_flow * open_fraction / 3600.0)
+                    link_state["reverse_flow_m3h"] = reverse_flow * open_fraction
+                    link_state["check_valve_close_elapsed_s"] = end
+                    if end >= close_time:
+                        link_state["check_valve_state"] = "CLOSED"
+                else:
+                    flow_m3s = 0.0
+                    link_state["reverse_flow_m3h"] = 0.0
+        else:
+            link_state["reverse_flow_m3h"] = 0.0
+            flow_m3s = (solve_flow(head_at_zero) if head_at_zero > 0
+                        else -solve_flow(-head_at_zero, reverse=True))
+
+        flow_m3h = flow_m3s * 3600.0
+        pressure_drop_kpa = losses(abs(flow_m3s), reverse=flow_m3s < 0) * 9.80665 + filter_pressure_kpa
+        if spec["pump"]:
+            if flow_m3s > 0:
+                pump_head = pump_head_at_zero - pump_curve_slope * flow_m3s**2
+                state["pumps"][spec["pump"]]["pump_head_m"] = max(0.0, pump_head)
         return flow_m3h, pressure_drop_kpa
 
     def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17,
@@ -395,11 +451,57 @@ class MineWaterNetwork:
         inlet = {}
         outlet = {}
 
-        def transfer(key: str, available_m3: float = float("inf")) -> None:
+        def transfer(key: str, available_m3: float = float("inf"),
+                     reverse_available_m3: float = float("inf")) -> None:
             link = state["links"][key]
-            incoming = min(requested[key], max(0.0, available_m3) * 3600.0)
+            spec = self.LINKS[key]
+            queue = link["transport_queue"]
+            if spec["pump"] and requested[key] < 0:
+                # The check-valve pulse draws only from the source-side pipe pack.
+                # The main plug-flow packets keep travelling toward the receiving
+                # tank, which is what happens downstream of a pump discharge valve.
+                remaining_m3 = abs(requested[key]) / 3600.0
+                backflow_m3 = 0.0
+                while remaining_m3 > 1e-12 and queue:
+                    take = min(remaining_m3, queue[-1])
+                    queue[-1] -= take
+                    remaining_m3 -= take
+                    backflow_m3 += take
+                    if queue[-1] <= 1e-12:
+                        queue.pop()
+                inlet[key] = -backflow_m3 * 3600.0
+                outlet[key] = queue.popleft() * 3600.0 if queue else 0.0
+                link.update(inlet_flow_m3h=inlet[key], outlet_flow_m3h=outlet[key],
+                            flow_m3h=outlet[key], pressure_kpa=pressure[key],
+                            available=backflow_m3 > 1e-9 or outlet[key] > 0.1,
+                            reverse_flow_m3h=-inlet[key])
+            elif spec["pump"]:
+                incoming = min(max(0.0, requested[key]), max(0.0, available_m3) * 3600.0)
+                queue.append(incoming / 3600.0)
+                delivered = queue.popleft() * 3600.0
+                inlet[key], outlet[key] = incoming, delivered
+                link.update(inlet_flow_m3h=incoming, outlet_flow_m3h=delivered,
+                            flow_m3h=delivered, pressure_kpa=pressure[key],
+                            available=incoming > 0.1, reverse_flow_m3h=0.0)
+            else:
+                direction = (-1 if requested[key] < 0 else 1) if abs(requested[key]) > 1e-9 else link.get("transport_direction", 1)
+                source_available = reverse_available_m3 if direction < 0 else available_m3
+                incoming_magnitude = min(abs(requested[key]), max(0.0, source_available) * 3600.0)
+                if incoming_magnitude > 1e-9 and direction != link.get("transport_direction", 1):
+                    queue.reverse()
+                    link["transport_direction"] = direction
+                queue.append(incoming_magnitude / 3600.0)
+                delivered_magnitude = queue.popleft() * 3600.0
+                if direction > 0:
+                    inlet[key], outlet[key] = incoming_magnitude, delivered_magnitude
+                else:
+                    inlet[key], outlet[key] = -delivered_magnitude, -incoming_magnitude
+                link.update(inlet_flow_m3h=inlet[key], outlet_flow_m3h=outlet[key],
+                            flow_m3h=outlet[key], pressure_kpa=pressure[key],
+                            available=incoming_magnitude > 0.1,
+                            reverse_flow_m3h=max(0.0, -inlet[key]))
             area = math.pi * self.LINKS[key]["diameter_m"] ** 2 / 4.0
-            velocity = incoming / 3600.0 / area
+            velocity = inlet[key] / 3600.0 / area
             # Joukowsky gives the pressure step for a rapid velocity change.
             # At the one-second simulator scan, acoustic reflections are represented
             # by a damped wave with a length-dependent round-trip time.
@@ -413,19 +515,14 @@ class MineWaterNetwork:
             link["minimum_surge_pressure_kpa"] = min(
                 link.get("minimum_surge_pressure_kpa", 0.0), surge)
             link["previous_velocity_m_s"] = velocity
-            link["transport_queue"].append(incoming / 3600.0)
-            delivered = link["transport_queue"].popleft() * 3600.0
-            inlet[key], outlet[key] = incoming, delivered
-            link.update(inlet_flow_m3h=incoming, outlet_flow_m3h=delivered,
-                        flow_m3h=delivered, pressure_kpa=pressure[key], available=incoming > 0.1)
 
-        transfer("raw_transfer", volumes["north_reservoir"])
+        transfer("raw_transfer", volumes["north_reservoir"], volumes["raw_tank"])
         raw_available = volumes["raw_tank"] + outlet["raw_transfer"] / 3600.0
-        transfer("process_feed", raw_available)
+        transfer("process_feed", raw_available, volumes["process_tank"])
         reclaim_sump_available = volumes["concentrator_reclaim_sump"] + state["concentrator_reclaim_m3h"] / 3600.0
         requested["concentrator_reclaim"] = min(requested["concentrator_reclaim"],
                                                  reclaim_sump_available * 3600.0)
-        transfer("concentrator_reclaim", reclaim_sump_available)
+        transfer("concentrator_reclaim", reclaim_sump_available, volumes["process_tank"])
         process_available_m3 = volumes["process_tank"] + outlet["process_feed"] / 3600.0
         served = min(state["demand_m3h"], process_available_m3 * 3600.0)
         state["unmet_demand_m3h"] = state["demand_m3h"] - served
@@ -451,9 +548,9 @@ class MineWaterNetwork:
         return_request = min(requested["reclaim_return"],
                              circulating_served * state["water_recovery_pct"] / 100.0)
         requested["reclaim_return"] = return_request
-        transfer("reclaim_return", process_available_m3)
+        transfer("reclaim_return", process_available_m3, volumes["reclaim_pond"])
         reclaim_available = volumes["reclaim_pond"] + outlet["reclaim_return"] / 3600.0
-        transfer("reclaim_transfer", reclaim_available)
+        transfer("reclaim_transfer", reclaim_available, volumes["treated_tank"])
         treatment_link = state["links"]["reclaim_transfer"]
         quality_queue = treatment_link["quality_transport_queue"]
         quality_queue.append({"turbidity_ntu": state["treatment"]["effluent_turbidity_ntu"],
@@ -500,7 +597,7 @@ class MineWaterNetwork:
         for link_key, link in self.LINKS.items():
             net_m3h[link["from"]] -= inlet[link_key]
             net_m3h[link["to"]] += outlet[link_key]
-        process_withdrawal = max(0.0, served - inlet["reclaim_return"])
+        process_withdrawal = max(0.0, served - max(0.0, inlet["reclaim_return"]))
         # Count the CIP return as an internal transfer for the site-wide balance,
         # while still drawing the full served demand from the process tank.
         process_consumption = max(0.0, process_withdrawal - actual_cip_effluent)
@@ -509,12 +606,16 @@ class MineWaterNetwork:
         net_m3h["reclaim_pond"] += state["wastewater"]["reuse_flow_m3h"]
         spilled = 0.0
         for key, node in state["nodes"].items():
-            node["inflow_m3h"] = sum(outlet[link_key] for link_key, link in self.LINKS.items()
+            node["inflow_m3h"] = sum(max(0.0, outlet[link_key]) for link_key, link in self.LINKS.items()
                                       if link["to"] == key)
+            node["inflow_m3h"] += sum(max(0.0, -inlet[link_key]) for link_key, link in self.LINKS.items()
+                                       if link["from"] == key)
             if key == "reclaim_pond":
                 node["inflow_m3h"] += state["wastewater"]["reuse_flow_m3h"]
-            node["outflow_m3h"] = sum(inlet[link_key] for link_key, link in self.LINKS.items()
+            node["outflow_m3h"] = sum(max(0.0, inlet[link_key]) for link_key, link in self.LINKS.items()
                                        if link["from"] == key)
+            node["outflow_m3h"] += sum(max(0.0, -outlet[link_key]) for link_key, link in self.LINKS.items()
+                                        if link["to"] == key)
             if key == "process_tank":
                 node["outflow_m3h"] += process_withdrawal
             elif key == "treated_tank":
@@ -613,8 +714,19 @@ class MineWaterNetwork:
         for key, link in self.LINKS.items():
             reading = state["links"][key]
             area = math.pi * link["diameter_m"]**2 / 4
-            add(key, "flow_rate", reading["inlet_flow_m3h"], "m³/h", 0, link["max_flow_m3h"], 0.01)
-            add(key, "arrival_flow_rate", reading["outlet_flow_m3h"], "m³/h", 0, link["max_flow_m3h"], 0.01)
+            add(key, "flow_rate", reading["inlet_flow_m3h"], "m³/h",
+                -link["max_flow_m3h"], link["max_flow_m3h"], 0.01)
+            add(key, "arrival_flow_rate", reading["outlet_flow_m3h"], "m³/h",
+                -link["max_flow_m3h"], link["max_flow_m3h"], 0.01)
+            add(key, "flow_direction", float(reading["inlet_flow_m3h"] > 0)
+                - float(reading["inlet_flow_m3h"] < 0), "enum", -1, 1)
+            add(key, "check_valve_open", float(reading["check_valve_state"] in {"OPEN", "CLOSING"}),
+                "bool", 0, 1)
+            add(key, "check_valve_closing", float(reading["check_valve_state"] == "CLOSING"),
+                "bool", 0, 1)
+            add(key, "check_valve_reverse_flow", reading["reverse_flow_m3h"], "m³/h",
+                0, link["max_flow_m3h"], 0.01)
+            add(key, "check_valve_closure_count", reading["check_valve_closure_count"], "count", 0, 10_000)
             add(key, "pressure_drop", reading["pressure_kpa"], "kPa", 0, 1200, 0.008)
             steady_discharge = (state["pumps"][link["pump"]]["pump_head_m"] * 9.80665
                                 if link["pump"] else reading["pressure_kpa"])
@@ -628,7 +740,7 @@ class MineWaterNetwork:
                 "Estimated line pressure at mine elevation")
             add(key, "pipe_pressure_rating", reading["pressure_rating_kpa"], "kPa", 0, 5000)
             velocity = reading["inlet_flow_m3h"] / 3600 / area
-            add(key, "line_velocity", velocity, "m/s", 0, 5, 0.005)
+            add(key, "line_velocity", velocity, "m/s", -5, 5, 0.005)
             add(key, "transport_delay", reading["transport_delay_s"], "s", 0, 21_600)
         for name, pump in state["pumps"].items():
             asset = name.lower().replace(" ", "_")
@@ -675,6 +787,9 @@ class MineWaterNetwork:
                   "flow_m3h": state["links"][key]["outlet_flow_m3h"],
                   "inlet_flow_m3h": state["links"][key]["inlet_flow_m3h"],
                   "pressure_kpa": state["links"][key]["pressure_kpa"],
+                  "surge_pressure_kpa": state["links"][key]["surge_pressure_kpa"],
+                  "check_valve_state": state["links"][key]["check_valve_state"],
+                  "reverse_flow_m3h": state["links"][key]["reverse_flow_m3h"],
                   "transport_delay_s": state["links"][key]["transport_delay_s"],
                   "pipe_inventory_m3": sum(state["links"][key]["transport_queue"]),
                   "pump": spec["pump"]} for key, spec in self.LINKS.items()]

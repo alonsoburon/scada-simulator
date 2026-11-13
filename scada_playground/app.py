@@ -1103,11 +1103,13 @@ def render_dashboard():
         for link in diagram["links"]:
             x0, y0 = positions[link["from"]]; x1, y1 = positions[link["to"]]
             max_flow = WATER_MODEL.LINKS[link["id"]]["max_flow_m3h"]
-            flow_ratio = min(1.0, link["flow_m3h"] / max_flow)
-            color = "#277da1" if link["flow_m3h"] > 1 else "#d1495b"
-            network_fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines",
+            flow_ratio = min(1.0, abs(link["flow_m3h"]) / max_flow)
+            color = ("#277da1" if link["flow_m3h"] > 1 else
+                     "#f9844a" if link["flow_m3h"] < -1 else "#a9b4bf")
+            path_x, path_y = ([x0, x1], [y0, y1]) if link["flow_m3h"] >= 0 else ([x1, x0], [y1, y0])
+            network_fig.add_trace(go.Scatter(x=path_x, y=path_y, mode="lines",
                                               line={"color": color, "width": 2 + 7 * flow_ratio},
-                                              hovertemplate=f"{link['label']} · {link['flow_m3h']:.1f} m³/h<extra></extra>",
+                                              hovertemplate=f"{link['label']} · {link['flow_m3h']:.1f} m³/h · check valve {link['check_valve_state']}<extra></extra>",
                                               showlegend=False))
         network_fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers+text",
                                           marker={"size": 24, "color": ["#4c78a8", "#72a0c1", "#f2a541", "#9b5de5", "#43aa8b", "#277da1"],
@@ -1116,11 +1118,20 @@ def render_dashboard():
                                           hovertemplate="%{text}<extra></extra>", showlegend=False))
         for link in diagram["links"]:
             x0, y0 = positions[link["from"]]; x1, y1 = positions[link["to"]]
-            network_fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+            arrow_x, arrow_y, arrow_ax, arrow_ay = ((x1, y1, x0, y0) if link["flow_m3h"] >= 0
+                                                     else (x0, y0, x1, y1))
+            arrow_color = ("#277da1" if link["flow_m3h"] > 1 else
+                           "#f9844a" if link["flow_m3h"] < -1 else "#a9b4bf")
+            network_fig.add_annotation(x=arrow_x, y=arrow_y, ax=arrow_ax, ay=arrow_ay,
+                                       xref="x", yref="y", axref="x", ayref="y",
                                        showarrow=True, arrowhead=3, arrowsize=1.1, arrowwidth=2,
-                                       arrowcolor="#277da1" if link["flow_m3h"] > 1 else "#d1495b")
+                                       arrowcolor=arrow_color)
+            if link["reverse_flow_m3h"] > 1:
+                network_fig.add_annotation(x=x0, y=y0, ax=(x0 + x1) / 2, ay=(y0 + y1) / 2,
+                    xref="x", yref="y", axref="x", ayref="y", showarrow=True,
+                    arrowhead=3, arrowsize=1.1, arrowwidth=2, arrowcolor="#f9844a")
             network_fig.add_annotation(x=(x0+x1)/2, y=(y0+y1)/2 + .06,
-                                       text=f"{link['label']}<br>in {link['inlet_flow_m3h']:.0f} → out {link['flow_m3h']:.0f} m³/h · {link['transport_delay_s']//60} min · ΔP {link['pressure_kpa']:.0f} kPa",
+                                       text=f"{link['label']}<br>in {link['inlet_flow_m3h']:.0f} → out {link['flow_m3h']:.0f} m³/h · reverse {link['reverse_flow_m3h']:.0f} m³/h · {link['transport_delay_s']//60} min · ΔP {link['pressure_kpa']:.0f} kPa · check {link['check_valve_state']}",
                                        showarrow=False, font={"size": 10, "color": "#243746"}, bgcolor="rgba(255,255,255,.88)")
         network_fig.update_layout(height=420, margin={"l": 10, "r": 10, "t": 10, "b": 10},
                                   xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},

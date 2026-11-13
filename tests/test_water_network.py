@@ -169,11 +169,14 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertLess(lower_speed_flow, initial_flow)
         outage = {"name": "Utility loss", "area": "Water supply network", "severity": "Large"}
         self.model.advance(self.state, 1, [outage])
-        self.assertEqual(self.state["links"]["process_feed"]["outlet_flow_m3h"], initial_flow)
+        self.assertAlmostEqual(self.state["links"]["process_feed"]["outlet_flow_m3h"], initial_flow)
+        self.assertLess(self.state["links"]["process_feed"]["inlet_flow_m3h"], 0.0)
+        self.assertEqual(self.state["links"]["process_feed"]["check_valve_state"], "CLOSED")
         self.assertGreater(initial_delay, 1)
 
     def test_rapid_pump_trip_creates_a_damped_water_hammer_pressure_wave(self):
         outage = {"name": "Utility loss", "area": "Water supply network", "severity": "Large"}
+        initial_inventory = self.model.total_inventory_m3(self.state)
         normal_velocity = self.state["links"]["process_feed"]["previous_velocity_m_s"]
         self.assertGreater(normal_velocity, 0.1)
         initial_flow = self.state["links"]["process_feed"]["inlet_flow_m3h"]
@@ -195,9 +198,22 @@ class MineWaterNetworkTests(unittest.TestCase):
         by_id = {tag["tag"]: tag for tag in tags}
         self.assertIn("water_supply_network.process_feed.water_hammer_surge", by_id)
         self.assertGreater(by_id["water_supply_network.process_feed.transient_gauge_pressure"]["value"], 0)
+        peak_check_valve_backflow = 0.0
         for second in range(3, 31):
             self.model.advance(self.state, second, [outage])
+            peak_check_valve_backflow = max(
+                peak_check_valve_backflow, link["reverse_flow_m3h"])
+            if second > 3 and link["check_valve_state"] == "CLOSED":
+                self.assertEqual(link["inlet_flow_m3h"], 0.0)
+                self.assertGreaterEqual(link["outlet_flow_m3h"], 0.0)
+        self.assertGreater(peak_check_valve_backflow, 0.0)
+        self.assertGreaterEqual(link["check_valve_closure_count"], 1)
+        self.assertEqual(link["transport_direction"], 1)
         self.assertLess(link["surge_pressure_kpa"], initial_surge)
+        expected_inventory = (initial_inventory + self.state["cumulative_concentrator_return_m3"]
+            - self.state["cumulative_process_consumption_m3"]
+            - self.state["cumulative_treated_delivery_m3"] - self.state["total_spilled_m3"])
+        self.assertAlmostEqual(self.model.total_inventory_m3(self.state), expected_inventory, places=5)
 
     def test_legacy_pipe_state_migrates_without_a_false_startup_surge(self):
         link = self.state["links"]["process_feed"]
