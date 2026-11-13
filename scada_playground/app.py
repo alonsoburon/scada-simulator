@@ -481,7 +481,8 @@ def publish_snapshot() -> dict:
         "scenario_run": sim["scenario_run"],
         "protocol_faults": sim["protocol_faults"],
         "water_network": water_diagram[0],
-        "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
+        "power_network": {key: value for key, value in sim["power_network"].items()
+                          if key not in {"history", "_instrument_noise"}},
         "plant_utilities": {key: value for key, value in sim["plant_utilities"].items() if key != "history"},
         "chilled_water": CHILLED_MODEL.public_state(sim["chilled_water"]),
         "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),

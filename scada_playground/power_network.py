@@ -7,7 +7,11 @@ It is intended for SCADA drills; it is not an AC load-flow or protection study.
 from __future__ import annotations
 
 import math
-import random
+
+try:
+    from .instrumentation import correlated_sensor_noise
+except ImportError:
+    from instrumentation import correlated_sensor_noise
 
 
 class MinePowerNetwork:
@@ -722,7 +726,6 @@ class MinePowerNetwork:
 
     def telemetry(self, state: dict) -> list[dict]:
         """Publish simulated grid and mine electrical measurements as SCADA tags."""
-        rng = random.Random(state["seed"] * 1_000_003 + state["sim_seconds"] * 9_176)
         v = state["voltage_pu"]
         source_v = state.get("source_voltage_pu", v)
         grid = state["grid_import_mw"]
@@ -790,7 +793,11 @@ class MinePowerNetwork:
                 for signal, (truth, units, low, high) in signals.items():
                     tag_id = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{signal}"
                     noise_scale = .0005 if signal == "available_fraction" else .001
-                    noise = rng.gauss(0.0, max(high-low, 1e-9) * noise_scale) if signal not in ("breaker_state", "equipment_running") else 0.0
+                    discrete = units in ("bool", "enum", "stage", "count")
+                    noise = (correlated_sensor_noise(
+                        state, tag_id, state["seed"], state["sim_seconds"],
+                        max(high - low, 1e-9) * noise_scale)
+                        if not discrete else 0.0)
                     rows.append({"tag": tag_id, "area": area, "unit": asset, "sensor": signal,
                         "units": units, "value": round(min(high, max(low, truth + noise)), 3),
                         "quality": "GOOD", "low": low, "high": high, "base": (low + high) / 2,
