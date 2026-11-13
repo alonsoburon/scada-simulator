@@ -20,6 +20,18 @@ def simulation_state() -> dict:
 
 
 class ScenarioRunnerTests(unittest.TestCase):
+    def test_distribution_protection_scenario_targets_a_named_feeder(self):
+        definition = ScenarioRunner().definition("distribution-overcurrent-reclose")
+        step = definition.steps[0]
+        self.assertEqual(step.parameters["incident_name"], "Electrical fault")
+        self.assertEqual(step.parameters["target_area"], "Grid distribution")
+        self.assertEqual(step.parameters["target_asset"], "Feeder north")
+        self.assertEqual(len(definition.steps), 3)
+        self.assertEqual(definition.steps[2].action, "feeder_protection_reset")
+        self.assertEqual(definition.steps[2].at_seconds, 80)
+        self.assertGreater(definition.duration_seconds,
+                           step.at_seconds + step.parameters["duration_seconds"] + 15)
+
     def test_water_treatment_scenario_exercises_quality_lag_and_recovery(self):
         definition = ScenarioRunner().definition("mine-water-treatment-upset-and-recovery")
         self.assertEqual(definition.steps[0].parameters["target_area"], "Water treatment")
@@ -117,6 +129,20 @@ class ProtocolFaultTests(unittest.TestCase):
 
 
 class ProcessDeterminismTests(unittest.TestCase):
+    def test_electrical_fault_requires_a_valid_named_distribution_feeder(self):
+        model = FactoryProcessModel({"Grid distribution": ["Feeder north", "Feeder south"]},
+            {"Electrical fault": "utility"}, lambda _unit, _tick: (0, 0, 0, 0, 0, "idle"))
+        sim = simulation_state()
+        event = model.inject(sim, "Electrical fault", "Grid distribution", "Large",
+                             duration_seconds=8, target_asset="Feeder north")
+        self.assertEqual(event.target_asset, "Feeder north")
+        with self.assertRaisesRegex(ValueError, "target one distribution feeder"):
+            model.inject(sim, "Electrical fault", "Grid distribution", "Small",
+                         target_asset=None)
+        with self.assertRaisesRegex(ValueError, "Unknown target asset"):
+            model.inject(sim, "Electrical fault", "Grid distribution", "Small",
+                         target_asset="Pump 01")
+
     def test_same_seed_reproduces_the_same_process_sample(self):
         model = FactoryProcessModel({"Grid distribution": []}, {}, lambda _unit, _tick: ())
         first, second = simulation_state(), simulation_state()

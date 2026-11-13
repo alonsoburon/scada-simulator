@@ -15,6 +15,7 @@ class ProcessEvent:
     started: int
     duration: int
     event_id: int
+    target_asset: str | None = None
 
 
 class FactoryProcessModel:
@@ -27,17 +28,26 @@ class FactoryProcessModel:
         self.fleet_motion = fleet_motion
 
     def inject(self, sim: dict, name: str, area: str, severity: str,
-               duration_seconds: int | None = None) -> ProcessEvent:
+               duration_seconds: int | None = None,
+               target_asset: str | None = None) -> ProcessEvent:
         if name not in self.incidents:
             raise ValueError(f"Unknown incident: {name}")
         if severity not in {"Small", "Medium", "Large"}:
             raise ValueError("Severity must be Small, Medium, or Large")
         if area != "Whole factory" and area not in self.areas:
             raise ValueError(f"Unknown target area: {area}")
+        if target_asset is not None and target_asset not in self.areas.get(area, []):
+            raise ValueError(f"Unknown target asset {target_asset!r} in {area}")
+        if name == "Electrical fault" and area != "Grid distribution":
+            raise ValueError("Electrical fault must target Grid distribution")
+        if name == "Electrical fault" and target_asset not in {
+                "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
+            raise ValueError("Electrical fault must target one distribution feeder")
         duration = duration_seconds or {"Small": 90, "Medium": 240, "Large": 600}[severity]
         if not 1 <= duration <= 86_400:
             raise ValueError("Incident duration must be between 1 and 86,400 simulated seconds")
-        event = ProcessEvent(name, area, severity, sim["tick"], duration, sim["next_event"])
+        event = ProcessEvent(name, area, severity, sim["tick"], duration,
+                             sim["next_event"], target_asset)
         sim["events"].append(event)
         sim["next_event"] += 1
         sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": severity.upper(),

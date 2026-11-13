@@ -281,15 +281,21 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 
 
 @mcp.tool()
-def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident"],
+def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident",
+                                     "reset_feeder_protection"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
-                       target_area: str = "Whole factory", duration_seconds: int = 0) -> dict[str, Any]:
-    """Control only the synthetic simulator: start, stop, reset, acknowledge alarms, or inject_incident.
+                       target_area: str = "Whole factory", duration_seconds: int = 0,
+                       target_asset: str = "") -> dict[str, Any]:
+    """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
+    or manually reset a locked-out distribution feeder after its fault has cleared.
 
     For incident injection, pass a known incident_name, severity Small/Medium/Large,
-    and target_area (an area name or Whole factory). No physical device can be controlled.
+    and target_area (an area name or Whole factory). Electrical fault also requires
+    target_asset set to Feeder north/south/east/west. For reset_feeder_protection, pass
+    target_area Grid distribution and the locked-out feeder as target_asset. No physical device can be controlled.
     """
-    allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident"}
+    allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
+               "reset_feeder_protection"}
     if action not in allowed:
         raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
     if action == "inject_incident":
@@ -304,9 +310,17 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
             raise ValueError("Unknown target_area; use a configured plant area or Whole factory")
         if duration_seconds < 0 or duration_seconds > 86_400:
             raise ValueError("duration_seconds must be 0 (severity default) or between 1 and 86,400")
+        if incident_name == "Electrical fault":
+            if target_area != "Grid distribution" or target_asset not in {
+                    "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
+                raise ValueError("Electrical fault requires Grid distribution and a named feeder target_asset")
+    if action == "reset_feeder_protection":
+        if target_area != "Grid distribution" or target_asset not in {
+                "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
+            raise ValueError("reset_feeder_protection requires Grid distribution and a named feeder target_asset")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
-                           "duration_seconds": duration_seconds})
+                           "duration_seconds": duration_seconds, "target_asset": target_asset or None})
 
 
 @mcp.tool()

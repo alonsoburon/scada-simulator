@@ -104,6 +104,7 @@ INCIDENTS = {
     "Mechanical degradation": "mechanical",
     "Process upset": "process",
     "Conveyor jam": "jam",
+    "Electrical fault": "utility",
 }
 
 # Fictional road geometry for a teaching site in northern Chile. The coordinate
@@ -429,7 +430,7 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
     params = step.parameters
     if step.action == "incident":
         PROCESS_MODEL.inject(sim, params["incident_name"], params["target_area"], params["severity"],
-                             params.get("duration_seconds"))
+                             params.get("duration_seconds"), params.get("target_asset"))
     elif step.action == "protocol_fault":
         PROTOCOL_FAULTS.add(sim, params["protocol"], params["mode"], params["selector_type"],
                             params["target"], params["duration_seconds"])
@@ -449,12 +450,23 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
             sim["plant_utilities"]["cip"], params.get("target_unit", "pasteurizer_01"), sim["tick"])
         if not started:
             raise RuntimeError(sim["plant_utilities"]["cip"]["start_block_reason"])
+    elif step.action == "feeder_protection_reset":
+        reset_feeder_protection(sim, params["target_asset"])
     else:
         raise ValueError(f"Scenario action is not supported: {step.action}")
 
 
-def inject(name: str, area: str, severity: str, duration_seconds: int | None = None) -> None:
-    PROCESS_MODEL.inject(st.session_state.sim, name, area, severity, duration_seconds)
+def inject(name: str, area: str, severity: str, duration_seconds: int | None = None,
+           target_asset: str | None = None) -> None:
+    PROCESS_MODEL.inject(st.session_state.sim, name, area, severity, duration_seconds, target_asset)
+
+
+def reset_feeder_protection(sim: dict, target_asset: str) -> None:
+    feeder_name = target_asset.removeprefix("Feeder ").lower()
+    fault_active = any(event.name == "Electrical fault" and event.target_asset == target_asset
+                       for event in sim["events"])
+    POWER_MODEL.reset_feeder_protection(sim["power_network"], feeder_name,
+                                        fault_active=fault_active)
 
 
 def process_mcp_commands() -> list[tuple[str, dict]]:
@@ -508,8 +520,12 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 severity = command.get("severity", "")
                 area = command.get("target_area", "")
                 duration = command.get("duration_seconds")
-                inject(name, area, severity, duration)
+                inject(name, area, severity, duration, command.get("target_asset"))
                 message = f"{severity} {name} injected in {area}. Start the factory to evolve its simulated process effects."
+            elif action == "reset_feeder_protection":
+                target_asset = command.get("target_asset", "")
+                reset_feeder_protection(sim, target_asset)
+                message = f"Feeder protection lockout manually reset for {target_asset}; trip history was retained."
             elif action == "process_control":
                 control = sim["process_control"]
                 process_action = command.get("process_action", "").upper()
@@ -754,6 +770,15 @@ def advance(force: bool = False) -> None:
         "battery_reserve": (power_state["battery_soc_pct"] < 20, power_state["battery_soc_pct"] > 30,
                             "Grid support battery reserve low", "HIGH"),
     }
+    for feeder_name, feeder in power_state["distribution_feeders"].items():
+        power_conditions[f"feeder_{feeder_name}_open"] = (
+            not feeder["breaker_closed"], feeder["breaker_closed"],
+            f"Distribution feeder {feeder_name} breaker open: {feeder['last_trip_reason'] or 'manual isolation'}",
+            "CRITICAL")
+        power_conditions[f"feeder_{feeder_name}_undervoltage"] = (
+            feeder["breaker_closed"] and feeder["voltage_pu"] < 0.92,
+            not feeder["breaker_closed"] or feeder["voltage_pu"] > 0.96,
+            f"Distribution feeder {feeder_name} voltage depressed", "HIGH")
     for key, (active, cleared, message, severity) in power_conditions.items():
         was_active = power_alarm_states.get(key, False)
         if active and not was_active:
@@ -874,9 +899,14 @@ with st.sidebar:
     st.subheader("Inject an incident")
     incident_name = st.selectbox("Incident", list(INCIDENTS))
     severity = st.select_slider("Severity", ["Small", "Medium", "Large"], value="Small")
-    target = st.selectbox("Target area", ["Whole factory", *AREAS.keys()])
+    if incident_name == "Electrical fault":
+        target = "Grid distribution"
+        target_asset = st.selectbox("Faulted feeder", ["Feeder north", "Feeder south", "Feeder east", "Feeder west"])
+    else:
+        target = st.selectbox("Target area", ["Whole factory", *AREAS.keys()])
+        target_asset = None
     if st.button("⚠ Inject incident", width="stretch"):
-        inject(incident_name, target, severity)
+        inject(incident_name, target, severity, target_asset=target_asset)
     st.caption("Incidents change simulated sensor behavior and produce alarm events. They never connect to equipment.")
     with st.expander("Protocol fault injector"):
         fault_protocol = st.selectbox("Protocol", PROTOCOLS, key="fault_protocol")
@@ -1291,7 +1321,7 @@ def render_dashboard():
     with tabs[7]:
         power = sim["power_network"]
         st.subheader("Mine electrical network · dispatch and load response")
-        st.caption("Grid import, solar, diesel reserve, and battery storage supply essential services, mine water, factory utilities, the concentrator, and flexible auxiliaries. Under scarcity, the feeder model prioritizes essential controls and water, then steam/compressed-air utilities, then the concentrator. Four radial feeders estimate voltage drop, reactive flow, current, and I²R loss with a linearized DistFlow approximation; protection and full AC load-flow behavior are outside this model.")
+        st.caption("Grid import, solar, diesel reserve, and battery storage supply the mine. Four radial feeders estimate voltage drop, reactive flow, current, and I²R losses. Feeders have a teaching IEC standard-inverse relay, trip latch, 15-second dead time, and one automatic reclose. This is not an AC short-circuit or protection-coordination study.")
         metrics = st.columns(7)
         for col, label, value in zip(metrics,
             ["Mine bus frequency", "Run frequency nadir", "Lowest feeder voltage", "Grid import", "Diesel generation", "Battery reserve", "Distribution losses"],
@@ -1340,12 +1370,26 @@ def render_dashboard():
             xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},
             plot_bgcolor="white", paper_bgcolor="white", uirevision="electrical-network")
         st.plotly_chart(fig, width="stretch")
-        feeder_rows = [{"Feeder": name.title(), "Voltage (pu)": values["voltage_pu"],
+        feeder_rows = [{"Feeder": name.title(), "Breaker": "Closed" if values["breaker_closed"] else "Open",
+            "Relay pickup": values["relay_pickup"], "I / pickup": values["relay_current_multiple"],
+            "Relay timer (s)": values["relay_timer_s"], "Trips": values["trip_count"],
+            "Recloses": values["reclose_count"], "Voltage (pu)": values["voltage_pu"],
             "Current (A)": values["current_a"], "Loading (%)": values["loading_pct"],
             "P (MW)": values["active_power_mw"], "Q (MVAr)": values["reactive_power_mvar"],
             "Loss (MW)": values["loss_mw"]}
             for name, values in power["distribution_feeders"].items()]
         st.dataframe(pd.DataFrame(feeder_rows).round(2), hide_index=True, width="stretch")
+        locked = [(name, values) for name, values in power["distribution_feeders"].items()
+                  if values["lockout"]]
+        for feeder_name, _values in locked:
+            target_asset = f"Feeder {feeder_name}"
+            fault_active = any(event.name == "Electrical fault" and event.target_asset == target_asset
+                               for event in sim["events"])
+            if st.button(f"Reset {target_asset} lockout", disabled=fault_active,
+                         key=f"reset_protection_{feeder_name}"):
+                reset_feeder_protection(sim, target_asset)
+                st.success(f"{target_asset} reclosed. Relay trip history is retained.")
+                st.rerun(scope="fragment")
         history = pd.DataFrame(power["history"])
         if not history.empty:
             if "frequency_window_nadir_hz" not in history:

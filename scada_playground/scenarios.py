@@ -238,6 +238,26 @@ SCENARIOS = {
             "The tag reappears after recovery; Modbus and OPC UA retain their stable tag map.",
         ),
     ),
+    "distribution-overcurrent-reclose": ScenarioDefinition(
+        scenario_id="distribution-overcurrent-reclose",
+        name="Distribution feeder overcurrent and reclose",
+        description="A feeder fault trips an inverse-time relay and clears for one successful automatic reclose; a second fault retrips and locks out the branch.",
+        duration_seconds=120,
+        steps=(
+            ScenarioStep(10, "incident", {"incident_name": "Electrical fault", "severity": "Large",
+                "target_area": "Grid distribution", "target_asset": "Feeder north", "duration_seconds": 8}),
+            ScenarioStep(45, "incident", {"incident_name": "Electrical fault", "severity": "Large",
+                "target_area": "Grid distribution", "target_asset": "Feeder north", "duration_seconds": 20}),
+            ScenarioStep(80, "feeder_protection_reset", {"target_asset": "Feeder north"}),
+        ),
+        expected_observations=(
+            "North feeder relay current rises to eight times pickup and its standard-inverse timer trips the breaker.",
+            "The open feeder stops carrying current and disconnects its process service while other feeders remain closed.",
+            "After a 15-second dead time, the breaker recloses once because the first fault is clear; the trip and reclose counters remain visible.",
+            "The second fault trips the reclosed breaker again and latches it in lockout until the later simulated operator reset.",
+            "After the second fault clears, the replay simulates an operator lockout reset and records successful re-energization without clearing the trip history.",
+        ),
+    ),
 }
 
 

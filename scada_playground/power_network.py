@@ -35,10 +35,14 @@ class MinePowerNetwork:
             "frequency_nadir_hz": 50.0, "frequency_window_nadir_hz": 50.0,
             "voltage_pu": 1.0,
             "source_voltage_pu": 1.0, "capacitor_bank_stage": 1,
-            "capacitor_bank_mvar": 1.2, "distribution_losses_mw": 0.55,
+            "capacitor_bank_mvar": 1.2, "distribution_losses_mw": 0.575,
             "distribution_feeders": {name: {"active_power_mw": 0.0, "reactive_power_mvar": 0.0,
                 "apparent_power_mva": 0.0, "current_a": 0.0, "voltage_pu": 1.0,
-                "voltage_drop_pu": 0.0, "loss_mw": 0.0, "loading_pct": 0.0}
+                "voltage_drop_pu": 0.0, "loss_mw": 0.0, "loading_pct": 0.0,
+                "breaker_closed": True, "relay_pickup": False, "relay_current_multiple": 0.0,
+                "relay_time_to_trip_s": 0.0, "relay_timer_s": 0.0,
+                "trip_count": 0, "reclose_count": 0, "reclose_timer_s": 0.0,
+                "lockout": False, "last_trip_reason": ""}
                 for name in self.DISTRIBUTION_FEEDERS},
             "tie_capacity_mw": 44.0, "mine_transformer_capacity_mw": 39.0,
             "process_feeder_capacity_mw": 32.0, "water_feeder_capacity_mw": 2.5,
@@ -67,12 +71,14 @@ class MinePowerNetwork:
 
     @classmethod
     def _radial_feeder_flows(cls, mine_load_mw: float, source_voltage_pu: float,
-                             capacitor_mvar: float) -> dict[str, dict[str, float]]:
+                             capacitor_mvar: float,
+                             active_power_by_feeder: dict[str, float] | None = None) -> dict[str, dict[str, float]]:
         """Estimate four radial feeder flows with linearized DistFlow voltage drop and I²R loss."""
         voltage = max(0.70, source_voltage_pu)
         flows = {}
         for name, spec in cls.DISTRIBUTION_FEEDERS.items():
-            active = max(0.0, mine_load_mw) * spec["share"]
+            active = (max(0.0, active_power_by_feeder[name]) if active_power_by_feeder is not None
+                      else max(0.0, mine_load_mw) * spec["share"])
             reactive = active * math.tan(math.acos(spec["power_factor"]))
             reactive -= capacitor_mvar * spec["cap_share"]
             apparent = math.hypot(active, reactive)
@@ -135,6 +141,7 @@ class MinePowerNetwork:
         for name, initial in initial_state["transformers"].items():
             state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
+        self._advance_feeder_protection(state, sim_seconds, events)
         connected_load_at_tick_start = state.get("served_load_mw", 34.5)
         faults = [event for event in events if event["name"] == "Utility loss"]
         gen_faults = [event for event in events if event["name"] == "Mechanical degradation"]
@@ -144,6 +151,8 @@ class MinePowerNetwork:
         process_factor = 1.0
         water_factor = 1.0
         generation_factor = 1.0
+        utility_factor = 1.0
+        site_factor = 1.0
         for event in faults:
             severity = self.SEVERITY[event["severity"]]
             area = event["area"]
@@ -164,6 +173,26 @@ class MinePowerNetwork:
         if any(event["area"] in ("Whole factory", "Grid generation") for event in gen_faults):
             generation_factor *= 0.72
 
+        # The mine's four distribution branches have distinct customer groups.
+        # Losing one branch disconnects its local demand; upstream generation
+        # cannot supply a load behind an open breaker.
+        protection = state["distribution_feeders"]
+        process_factor = min(process_factor,
+            0.45 * protection["north"]["breaker_closed"]
+            + 0.30 * protection["south"]["breaker_closed"]
+            + 0.15 * protection["east"]["breaker_closed"]
+            + 0.10 * protection["west"]["breaker_closed"])
+        water_factor = min(water_factor, float(protection["south"]["breaker_closed"]))
+        utility_factor = min(utility_factor,
+            0.30 * protection["north"]["breaker_closed"]
+            + 0.15 * protection["south"]["breaker_closed"]
+            + 0.30 * protection["east"]["breaker_closed"]
+            + 0.25 * protection["west"]["breaker_closed"])
+        site_factor = min(site_factor,
+            0.65 * protection["south"]["breaker_closed"]
+            + 0.25 * protection["east"]["breaker_closed"]
+            + 0.10 * protection["west"]["breaker_closed"])
+
         state["tie_capacity_mw"] = 44.0 * tie_factor
         state["mine_transformer_capacity_mw"] = 39.0 * mine_factor
         state["process_feeder_capacity_mw"] = 32.0 * process_factor * mine_factor
@@ -176,9 +205,12 @@ class MinePowerNetwork:
         water_request = max(0.0, water_load_mw)
         utility_request = max(0.0, utility_load_mw)
         site_request = 6.0
-        process_feeder_request = min(process_request + utility_request,
+        available_site_request = site_request * site_factor
+        available_water_request = water_request * water_factor
+        available_utility_request = utility_request * utility_factor
+        process_feeder_request = min(process_request * process_factor + available_utility_request,
                                      state["process_feeder_capacity_mw"])
-        dispatch_request = (site_request + min(water_request, state["water_feeder_capacity_mw"])
+        dispatch_request = (available_site_request + min(available_water_request, state["water_feeder_capacity_mw"])
                             + process_feeder_request)
         total_load_request = site_request + water_request + utility_request + process_request
         estimated_network_losses = max(0.0, state.get("distribution_losses_mw", 0.55))
@@ -245,17 +277,17 @@ class MinePowerNetwork:
         available = max(0.0, state["total_generation_mw"] - charge_power - estimated_network_losses)
         # Preserve critical controls and water first, then factory utility services,
         # then the concentrator; flexible site auxiliaries are last.
-        served_critical_site = min(3.0, available)
+        served_critical_site = min(3.0 * site_factor, available)
         available = max(0.0, available - served_critical_site)
-        served_water = min(water_request, state["water_feeder_capacity_mw"], available)
+        served_water = min(available_water_request, state["water_feeder_capacity_mw"], available)
         available = max(0.0, available - served_water)
         feeder_headroom = max(0.0, state["process_feeder_capacity_mw"])
-        served_utility = min(utility_request, feeder_headroom, available)
+        served_utility = min(available_utility_request, feeder_headroom, available)
         feeder_headroom -= served_utility
         available = max(0.0, available - served_utility)
-        served_process = min(process_request, feeder_headroom, available)
+        served_process = min(process_request * process_factor, feeder_headroom, available)
         available = max(0.0, available - served_process)
-        served_flexible_site = min(3.0, available)
+        served_flexible_site = min(3.0 * site_factor, available)
         served_site = served_critical_site + served_flexible_site
         state["process_requested_mw"] = process_request
         state["water_requested_mw"] = water_request
@@ -309,11 +341,46 @@ class MinePowerNetwork:
         elif source_voltage > 1.0:
             state["capacitor_bank_stage"], state["capacitor_bank_mvar"] = 1, 1.2
         state["source_voltage_pu"] = source_voltage
+        closed = {name: protection[name]["breaker_closed"] for name in self.DISTRIBUTION_FEEDERS}
+        customer_shares = {
+            "process": {"north": 0.45, "south": 0.30, "east": 0.15, "west": 0.10},
+            "utility": {"north": 0.30, "south": 0.15, "east": 0.30, "west": 0.25},
+            "site": {"south": 0.65, "east": 0.25, "west": 0.10},
+        }
+        def branch_allocation(served: float, group: str) -> dict[str, float]:
+            shares = customer_shares[group]
+            available_share = sum(share for name, share in shares.items() if closed[name])
+            return {name: served * share / available_share if closed[name] and available_share > 0 else 0.0
+                    for name, share in shares.items()}
+        process_by_feeder = branch_allocation(served_process, "process")
+        utility_by_feeder = branch_allocation(served_utility, "utility")
+        site_by_feeder = branch_allocation(served_site, "site")
+        feeder_loads = {name:
+            process_by_feeder.get(name, 0.0) + utility_by_feeder.get(name, 0.0)
+            + site_by_feeder.get(name, 0.0)
+            + (served_water if name == "south" and closed["south"] else 0.0)
+            for name in self.DISTRIBUTION_FEEDERS}
         feeder_flows = self._radial_feeder_flows(
-            state["served_load_mw"], source_voltage, state["capacitor_bank_mvar"])
+            state["served_load_mw"], source_voltage, state["capacitor_bank_mvar"], feeder_loads)
+        for name, flow in feeder_flows.items():
+            prior = state["distribution_feeders"][name]
+            flow.update({key: prior[key] for key in (
+                "breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",
+                "relay_timer_s", "trip_count", "reclose_count", "reclose_timer_s",
+                "lockout", "last_trip_reason", "pickup_current_a")})
+            if not flow["breaker_closed"]:
+                flow.update(active_power_mw=0.0, reactive_power_mvar=0.0,
+                            apparent_power_mva=0.0, current_a=0.0, loss_mw=0.0, loading_pct=0.0,
+                            voltage_pu=0.0, voltage_drop_pu=source_voltage)
+            elif flow["relay_pickup"]:
+                flow["current_a"] = flow["pickup_current_a"] * flow["relay_current_multiple"]
+                flow["voltage_pu"] = max(0.70, flow["voltage_pu"]
+                                          - min(0.28, 0.035 * flow["relay_current_multiple"]))
         state["distribution_feeders"] = feeder_flows
         state["distribution_losses_mw"] = sum(flow["loss_mw"] for flow in feeder_flows.values())
-        state["voltage_pu"] = min(source_voltage, *(f["voltage_pu"] for f in feeder_flows.values()))
+        energized_voltages = [flow["voltage_pu"] for flow in feeder_flows.values()
+                              if flow["breaker_closed"]]
+        state["voltage_pu"] = min([source_voltage, *energized_voltages])
         state["power_deficit"] = state["power_deficit"] or state["frequency_hz"] < 49.5
 
         # Winding temperature responds faster than oil temperature. The thermal
@@ -369,10 +436,10 @@ class MinePowerNetwork:
                 "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * source_v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "frequency_rocof": (state["frequency_rocof_hz_s"], "Hz/s", -5, 5), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
             },
             "Grid distribution": {
-                "Feeder north": {"active_power": (state["distribution_feeders"]["north"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["north"]["voltage_pu"], "kV", 25, 40), "line_current": (state["distribution_feeders"]["north"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["north"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["process_power_fraction"] > .05), "bool", 0, 1)},
-                "Feeder south": {"active_power": (state["distribution_feeders"]["south"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["south"]["voltage_pu"], "kV", 25, 40), "line_current": (state["distribution_feeders"]["south"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["south"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
-                "Feeder east": {"active_power": (state["distribution_feeders"]["east"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["east"]["voltage_pu"], "kV", 8, 14), "line_current": (state["distribution_feeders"]["east"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["east"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (1.0, "bool", 0, 1)},
-                "Feeder west": {"active_power": (state["distribution_feeders"]["west"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["west"]["voltage_pu"], "kV", 8, 14), "line_current": (state["distribution_feeders"]["west"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["west"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (1.0, "bool", 0, 1)},
+                "Feeder north": {"active_power": (state["distribution_feeders"]["north"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["north"]["voltage_pu"], "kV", 0, 40), "line_current": (state["distribution_feeders"]["north"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["north"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["north"]["breaker_closed"]), "bool", 0, 1)},
+                "Feeder south": {"active_power": (state["distribution_feeders"]["south"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["south"]["voltage_pu"], "kV", 0, 40), "line_current": (state["distribution_feeders"]["south"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["south"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["south"]["breaker_closed"]), "bool", 0, 1)},
+                "Feeder east": {"active_power": (state["distribution_feeders"]["east"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["east"]["voltage_pu"], "kV", 0, 14), "line_current": (state["distribution_feeders"]["east"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["east"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["east"]["breaker_closed"]), "bool", 0, 1)},
+                "Feeder west": {"active_power": (state["distribution_feeders"]["west"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["west"]["voltage_pu"], "kV", 0, 14), "line_current": (state["distribution_feeders"]["west"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["west"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["west"]["breaker_closed"]), "bool", 0, 1)},
                 "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-state["capacitor_bank_mvar"], "MVAr", -10, 10), "line_voltage": (33 * source_v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
             },
             "Mine power network": {
@@ -399,6 +466,22 @@ class MinePowerNetwork:
                         "units": units, "value": round(min(high, max(low, truth + noise)), 3),
                         "quality": "GOOD", "low": low, "high": high, "base": (low + high) / 2,
                         "phase": 0.0, "last_change": "Dynamic mine electrical model"})
+        for name, feeder in state["distribution_feeders"].items():
+            asset = f"Feeder {name}"
+            for signal, value, units, low, high in (
+                ("relay_pickup", float(feeder["relay_pickup"]), "bool", 0, 1),
+                ("relay_current_multiple", feeder["relay_current_multiple"], "x pickup", 0, 20),
+                ("relay_timer", feeder["relay_timer_s"], "s", 0, 3600),
+                ("relay_time_to_trip", feeder["relay_time_to_trip_s"], "s", 0, 3600),
+                ("trip_count", feeder["trip_count"], "count", 0, 1000),
+                ("reclose_count", feeder["reclose_count"], "count", 0, 1000),
+                ("lockout", float(feeder["lockout"]), "bool", 0, 1),
+            ):
+                rows.append({"tag": f"grid_distribution.feeder_{name}.{signal}",
+                    "area": "Grid distribution", "unit": asset, "sensor": signal,
+                    "units": units, "value": round(value, 3), "quality": "GOOD",
+                    "low": low, "high": high, "base": value, "phase": 0.0,
+                    "last_change": "Feeder overcurrent relay model"})
         rows.extend([
             {"tag": "mine_power_network.concentrator_substation.active_power", "area": "Mine power network",
              "unit": "Concentrator substation", "sensor": "active_power", "units": "MW",
@@ -410,3 +493,65 @@ class MinePowerNetwork:
              "base": .1, "phase": 0.0, "last_change": "Water pump electrical load"},
         ])
         return rows
+
+    @classmethod
+    def _advance_feeder_protection(cls, state: dict, sim_seconds: int, events: list[dict]) -> None:
+        """Apply a teaching IEC standard-inverse overcurrent relay and one reclose."""
+        feeders = state.setdefault("distribution_feeders", {})
+        initial = cls().initialize()["distribution_feeders"]
+        for name in cls.DISTRIBUTION_FEEDERS:
+            feeder = feeders.setdefault(name, initial[name].copy())
+            for key, value in initial[name].items():
+                feeder.setdefault(key, value)
+            asset = f"Feeder {name}"
+            fault = next((event for event in events if event.get("name") == "Electrical fault"
+                          and event.get("area") == "Grid distribution"
+                          and event.get("target_asset") == asset), None)
+            spec = cls.DISTRIBUTION_FEEDERS[name]
+            pickup_a = spec["rating_mva"] * 1000 / (math.sqrt(3) * spec["nominal_kv"]) * 1.15
+            multiple = ({"Small": 2.5, "Medium": 4.0, "Large": 8.0}.get(fault["severity"], 0.0)
+                        if fault else 0.0)
+            feeder["relay_current_multiple"] = multiple
+            feeder["relay_pickup"] = multiple > 1.0 and feeder["breaker_closed"]
+            trip_s = 0.60 * 0.14 / (multiple ** 0.02 - 1.0) if multiple > 1.0 else 0.0
+            feeder["relay_time_to_trip_s"] = trip_s
+            if fault and feeder["breaker_closed"] and not feeder["lockout"]:
+                feeder["relay_timer_s"] += 1
+                if feeder["relay_timer_s"] >= max(1, math.ceil(trip_s)):
+                    feeder["breaker_closed"] = False
+                    feeder["trip_count"] += 1
+                    feeder["last_trip_reason"] = f"Overcurrent {multiple:.1f}× pickup"
+                    feeder["lockout"] = feeder["trip_count"] >= 2
+                    feeder["reclose_timer_s"] = 0
+                    feeder["relay_timer_s"] = 0
+            else:
+                feeder["relay_timer_s"] = 0.0
+            if not feeder["breaker_closed"] and not feeder["lockout"]:
+                feeder["reclose_timer_s"] += 1
+                if feeder["reclose_timer_s"] >= 15:
+                    feeder["breaker_closed"] = True
+                    feeder["reclose_count"] += 1
+                    feeder["reclose_timer_s"] = 0
+                    feeder["last_trip_reason"] = ""
+            if feeder["lockout"]:
+                feeder["breaker_closed"] = False
+            feeder["relay_pickup"] = multiple > 1.0 and feeder["breaker_closed"]
+            feeder["pickup_current_a"] = round(pickup_a, 2)
+
+    @classmethod
+    def reset_feeder_protection(cls, state: dict, feeder_name: str, *, fault_active: bool) -> None:
+        """Manually reset a cleared feeder lockout; retain relay event counters."""
+        if feeder_name not in cls.DISTRIBUTION_FEEDERS:
+            raise ValueError(f"Unknown feeder: {feeder_name}")
+        feeder = state["distribution_feeders"][feeder_name]
+        if fault_active:
+            raise ValueError("Clear the feeder fault before resetting protection lockout")
+        if not feeder["lockout"]:
+            raise ValueError(f"Feeder {feeder_name} is not locked out")
+        feeder["lockout"] = False
+        feeder["breaker_closed"] = True
+        feeder["relay_pickup"] = False
+        feeder["relay_current_multiple"] = 0.0
+        feeder["relay_timer_s"] = 0.0
+        feeder["reclose_timer_s"] = 0.0
+        feeder["last_trip_reason"] = ""
