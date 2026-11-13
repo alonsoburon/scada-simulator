@@ -35,6 +35,11 @@ class MinePowerNetwork:
     NOMINAL_FREQUENCY_HZ = 50.0
     DIESEL_DROOP_MW_PER_HZ = 2.67
     DIESEL_RAMP_MW_PER_S = 0.12
+    DIESEL_UNITS = {
+        "turbine_generator_01": {"asset": "Turbine generator 01", "capacity_mw": 4.8},
+        "turbine_generator_02": {"asset": "Turbine generator 02", "capacity_mw": 3.2},
+    }
+    DIESEL_TOTAL_CAPACITY_MW = sum(unit["capacity_mw"] for unit in DIESEL_UNITS.values())
     DIESEL_FUEL_CAPACITY_L = 36_000.0
     DIESEL_MIN_START_FUEL_L = 250.0
     DIESEL_IDLE_FUEL_L_H = 70.0
@@ -89,6 +94,11 @@ class MinePowerNetwork:
             "process_feeder_capacity_mw": 36.0, "water_feeder_capacity_mw": 2.5,
             "solar_mw": 2.2, "diesel_mw": 0.0, "diesel_available_mw": 8.0,
             "diesel_start_timer_s": 0, "diesel_started": False,
+            "diesel_units": {key: {**spec, "available_capacity_mw": spec["capacity_mw"],
+                "dispatch_target_mw": 0.0, "output_mw": 0.0,
+                "start_timer_s": 0.0, "started": False,
+                "governor_bias_mw": 0.0}
+                for key, spec in self.DIESEL_UNITS.items()},
             "diesel_fuel_inventory_l": self.DIESEL_FUEL_CAPACITY_L,
             "diesel_fuel_consumption_l_h": 0.0, "diesel_fuel_used_l": 0.0,
             "diesel_governor_bias_mw": 0.0, "diesel_dispatch_target_mw": 0.0,
@@ -239,6 +249,19 @@ class MinePowerNetwork:
         state.setdefault("diesel_fuel_inventory_l", self.DIESEL_FUEL_CAPACITY_L)
         state.setdefault("diesel_fuel_consumption_l_h", 0.0)
         state.setdefault("diesel_fuel_used_l", 0.0)
+        state.setdefault("diesel_units", {})
+        for name, initial_unit in initial_state["diesel_units"].items():
+            unit = state["diesel_units"].setdefault(name, initial_unit.copy())
+            for field, value in initial_unit.items():
+                unit.setdefault(field, value)
+        # Upgrade a paused pre-unitization snapshot without dropping its live
+        # aggregate generator output or start state.
+        if state.get("diesel_started") and not any(
+                unit["started"] for unit in state["diesel_units"].values()):
+            for share, unit in zip((0.6, 0.4), state["diesel_units"].values()):
+                unit["started"] = True
+                unit["output_mw"] = state.get("diesel_mw", 0.0) * share
+                unit["start_timer_s"] = state.get("diesel_start_timer_s", 0.0)
         state.setdefault("battery_conversion_loss_mw", 0.0)
         state.setdefault("battery_scan_average_loss_mw", 0.0)
         state.setdefault("site_flexible_power_fraction", 1.0)
@@ -287,9 +310,10 @@ class MinePowerNetwork:
                 water_factor = min(water_factor, 1.0 - severity * 0.55)
             if area == "Water supply network":
                 water_factor = min(water_factor, 1.0 - severity * 0.55)
-            if area == "Grid generation":
+            if area == "Grid generation" and event.get("target_asset") is None:
                 generation_factor = min(generation_factor, 1.0 - severity)
-        if any(event["area"] in ("Whole factory", "Grid generation") for event in gen_faults):
+        if any(event["area"] in ("Whole factory", "Grid generation")
+               and event.get("target_asset") is None for event in gen_faults):
             generation_factor *= 0.72
 
         # The mine's four distribution branches have distinct customer groups.
@@ -320,7 +344,22 @@ class MinePowerNetwork:
 
         solar = (2.2 + 0.65 * math.sin(sim_seconds / 430.0) + 0.22 * math.sin(sim_seconds / 71.0))
         solar = min(3.2, max(0.8, solar)) * generation_factor
-        diesel_cap = 8.0 * generation_factor
+        diesel_unit_capacities = {}
+        for key, spec in self.DIESEL_UNITS.items():
+            unit_factor = generation_factor
+            for event in faults:
+                target = (event.get("target_asset") or "").lower().replace(" ", "_")
+                if event["area"] == "Grid generation" and target in (key, spec["asset"].lower().replace(" ", "_")):
+                    unit_factor = min(unit_factor, 1.0 - self.SEVERITY[event["severity"]])
+            for event in gen_faults:
+                target = (event.get("target_asset") or "").lower().replace(" ", "_")
+                if event["area"] in ("Whole factory", "Grid generation"):
+                    if (event.get("target_asset") is not None
+                            and target in (key, spec["asset"].lower().replace(" ", "_"))):
+                        unit_factor *= max(0.0, 1.0 - 0.48 * self.SEVERITY[event["severity"]])
+            diesel_unit_capacities[key] = spec["capacity_mw"] * max(0.0, unit_factor)
+            state["diesel_units"][key]["available_capacity_mw"] = diesel_unit_capacities[key]
+        diesel_cap = sum(diesel_unit_capacities.values())
         process_request = max(0.0, process_load_mw) + motor_starting_load_mw
         water_request = max(0.0, water_load_mw)
         utility_request = max(0.0, utility_load_mw)
@@ -350,15 +389,31 @@ class MinePowerNetwork:
                       grid_transformer_limit)
 
         residual_after_grid_and_solar = max(0.0, source_request - tie_cap - solar)
-        if (residual_after_grid_and_solar > 0.8 and diesel_cap > 0
-                and state["diesel_fuel_inventory_l"] >= self.DIESEL_MIN_START_FUEL_L):
-            state["diesel_start_timer_s"] += 1
-            if state["diesel_start_timer_s"] >= 20:
-                state["diesel_started"] = True
-        else:
-            state["diesel_start_timer_s"] = max(0, state["diesel_start_timer_s"] - 2)
-        diesel_base_target = (min(diesel_cap, residual_after_grid_and_solar)
-                              if state["diesel_started"] else 0.0)
+        diesel_remaining_request = residual_after_grid_and_solar
+        preceding_capacity = 0.0
+        for key, unit in state["diesel_units"].items():
+            capacity = diesel_unit_capacities[key]
+            need_start = residual_after_grid_and_solar > preceding_capacity + 0.8
+            if unit["started"]:
+                unit["start_timer_s"] = 0.0
+            elif (need_start and capacity > 0.01
+                    and state["diesel_fuel_inventory_l"] >= self.DIESEL_MIN_START_FUEL_L):
+                unit["start_timer_s"] += 1.0
+                if unit["start_timer_s"] >= 20.0:
+                    unit["started"] = True
+                    unit["start_timer_s"] = 0.0
+            else:
+                unit["start_timer_s"] = max(0.0, unit["start_timer_s"] - 2.0)
+            unit["dispatch_target_mw"] = (min(capacity, diesel_remaining_request)
+                if unit["started"] else 0.0)
+            diesel_remaining_request = max(0.0,
+                diesel_remaining_request - unit["dispatch_target_mw"])
+            preceding_capacity += capacity
+        state["diesel_started"] = any(unit["started"] for unit in state["diesel_units"].values())
+        state["diesel_start_timer_s"] = max(
+            (unit["start_timer_s"] for unit in state["diesel_units"].values()), default=0.0)
+        diesel_base_target = sum(unit["dispatch_target_mw"]
+                                 for unit in state["diesel_units"].values())
         state["diesel_dispatch_target_mw"] = diesel_base_target
 
         grid_for_load = min(tie_cap, max(0.0, source_request - solar - state["diesel_mw"]))
@@ -436,38 +491,57 @@ class MinePowerNetwork:
         battery_power_integral_mw_s = 0.0
         diesel_fuel_scan_l = 0.0
         for _ in range(self.FREQUENCY_SUBSTEPS_PER_SCAN):
-            diesel_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
-                            * self.DIESEL_DROOP_MW_PER_HZ if state["diesel_started"] else 0.0)
-            if state["diesel_started"]:
-                fuel_for_interval_l = (state["diesel_fuel_inventory_l"] * 3600.0
-                                       / frequency_interval_s)
-                fuel_limited_power_mw = max(0.0,
-                    (fuel_for_interval_l - self.DIESEL_IDLE_FUEL_L_H)
-                    / self.DIESEL_FUEL_L_PER_MWH)
-                diesel_target = min(diesel_cap, fuel_limited_power_mw,
-                                    max(0.0, diesel_base_target + diesel_droop))
-            else:
-                diesel_target = 0.0
-            state["diesel_governor_bias_mw"] = diesel_target - diesel_base_target
-            diesel_delta_limit = self.DIESEL_RAMP_MW_PER_S * frequency_interval_s
-            state["diesel_mw"] += min(diesel_delta_limit,
-                max(-diesel_delta_limit, diesel_target - state["diesel_mw"]))
-            if state["diesel_started"]:
-                fuel_rate_l_h = (self.DIESEL_IDLE_FUEL_L_H
-                                 + max(0.0, state["diesel_mw"])
-                                 * self.DIESEL_FUEL_L_PER_MWH)
-                fuel_used_l = min(state["diesel_fuel_inventory_l"],
-                                  fuel_rate_l_h * frequency_interval_s / 3600.0)
-                state["diesel_fuel_inventory_l"] -= fuel_used_l
-                state["diesel_fuel_used_l"] += fuel_used_l
-                diesel_fuel_scan_l += fuel_used_l
-                if state["diesel_fuel_inventory_l"] <= 1e-9:
-                    state["diesel_fuel_inventory_l"] = 0.0
-                    state["diesel_mw"] = 0.0
-                    state["diesel_started"] = False
-            if state["diesel_mw"] < 0.01 and state["diesel_start_timer_s"] == 0:
+            online_units = [unit for unit in state["diesel_units"].values() if unit["started"]]
+            fuel_for_interval_l = (state["diesel_fuel_inventory_l"] * 3600.0
+                                   / frequency_interval_s)
+            idle_rate_l_h = self.DIESEL_IDLE_FUEL_L_H / len(self.DIESEL_UNITS)
+            fuel_limited_power_mw = max(0.0,
+                (fuel_for_interval_l - idle_rate_l_h * len(online_units))
+                / self.DIESEL_FUEL_L_PER_MWH)
+            requested_targets = {}
+            for key, unit in state["diesel_units"].items():
+                droop_share = (self.DIESEL_DROOP_MW_PER_HZ
+                               * unit["capacity_mw"] / self.DIESEL_TOTAL_CAPACITY_MW)
+                droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+                         * droop_share if unit["started"] else 0.0)
+                requested_targets[key] = min(unit["available_capacity_mw"],
+                    max(0.0, unit["dispatch_target_mw"] + droop))
+            requested_total = sum(requested_targets.values())
+            fuel_scale = min(1.0, fuel_limited_power_mw / requested_total) if requested_total > 1e-9 else 1.0
+            for key, unit in state["diesel_units"].items():
+                diesel_target = requested_targets[key] * fuel_scale
+                unit["governor_bias_mw"] = diesel_target - unit["dispatch_target_mw"]
+                ramp = (self.DIESEL_RAMP_MW_PER_S * unit["capacity_mw"] / 8.0
+                        * frequency_interval_s)
+                unit["output_mw"] += min(ramp,
+                    max(-ramp, diesel_target - unit["output_mw"]))
+                if (unit["output_mw"] < 0.01 and diesel_target < 0.01
+                        and unit["start_timer_s"] <= 0.0):
+                    unit["output_mw"] = 0.0
+                    unit["started"] = False
+                    unit["start_timer_s"] = 0.0
+            state["diesel_mw"] = sum(unit["output_mw"]
+                                     for unit in state["diesel_units"].values())
+            state["diesel_governor_bias_mw"] = sum(unit["governor_bias_mw"]
+                                                   for unit in state["diesel_units"].values())
+            online_units = [unit for unit in state["diesel_units"].values() if unit["started"]]
+            fuel_rate_l_h = (self.DIESEL_IDLE_FUEL_L_H / len(self.DIESEL_UNITS)
+                             * len(online_units)
+                             + state["diesel_mw"] * self.DIESEL_FUEL_L_PER_MWH)
+            fuel_used_l = min(state["diesel_fuel_inventory_l"],
+                              fuel_rate_l_h * frequency_interval_s / 3600.0)
+            state["diesel_fuel_inventory_l"] -= fuel_used_l
+            state["diesel_fuel_used_l"] += fuel_used_l
+            diesel_fuel_scan_l += fuel_used_l
+            if state["diesel_fuel_inventory_l"] <= 1e-9:
+                state["diesel_fuel_inventory_l"] = 0.0
                 state["diesel_mw"] = 0.0
-                state["diesel_started"] = False
+                for unit in state["diesel_units"].values():
+                    unit["output_mw"] = 0.0
+                    unit["started"] = False
+                    unit["start_timer_s"] = 0.0
+            state["diesel_started"] = any(unit["started"]
+                                           for unit in state["diesel_units"].values())
 
             battery_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
                              * self.BATTERY_DROOP_MW_PER_HZ)
@@ -767,10 +841,12 @@ class MinePowerNetwork:
         grid = state["grid_import_mw"]
         mine = state["process_load_mw"] + state["water_load_mw"] + state["site_load_mw"]
         diesel = state["diesel_mw"]
+        diesel_01 = state["diesel_units"]["turbine_generator_01"]
+        diesel_02 = state["diesel_units"]["turbine_generator_02"]
         values = {
             "Grid generation": {
-                "Turbine generator 01": {"active_power": (diesel * .6, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .6, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (62 + diesel * 1.7, "°C", 0, 150)},
-                "Turbine generator 02": {"active_power": (diesel * .4, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .4, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (58 + diesel * 1.5, "°C", 0, 150)},
+                "Turbine generator 01": {"active_power": (diesel_01["output_mw"], "MW", 0, diesel_01["capacity_mw"]), "available_capacity": (diesel_01["available_capacity_mw"], "MW", 0, diesel_01["capacity_mw"]), "dispatch_target": (diesel_01["dispatch_target_mw"], "MW", 0, diesel_01["capacity_mw"]), "governor_bias": (diesel_01["governor_bias_mw"], "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel_01["started"]), "bool", 0, 1), "start_timer": (diesel_01["start_timer_s"], "s", 0, 30), "transformer_oil_temp": (62 + diesel_01["output_mw"] * 1.7, "°C", 0, 150)},
+                "Turbine generator 02": {"active_power": (diesel_02["output_mw"], "MW", 0, diesel_02["capacity_mw"]), "available_capacity": (diesel_02["available_capacity_mw"], "MW", 0, diesel_02["capacity_mw"]), "dispatch_target": (diesel_02["dispatch_target_mw"], "MW", 0, diesel_02["capacity_mw"]), "governor_bias": (diesel_02["governor_bias_mw"], "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel_02["started"]), "bool", 0, 1), "start_timer": (diesel_02["start_timer_s"], "s", 0, 30), "transformer_oil_temp": (58 + diesel_02["output_mw"] * 1.5, "°C", 0, 150)},
                 "Solar farm": {"active_power": (state["solar_mw"], "MW", 0, 5), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["solar_mw"] > .1), "bool", 0, 1), "power_quality_thd": (2.2, "%", 0, 20)},
                 "Battery storage": {"active_power": (state["battery_power_mw"], "MW", -4, 6), "scan_average_power": (state["battery_scan_average_power_mw"], "MW", -4, 6), "conversion_loss": (state["battery_conversion_loss_mw"], "MW", 0, 1), "frequency_response": (state["battery_frequency_response_mw"], "MW", -6, 6), "state_of_charge": (state["battery_soc_pct"], "%", 0, 100), "breaker_state": (1.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53)},
                 "Black start unit": {"active_power": (0.0, "MW", 0, 3), "breaker_state": (0.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "equipment_running": (0.0, "bool", 0, 1)},
