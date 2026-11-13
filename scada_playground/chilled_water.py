@@ -11,6 +11,8 @@ class ChilledWaterPlant:
     STORAGE_CAPACITY_MWH = 1.5
     STORAGE_TARGET_MWH = 0.95
     STORAGE_CHARGE_LIMIT_KW = 120.0
+    CHILLED_WATER_DESIGN_DELTA_T_K = 6.0
+    WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
     PRODUCT_CP_KJ_KG_K = 4.186
@@ -33,6 +35,7 @@ class ChilledWaterPlant:
             "storage_capacity_mwh": self.STORAGE_CAPACITY_MWH,
             "storage_charge_kw": 0.0,
             "storage_discharge_kw": 0.0,
+            "storage_discharge_capacity_kw": 0.0,
             "supply_temperature_c": 6.0,
             "return_temperature_c": 11.0,
             "condenser_entering_temperature_c": 30.0,
@@ -113,6 +116,11 @@ class ChilledWaterPlant:
         evaporating_temp = state["supply_temperature_c"] - 3.0
         lift = max(10.0, condenser_temp - evaporating_temp)
         state["cop"] = max(2.5, min(7.0, 0.52 * (evaporating_temp + 273.15) / lift))
+        hydraulic_capacity_kw = (state["pump_flow_m3h"]
+                                 * self.WATER_HEAT_CAPACITY_KWH_PER_M3_K
+                                 * self.CHILLED_WATER_DESIGN_DELTA_T_K)
+        hydraulic_derate = min(1.0, hydraulic_capacity_kw
+                               / max(sum(self.CHILLER_CAPACITY_KW.values()), 1e-9))
         capacity_by_unit = {}
         available_capacity = 0.0
         for name, unit in state["chillers"].items():
@@ -123,7 +131,7 @@ class ChilledWaterPlant:
             availability *= max(0.0, 1.0 - 0.65 * unit_degradation)
             ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, ambient - 25.0)) * tower_factor
             unit["available_fraction"] = availability
-            capacity = unit["capacity_kw"] * availability * ambient_derate * min(1.0, pump_fraction / 0.25)
+            capacity = unit["capacity_kw"] * availability * ambient_derate * hydraulic_derate
             unit["available_capacity_kw"] = capacity
             capacity_by_unit[name] = capacity
             available_capacity += capacity
@@ -140,10 +148,9 @@ class ChilledWaterPlant:
             target = min(capacity_by_unit[name], remaining_target)
             prior = unit["output_kw"]
             ramp = 18.0 if target > prior else 35.0
-            if unit["available_fraction"] <= 0.01:
-                # A tripped compressor cannot keep making refrigeration; the
-                # chilled-water store, not fictitious compressor output, bridges
-                # the scan after a total electrical loss.
+            if unit["available_fraction"] <= 0.01 or capacity_by_unit[name] <= 0.01:
+                # No compressor output without power, chilled-water flow, or
+                # heat rejection capacity.
                 unit["output_kw"] = 0.0
             else:
                 unit["output_kw"] = min(capacity_by_unit[name], max(0.0,
@@ -155,7 +162,9 @@ class ChilledWaterPlant:
         dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
         deficit_kw = max(0.0, demand - production)
         available_store_kw = (state["storage_mwh"] * 3_600_000.0 / dt_s if dt_s > 0 else 0.0)
-        discharge = min(deficit_kw, available_store_kw)
+        storage_discharge_capacity_kw = max(0.0, hydraulic_capacity_kw - production)
+        state["storage_discharge_capacity_kw"] = storage_discharge_capacity_kw
+        discharge = min(deficit_kw, available_store_kw, storage_discharge_capacity_kw)
         served = min(demand, production + discharge)
         net_storage_kw = production - served
         state["storage_mwh"] = max(0.0, min(self.STORAGE_CAPACITY_MWH,
@@ -184,7 +193,8 @@ class ChilledWaterPlant:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "ambient_temperature_c", "cooling_demand_kw",
                 "cooling_production_kw", "cooling_served_kw", "cooling_service_fraction",
-                "storage_mwh", "supply_temperature_c", "return_temperature_c", "cop",
+                "storage_mwh", "storage_discharge_capacity_kw",
+                "supply_temperature_c", "return_temperature_c", "cop",
                 "pump_flow_m3h", "electric_load_mw")})
             state["history"] = state["history"][-1_440:]
 
@@ -202,7 +212,10 @@ class ChilledWaterPlant:
             ("Chilled water", "Thermal storage"): {
                 "state_of_charge": (100.0 * state["storage_mwh"] / self.STORAGE_CAPACITY_MWH, "%", 0, 100),
                 "stored_cooling": (state["storage_mwh"], "MWh", 0, self.STORAGE_CAPACITY_MWH),
-                "charge_rate": (state["storage_charge_kw"], "kW", -2_000, 2_000),
+                "charge_rate": (state["storage_charge_kw"], "kW", 0, 200),
+                "discharge_rate": (state["storage_discharge_kw"], "kW", 0, 2_000),
+                "available_discharge_capacity": (
+                    state["storage_discharge_capacity_kw"], "kW", 0, 2_000),
             },
             ("Chilled water", "Cooling tower"): {
                 "ambient_temperature": (state["ambient_temperature_c"], "°C", -20, 60),
