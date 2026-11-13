@@ -26,6 +26,9 @@ class MinePowerNetwork:
     SOURCE_R_PU = 0.004
     SOURCE_X_PU = 0.035
     CAPACITOR_SWITCH_DELAY_S = 10
+    NOMINAL_FREQUENCY_HZ = 50.0
+    DIESEL_DROOP_MW_PER_HZ = 2.67
+    BATTERY_DROOP_MW_PER_HZ = 2.4
     DISTRIBUTION_FEEDERS = {
         "north": {"share": 0.38, "cap_share": 0.60, "nominal_kv": 33.0,
                   "rating_mva": 22.0, "r_pu": 0.018, "x_pu": 0.060, "power_factor": 0.92},
@@ -66,8 +69,10 @@ class MinePowerNetwork:
             "process_feeder_capacity_mw": 32.0, "water_feeder_capacity_mw": 2.5,
             "solar_mw": 2.2, "diesel_mw": 0.0, "diesel_available_mw": 8.0,
             "diesel_start_timer_s": 0, "diesel_started": False,
+            "diesel_governor_bias_mw": 0.0,
             "battery_soc_pct": 82.0, "battery_energy_mwh": 16.4,
             "battery_capacity_mwh": 20.0, "battery_power_mw": 0.0,
+            "battery_frequency_response_mw": 0.0,
             "battery_discharge_ramp_mw_s": 6.0, "battery_charge_ramp_mw_s": 1.5,
             "transformers": {
                 "grid_a": {"top_oil_c": 58.0, "hotspot_c": 73.0, "cooling_stage": 0},
@@ -149,6 +154,7 @@ class MinePowerNetwork:
         for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
                     "source_voltage_pu", "capacitor_bank_stage", "capacitor_bank_mvar",
                     "capacitor_control_timer_s",
+                    "diesel_governor_bias_mw", "battery_frequency_response_mw",
                     "distribution_feeders", "battery_discharge_ramp_mw_s",
                     "battery_charge_ramp_mw_s"):
             state.setdefault(key, initial_state[key])
@@ -256,7 +262,12 @@ class MinePowerNetwork:
                 state["diesel_started"] = True
         else:
             state["diesel_start_timer_s"] = max(0, state["diesel_start_timer_s"] - 2)
-        diesel_target = min(diesel_cap, residual_after_grid_and_solar) if state["diesel_started"] else 0.0
+        diesel_base_target = (min(diesel_cap, residual_after_grid_and_solar)
+                              if state["diesel_started"] else 0.0)
+        diesel_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+                        * self.DIESEL_DROOP_MW_PER_HZ if state["diesel_started"] else 0.0)
+        diesel_target = min(diesel_cap, max(0.0, diesel_base_target + diesel_droop))
+        state["diesel_governor_bias_mw"] = diesel_target - diesel_base_target
         state["diesel_mw"] += min(0.12, max(-0.12, diesel_target - state["diesel_mw"]))
         if state["diesel_mw"] < 0.01 and state["diesel_start_timer_s"] == 0:
             state["diesel_mw"] = 0.0
@@ -264,12 +275,17 @@ class MinePowerNetwork:
 
         grid_for_load = min(tie_cap, max(0.0, source_request - solar - state["diesel_mw"]))
         deficit = max(0.0, source_request - solar - state["diesel_mw"] - grid_for_load)
-        battery_target = min(state["battery_discharge_limit_mw"], deficit,
-                             state["battery_energy_mwh"] * 3600.0)
+        battery_base_target = min(state["battery_discharge_limit_mw"], deficit,
+                                  state["battery_energy_mwh"] * 3600.0)
         if deficit <= 1e-9 and state["battery_energy_mwh"] < state["battery_capacity_mwh"]:
             charge_headroom = min(state["battery_charge_limit_mw"], tie_cap - grid_for_load,
                                   (state["battery_capacity_mwh"] - state["battery_energy_mwh"]) * 3600.0)
-            battery_target = -max(0.0, charge_headroom)
+            battery_base_target = -max(0.0, charge_headroom)
+        battery_droop = ((self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
+                         * self.BATTERY_DROOP_MW_PER_HZ)
+        battery_target = min(state["battery_discharge_limit_mw"], max(
+            -state["battery_charge_limit_mw"], battery_base_target + battery_droop))
+        state["battery_frequency_response_mw"] = battery_target - battery_base_target
         # The inverter responds quickly when increasing discharge to arrest a
         # deficit; charging and discharge reduction use a slower controlled ramp.
         previous_battery = state["battery_power_mw"]
@@ -343,12 +359,14 @@ class MinePowerNetwork:
             net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
                    - estimated_network_losses)
         previous_frequency = state["frequency_hz"]
-        state["frequency_hz"] += 0.035 * net - 0.16 * (state["frequency_hz"] - 50.0)
+        state["frequency_hz"] += 0.035 * net - 0.16 * (
+            state["frequency_hz"] - self.NOMINAL_FREQUENCY_HZ)
         # A closed utility intertie is a stiff frequency reference. This compact
         # model does not simulate phase matching, so a restored tie re-locks the
         # mine bus to nominal instead of inventing an islanded frequency overshoot.
         grid_coupling = 0.98 * min(1.0, tie_cap / 44.0)
-        state["frequency_hz"] += grid_coupling * (50.0 - state["frequency_hz"])
+        state["frequency_hz"] += grid_coupling * (
+            self.NOMINAL_FREQUENCY_HZ - state["frequency_hz"])
         state["frequency_rocof_hz_s"] = state["frequency_hz"] - previous_frequency
         state["frequency_nadir_hz"] = min(state.get("frequency_nadir_hz", 50.0), state["frequency_hz"])
         state["frequency_window_nadir_hz"] = min(
@@ -472,10 +490,10 @@ class MinePowerNetwork:
         diesel = state["diesel_mw"]
         values = {
             "Grid generation": {
-                "Turbine generator 01": {"active_power": (diesel * .6, "MW", 0, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (62 + diesel * 1.7, "°C", 0, 150)},
-                "Turbine generator 02": {"active_power": (diesel * .4, "MW", 0, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (58 + diesel * 1.5, "°C", 0, 150)},
+                "Turbine generator 01": {"active_power": (diesel * .6, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .6, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (62 + diesel * 1.7, "°C", 0, 150)},
+                "Turbine generator 02": {"active_power": (diesel * .4, "MW", 0, 8), "governor_bias": (state["diesel_governor_bias_mw"] * .4, "MW", -8, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(diesel > .1), "bool", 0, 1), "transformer_oil_temp": (58 + diesel * 1.5, "°C", 0, 150)},
                 "Solar farm": {"active_power": (state["solar_mw"], "MW", 0, 5), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["solar_mw"] > .1), "bool", 0, 1), "power_quality_thd": (2.2, "%", 0, 20)},
-                "Battery storage": {"active_power": (state["battery_power_mw"], "MW", -4, 6), "state_of_charge": (state["battery_soc_pct"], "%", 0, 100), "breaker_state": (1.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53)},
+                "Battery storage": {"active_power": (state["battery_power_mw"], "MW", -4, 6), "frequency_response": (state["battery_frequency_response_mw"], "MW", -6, 6), "state_of_charge": (state["battery_soc_pct"], "%", 0, 100), "breaker_state": (1.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53)},
                 "Black start unit": {"active_power": (0.0, "MW", 0, 3), "breaker_state": (0.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "equipment_running": (0.0, "bool", 0, 1)},
             },
             "Grid transmission": {

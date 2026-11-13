@@ -84,6 +84,39 @@ class MinePowerNetworkTests(unittest.TestCase):
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
         self.assertEqual(tags["grid_distribution.capacitor_bank.stage"]["value"], 2.0)
 
+    def test_battery_frequency_droop_reduces_charging_when_frequency_is_low(self):
+        nominal = self.model.initialize()
+        low_frequency = self.model.initialize()
+        low_frequency["frequency_hz"] = 49.0
+        self.model.advance(nominal, 1, [], process_load_mw=8.0,
+                           water_load_mw=0.5, seed=17)
+        self.model.advance(low_frequency, 1, [], process_load_mw=8.0,
+                           water_load_mw=0.5, seed=17)
+
+        self.assertGreater(low_frequency["battery_power_mw"], nominal["battery_power_mw"])
+        self.assertEqual(low_frequency["battery_frequency_response_mw"], 2.4)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(low_frequency)}
+        self.assertAlmostEqual(tags["grid_generation.battery_storage.frequency_response"]["value"],
+                               2.4, delta=0.02)
+
+    def test_diesel_governor_increases_output_below_nominal_frequency(self):
+        nominal = self.model.initialize()
+        low_frequency = self.model.initialize()
+        for state, frequency in ((nominal, 50.0), (low_frequency, 49.0)):
+            state["frequency_hz"] = frequency
+            state["diesel_started"] = True
+            state["diesel_start_timer_s"] = 30
+            state["diesel_mw"] = 1.0
+            self.model.advance(state, 1, [], process_load_mw=28.0,
+                               water_load_mw=0.5, seed=17)
+
+        self.assertGreater(low_frequency["diesel_mw"], nominal["diesel_mw"])
+        self.assertEqual(low_frequency["diesel_governor_bias_mw"], 2.67)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(low_frequency)}
+        self.assertAlmostEqual(
+            tags["grid_generation.turbine_generator_01.governor_bias"]["value"],
+            1.602, delta=0.02)
+
     def test_old_power_snapshot_migrates_to_feeder_protection_state(self):
         for feeder in self.state["distribution_feeders"].values():
             for key in ("breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",
