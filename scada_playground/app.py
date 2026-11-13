@@ -871,12 +871,17 @@ with st.sidebar:
             if st.button("Clear all protocol faults", width="stretch"):
                 PROTOCOL_FAULTS.clear(sim)
 
-st.subheader("Live fleet map")
-if live_map_available():
-    st.link_button("Open live fleet map", "http://127.0.0.1:8502/map", type="primary")
-    st.caption("The dedicated map uses WebSockets. It stays in its own page while the dashboard updates.")
-else:
-    st.info("The live map and protocol endpoints are not running. Start the full playground with `./start_playground.sh`.")
+@st.fragment(run_every="5s")
+def render_live_map_status():
+    st.subheader("Live fleet map")
+    if live_map_available():
+        st.link_button("Open live fleet map", "http://127.0.0.1:8502/map", type="primary")
+        st.caption("The dedicated map uses WebSockets. It stays in its own page while the dashboard updates.")
+    else:
+        st.info("The live map and protocol endpoints are not running. Start the full playground with `./start_playground.sh`.")
+
+
+render_live_map_status()
 
 @st.fragment(run_every="1s")
 def render_dashboard():
