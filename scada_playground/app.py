@@ -747,6 +747,8 @@ def advance(force: bool = False) -> None:
     PROCESS_MODEL.advance(sim, force=force)
     utility_events = [event.__dict__ for event in sim["events"]]
     prior_factory_water_availability = sim["water_network"].get("factory_water_available_fraction", 1.0)
+    prior_boiler_feedwater_delivery_m3h = (
+        sim["water_network"].get("boiler_feedwater_in_transit_m3", 0.0) * 3600.0)
     prior_wastewater_availability = sim["water_network"].get("wastewater_available_fraction", 1.0)
     CHILLED_MODEL.advance(
         sim["chilled_water"], sim["tick"], utility_events,
@@ -758,6 +760,7 @@ def advance(force: bool = False) -> None:
         sim["plant_utilities"], sim["tick"], utility_events,
         power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
         water_available_fraction=prior_factory_water_availability,
+        boiler_feedwater_delivery_m3h=prior_boiler_feedwater_delivery_m3h,
         wastewater_available_fraction=prior_wastewater_availability,
         chilled_water_service_fraction=sim["chilled_water"]["cooling_service_fraction"],
         chilled_water_supply_temperature_c=sim["chilled_water"]["supply_temperature_c"],
@@ -870,6 +873,8 @@ def advance(force: bool = False) -> None:
                         concentrator_reclaim_m3h=sim["concentrator"]["concentrator_reclaim_m3h"],
                         factory_cip_demand_m3h=sim["plant_utilities"]["cip_water_demand_m3h"],
                         factory_cip_effluent_m3h=sim["plant_utilities"]["cip_effluent_m3h"],
+                        factory_boiler_feedwater_demand_m3h=(
+                            sim["plant_utilities"]["feedwater_demand_m3h"]),
                         factory_cip_return_ph=sim["plant_utilities"]["cip"]["return_ph"],
                         factory_cip_conductivity_us_cm=sim["plant_utilities"]["cip"]["return_conductivity_us_cm"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])

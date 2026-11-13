@@ -39,6 +39,7 @@ class FactoryUtilities:
     AIR_STANDARD_TEMPERATURE_K = 273.15
     AIR_RECEIVER_TEMPERATURE_K = 293.15
     CONDENSATE_CAPACITY_T = 30.0
+    FEEDWATER_TANK_CAPACITY_T = 30.0
     PRODUCT_TANK_CAPACITY_UNITS = 450.0
     PACKAGE_BUFFER_CAPACITY_UNITS = 180.0
     UNITS_PER_CASE = 3.0
@@ -60,9 +61,19 @@ class FactoryUtilities:
             "steam_consumption_tph": 32.0,
             "steam_service_fraction": 1.0,
             "condensate_inventory_t": 12.0,
+            "condensate_tank_overflow_t": 0.0,
+            "cumulative_condensate_overflow_t": 0.0,
             "condensate_return_tph": 25.6,
             "condensate_reuse_tph": 25.6,
             "feedwater_makeup_tph": 6.4,
+            "feedwater_demand_m3h": 6.4,
+            "feedwater_delivered_tph": 6.4,
+            "feedwater_tank_inventory_t": 18.0,
+            "feedwater_tank_capacity_t": self.FEEDWATER_TANK_CAPACITY_T,
+            "feedwater_service_fraction": 1.0,
+            "feedwater_tank_overflow_t": 0.0,
+            "cumulative_feedwater_overflow_t": 0.0,
+            "cumulative_feedwater_withdrawal_t": 0.0,
             "condensate_return_queue": [25.6] * 60,
             "pasteurizers": {
                 "pasteurizer_01": {"temperature_c": 82.0, "setpoint_c": 82.0,
@@ -182,6 +193,7 @@ class FactoryUtilities:
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
+                boiler_feedwater_delivery_m3h: float = 6.4,
                 wastewater_available_fraction: float = 1.0,
                 chilled_water_service_fraction: float = 1.0,
                 chilled_water_supply_temperature_c: float = 6.8,
@@ -194,6 +206,10 @@ class FactoryUtilities:
             # utility scan must represent one scan, not the entire old uptime.
             state["last_advance_seconds"] = max(0, sim_seconds - 1)
         state["sim_seconds"] = sim_seconds
+        dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
+        dt_hours = dt_s / 3_600.0
+        state["condensate_tank_overflow_t"] = 0.0
+        state["feedwater_tank_overflow_t"] = 0.0
         power_factor = max(0.0, min(1.0, power_available_fraction))
         cip_mechanical = self._event_severity(events, "Mechanical degradation", ("CIP",))
         self.CIP_MODEL.advance(
@@ -240,10 +256,64 @@ class FactoryUtilities:
         queued_return = state["condensate_return_queue"].pop(0)
         state["condensate_return_queue"].append(actual_steam_demand * condensate_fraction)
         state["condensate_return_tph"] = queued_return
-        state["condensate_reuse_tph"] = min(queued_return, boiler_total * 0.9)
-        state["condensate_inventory_t"] = max(0.0, min(self.CONDENSATE_CAPACITY_T,
-            state["condensate_inventory_t"] + (queued_return - state["condensate_reuse_tph"]) / 3600.0))
-        state["feedwater_makeup_tph"] = max(0.0, boiler_total - state["condensate_reuse_tph"])
+        condensate_available_t = (state["condensate_inventory_t"]
+                                  + queued_return * dt_hours)
+        feedwater_delivery_rate = max(0.0, boiler_feedwater_delivery_m3h)
+        feedwater_inventory = state["feedwater_tank_inventory_t"]
+        condensate_reuse = makeup_request = makeup_delivery = 0.0
+        if dt_hours > 0.0:
+            # Find the highest firing rate supported by feedwater inventory,
+            # stored condensate, and treated-water delivery in this scan.
+            low_generation, high_generation = 0.0, boiler_total
+            condensate_rate = condensate_available_t / dt_hours
+            for _ in range(32):
+                trial_generation = (low_generation + high_generation) / 2.0
+                trial_reuse = min(trial_generation * 0.9, condensate_rate)
+                trial_available = (feedwater_inventory
+                    + (trial_reuse + feedwater_delivery_rate) * dt_hours)
+                if trial_available >= trial_generation * dt_hours:
+                    low_generation = trial_generation
+                else:
+                    high_generation = trial_generation
+            boiler_total = low_generation
+            # A dry boiler feed tank cannot sustain firing. Reduce both boilers
+            # together while preserving their parallel load share.
+            output_total = sum(boiler["output_tph"] for boiler in state["boilers"].values())
+            if output_total > 1e-9 and boiler_total < output_total:
+                output_scale = boiler_total / output_total
+                for boiler in state["boilers"].values():
+                    boiler["output_tph"] *= output_scale
+            condensate_reuse = min(boiler_total * 0.9,
+                                   condensate_available_t / dt_hours)
+            makeup_request = max(0.0, boiler_total - condensate_reuse)
+            makeup_delivery = feedwater_delivery_rate
+            state["feedwater_service_fraction"] = min(1.0,
+                makeup_delivery / makeup_request) if makeup_request > 1e-9 else 1.0
+            condensate_used_t = condensate_reuse * dt_hours
+            condensate_after_reuse_t = max(0.0, condensate_available_t - condensate_used_t)
+            state["condensate_tank_overflow_t"] = max(
+                0.0, condensate_after_reuse_t - self.CONDENSATE_CAPACITY_T)
+            state["cumulative_condensate_overflow_t"] += state["condensate_tank_overflow_t"]
+            state["condensate_inventory_t"] = min(self.CONDENSATE_CAPACITY_T,
+                                                    condensate_after_reuse_t)
+            feedwater_unconstrained_t = (feedwater_inventory
+                + (condensate_reuse + makeup_delivery - boiler_total) * dt_hours)
+            state["feedwater_tank_overflow_t"] = max(
+                0.0, feedwater_unconstrained_t - self.FEEDWATER_TANK_CAPACITY_T)
+            state["cumulative_feedwater_overflow_t"] += state["feedwater_tank_overflow_t"]
+            state["feedwater_tank_inventory_t"] = max(0.0, min(
+                self.FEEDWATER_TANK_CAPACITY_T, feedwater_unconstrained_t))
+            state["cumulative_feedwater_withdrawal_t"] += boiler_total * dt_hours
+        else:
+            condensate_reuse = min(queued_return, boiler_total * 0.9)
+            makeup_request = max(0.0, boiler_total - condensate_reuse)
+            makeup_delivery = feedwater_delivery_rate
+            state["feedwater_service_fraction"] = min(1.0,
+                makeup_delivery / makeup_request) if makeup_request > 1e-9 else 1.0
+        state["condensate_reuse_tph"] = condensate_reuse
+        state["feedwater_makeup_tph"] = makeup_request
+        state["feedwater_demand_m3h"] = makeup_request
+        state["feedwater_delivered_tph"] = makeup_delivery
         state["steam_generation_tph"] = boiler_total
         state["steam_demand_tph"] = steam_demand
         state["steam_consumption_tph"] = actual_steam_demand
@@ -302,7 +372,6 @@ class FactoryUtilities:
         state["electric_load_mw"] = (air_supply * 60.0 * 0.11 / 1000.0 + 0.08
                                      + (0.08 if state["cip"]["active"] else 0.0))
 
-        dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
         dt_min = dt_s / 60.0
         raw_product_rate = 0.0
         product_tank_headroom_control = max(0.5, 1.0 - 0.5 * max(0.0,
@@ -437,8 +506,15 @@ class FactoryUtilities:
             },
             ("Boiler house", "Feedwater system"): {
                 "makeup_flow": (state["feedwater_makeup_tph"], "t/h", 0, 40),
+                "makeup_demand": (state["feedwater_demand_m3h"], "m³/h", 0, 40),
+                "makeup_delivered": (state["feedwater_delivered_tph"], "t/h", 0, 40),
                 "feedwater_pressure": (1_150 * min(1.0, state["steam_generation_tph"] / 32), "kPa", 0, 1_600),
                 "condensate_tank_level": (100 * state["condensate_inventory_t"] / self.CONDENSATE_CAPACITY_T, "%", 0, 100),
+                "condensate_tank_overflow": (state["condensate_tank_overflow_t"], "t/scan", 0, 1),
+                "cumulative_condensate_overflow": (state["cumulative_condensate_overflow_t"], "t", 0, 1_000),
+                "feedwater_tank_level": (100 * state["feedwater_tank_inventory_t"] / self.FEEDWATER_TANK_CAPACITY_T, "%", 0, 100),
+                "feedwater_tank_inventory": (state["feedwater_tank_inventory_t"], "t", 0, self.FEEDWATER_TANK_CAPACITY_T),
+                "feedwater_tank_overflow": (state["feedwater_tank_overflow_t"], "t", 0, 5),
                 "pump_current": (42 + 35 * min(1.0, state["steam_generation_tph"] / 32), "A", 0, 150),
                 "conductivity": (28.0 + 2 * state["feedwater_makeup_tph"], "µS/cm", 0, 300),
             },
