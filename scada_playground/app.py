@@ -903,7 +903,7 @@ def render_dashboard():
         plant = sim["concentrator"]
         control = sim["process_control"]
         st.subheader("Copper concentrator · ore-to-tailings process circuit")
-        st.caption("Crusher and mill power limits, ore hardness, finite buffers, three grinding size classes, size-dependent cyclone partition, first-order flotation kinetics, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
+        st.caption("Crusher and mill power limits, ore hardness, finite buffers, per-pass breakage across three size classes, cyclone reject recirculation, first-order flotation kinetics, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
         metric_cols = st.columns(6)
         metric_values = [
             ("Plant feed", f"{plant['plant_feed_tph']:.0f} t/h"),
@@ -915,7 +915,7 @@ def render_dashboard():
         ]
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
-        st.caption(f"Grinding size fractions · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
+        st.caption(f"Mill feed size classes · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · breakage/pass {plant['coarse_breakage_per_pass']*100:.0f}% coarse, {plant['intermediate_breakage_per_pass']*100:.0f}% intermediate · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. It is not a certified safety PLC or safety instrumented system. The factory timeline must be running or single-stepped for sequences to progress.")
             state_col, buttons = st.columns([1.1, 2])
