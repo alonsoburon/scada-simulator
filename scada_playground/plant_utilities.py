@@ -1,12 +1,14 @@
 """Low-compute steam and instrument-air dynamics for the synthetic factory."""
 from __future__ import annotations
 
-import random
-
 try:  # Support both package imports in tests and direct app imports.
     from .cip_system import CleaningInPlaceSystem
 except ImportError:
     from cip_system import CleaningInPlaceSystem
+try:
+    from .instrumentation import correlated_sensor_noise
+except ImportError:
+    from instrumentation import correlated_sensor_noise
 
 
 class FactoryUtilities:
@@ -349,7 +351,6 @@ class FactoryUtilities:
             state["history"] = state["history"][-1_440:]
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
-        rng = random.Random(seed * 1_000_003 + state["sim_seconds"] * 9_176)
         pressure = state["steam_header_pressure_bar"]
         air_pressure = state["air_receiver_pressure_bar"]
         steam = state["steam_consumption_tph"]
@@ -484,7 +485,10 @@ class FactoryUtilities:
         for (area, asset), signals in values.items():
             for sensor, (truth, units, low, high) in signals.items():
                 tag = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{sensor}"
-                noise = 0.0 if units == "bool" else rng.gauss(0, max(high - low, 1e-9) * 0.001)
+                discrete = units in {"bool", "phase"} or sensor == "temperature_compliance"
+                noise = (correlated_sensor_noise(
+                    state, tag, seed, state["sim_seconds"], max(high - low, 1e-9) * 0.001)
+                    if not discrete else 0.0)
                 rows.append({"tag": tag, "area": area, "unit": asset, "sensor": sensor,
                     "units": units, "value": round(min(high, max(low, truth + noise)), 3),
                     "quality": "GOOD", "low": low, "high": high, "base": (low + high) / 2,
