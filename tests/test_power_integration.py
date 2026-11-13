@@ -2,6 +2,7 @@ import unittest
 
 from scada_playground.concentrator import CopperConcentrator
 from scada_playground.power_network import MinePowerNetwork
+from scada_playground.plant_utilities import FactoryUtilities
 from scada_playground.water_network import MineWaterNetwork
 
 
@@ -62,6 +63,37 @@ class MinePowerIntegrationTests(unittest.TestCase):
         self.assertGreater(power["process_power_fraction"], process_fraction_during_outage)
         self.assertGreater(concentrator["plant_feed_tph"], 0)
         self.assertGreaterEqual(water_model.total_inventory_m3(water), 0)
+
+    def test_long_grid_and_generation_loss_depletes_battery_then_collapses_steam_and_air(self):
+        power_model = MinePowerNetwork()
+        utility_model = FactoryUtilities()
+        power = power_model.initialize()
+        utilities = utility_model.initialize()
+        outage = [
+            {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"},
+            {"name": "Utility loss", "area": "Grid generation", "severity": "Large"},
+        ]
+        initial_air_pressure = utilities["air_receiver_pressure_bar"]
+        initial_steam_pressure = utilities["steam_header_pressure_bar"]
+        utility_loss_started_at = None
+
+        for tick in range(1, 11_001):
+            utility_model.advance(utilities, tick, outage,
+                                 power_available_fraction=power["factory_utilities_power_fraction"])
+            power_model.advance(power, tick, outage, process_load_mw=28.0,
+                                water_load_mw=0.8,
+                                utility_load_mw=utilities["electric_load_mw"])
+            if (utility_loss_started_at is None
+                    and power["factory_utilities_power_fraction"] < 0.99):
+                utility_loss_started_at = tick
+
+        self.assertGreater(utility_loss_started_at, 9_000)
+        self.assertAlmostEqual(power["battery_energy_mwh"], 0.0)
+        self.assertEqual(power["factory_utilities_power_fraction"], 0.0)
+        self.assertLess(utilities["air_receiver_pressure_bar"], initial_air_pressure - 3.0)
+        self.assertLess(utilities["steam_header_pressure_bar"], initial_steam_pressure - 2.0)
+        self.assertEqual(utilities["air_supply_nm3_min"], 0.0)
+        self.assertGreater(power["unserved_load_mw"], 20.0)
 
 
 if __name__ == "__main__":

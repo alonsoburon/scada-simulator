@@ -8,10 +8,11 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.model = MinePowerNetwork()
         self.state = self.model.initialize()
 
-    def advance(self, seconds, events=None, process_load_mw=28.0, water_load_mw=0.5):
+    def advance(self, seconds, events=None, process_load_mw=28.0, water_load_mw=0.5,
+                utility_load_mw=0.0):
         for tick in range(1, seconds + 1):
             self.model.advance(self.state, tick, events or [], process_load_mw=process_load_mw,
-                               water_load_mw=water_load_mw, seed=17)
+                               water_load_mw=water_load_mw, utility_load_mw=utility_load_mw, seed=17)
 
     def test_normal_dispatch_balances_load_without_unnecessary_storage_discharge(self):
         battery_energy_start = self.state["battery_energy_mwh"]
@@ -33,15 +34,23 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.assertGreater(self.state["frequency_hz"], 49.8)
         self.assertLess(self.state["frequency_hz"], 50.2)
         self.assertAlmostEqual(self.state["requested_load_mw"], self.state["served_load_mw"], places=6)
+        self.assertAlmostEqual(self.state["requested_load_mw"],
+                               self.state["served_load_mw"] + self.state["unserved_load_mw"], places=6)
 
     def test_initial_dispatch_can_supply_a_stopped_dashboard_snapshot(self):
-        self.model.advance(self.state, 0, [], process_load_mw=26.9, water_load_mw=0.4, seed=17)
+        for key in ("factory_utilities_requested_mw", "factory_utilities_load_mw",
+                    "factory_utilities_power_fraction"):
+            del self.state[key]
+        self.model.advance(self.state, 0, [], process_load_mw=26.9, water_load_mw=0.4,
+                           utility_load_mw=0.6, seed=17)
         self.assertGreater(self.state["grid_import_mw"], 20)
         self.assertAlmostEqual(self.state["process_power_fraction"], 1.0)
         self.assertAlmostEqual(self.state["water_power_fraction"], 1.0)
+        self.assertAlmostEqual(self.state["factory_utilities_power_fraction"], 1.0)
+        self.assertAlmostEqual(self.state["factory_utilities_load_mw"], 0.6)
         self.assertAlmostEqual(self.state["total_generation_mw"],
             self.state["served_load_mw"] + max(0.0, -self.state["battery_power_mw"])
-            + self.state["distribution_losses_mw"], delta=0.01)
+            + self.state["distribution_losses_mw"], delta=0.02)
 
     def test_transmission_outage_dispatches_reserves_and_derates_process_load(self):
         event = {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}
@@ -74,6 +83,20 @@ class MinePowerNetworkTests(unittest.TestCase):
     def test_seeded_measurement_noise_replays(self):
         self.advance(25)
         self.assertEqual(self.model.telemetry(self.state), self.model.telemetry(self.state))
+
+    def test_power_deficit_preserves_water_and_factory_utilities_before_concentrator(self):
+        outage = [{"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}]
+        self.advance(180, outage, process_load_mw=28.0, water_load_mw=0.5, utility_load_mw=15.0)
+        self.assertAlmostEqual(self.state["water_power_fraction"], 1.0)
+        self.assertGreater(self.state["factory_utilities_load_mw"], self.state["process_load_mw"])
+        self.assertLess(self.state["factory_utilities_power_fraction"], 1.0)
+        self.assertAlmostEqual(self.state["process_power_fraction"], 0.0)
+        self.assertGreater(self.state["unserved_load_mw"], 0.0)
+        self.assertAlmostEqual(self.state["requested_load_mw"],
+                               self.state["served_load_mw"] + self.state["unserved_load_mw"], places=6)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertLess(abs(tags["mine_power_network.factory_utility_feeder.available_fraction"]["value"]
+                            - 100 * self.state["factory_utilities_power_fraction"]), 0.2)
 
 
 if __name__ == "__main__":

@@ -243,11 +243,11 @@ def initialize(seed: int = 17) -> None:
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
         initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
-                                     + concentrator_state["crusher_power_mw"] + 1.0
-                                     + utility_state["electric_load_mw"])
+                                     + concentrator_state["crusher_power_mw"] + 1.0)
         initial_water_power_mw = sum(pump["power_kw"] for pump in water_state["pumps"].values()) / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
-                            water_load_mw=initial_water_power_mw, seed=seed)
+                            water_load_mw=initial_water_power_mw,
+                            utility_load_mw=utility_state["electric_load_mw"], seed=seed)
         power_tags = POWER_MODEL.telemetry(power_state)
         power_assets = {(area, asset) for area, assets in POWER_MODEL.AREA_ASSETS.items() for asset in assets}
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in power_assets]
@@ -317,11 +317,16 @@ def initialize(seed: int = 17) -> None:
         if "power_network" not in sim:
             sim["power_network"] = POWER_MODEL.initialize()
             process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                               + sim["concentrator"]["crusher_power_mw"] + 1.0
-                               + sim["plant_utilities"]["electric_load_mw"])
+                               + sim["concentrator"]["crusher_power_mw"] + 1.0)
             water_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
-                                water_load_mw=water_load_mw, seed=sim["seed"])
+                                water_load_mw=water_load_mw,
+                                utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                                seed=sim["seed"])
+        utility_power_demand = sim["plant_utilities"]["electric_load_mw"]
+        sim["power_network"].setdefault("factory_utilities_requested_mw", utility_power_demand)
+        sim["power_network"].setdefault("factory_utilities_load_mw", utility_power_demand)
+        sim["power_network"].setdefault("factory_utilities_power_fraction", 1.0)
         power_assets = {(area, asset) for area, assets in POWER_MODEL.AREA_ASSETS.items() for asset in assets}
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in power_assets]
         for tag in POWER_MODEL.telemetry(sim["power_network"]):
@@ -550,19 +555,21 @@ def advance(force: bool = False) -> None:
     SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
     PROCESS_MODEL.advance(sim, force=force)
     utility_events = [event.__dict__ for event in sim["events"]]
-    UTILITY_MODEL.advance(sim["plant_utilities"], sim["tick"], utility_events,
-                          power_available_fraction=sim["power_network"]["process_power_fraction"],
-                          seed=sim["seed"])
+    UTILITY_MODEL.advance(
+        sim["plant_utilities"], sim["tick"], utility_events,
+        power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
+        seed=sim["seed"],
+    )
     water_events = [event.__dict__ for event in sim["events"]
                     if event.area in ("Water supply network", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
     process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                             + sim["concentrator"]["crusher_power_mw"] + 1.0
-                             + sim["plant_utilities"]["electric_load_mw"])
+                             + sim["concentrator"]["crusher_power_mw"] + 1.0)
     water_power_load_mw = sum(pump["power_kw"] for pump in sim["water_network"]["pumps"].values()) / 1000.0
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
-                        water_load_mw=water_power_load_mw, seed=sim["seed"])
+                        water_load_mw=water_power_load_mw,
+                        utility_load_mw=sim["plant_utilities"]["electric_load_mw"], seed=sim["seed"])
     water_level = sim["water_network"]["nodes"]["process_tank"]["level_pct"]
     trips_before = sim["process_control"]["trip_count"]
     PLANT_CONTROLLER.advance(
@@ -686,6 +693,10 @@ def advance(force: bool = False) -> None:
         "water_feeder_limited": (power_state["water_power_fraction"] < 0.95,
                                  power_state["water_power_fraction"] > 0.98,
                                  "Water pumping electrical supply is feeder- or source-limited", "HIGH"),
+        "factory_utility_feeder_limited": (
+            power_state["factory_utilities_power_fraction"] < 0.95,
+            power_state["factory_utilities_power_fraction"] > 0.98,
+            "Factory steam and compressed-air electrical supply curtailed", "HIGH"),
         "battery_reserve": (power_state["battery_soc_pct"] < 20, power_state["battery_soc_pct"] > 30,
                             "Grid support battery reserve low", "HIGH"),
     }
@@ -1145,14 +1156,14 @@ def render_dashboard():
     with tabs[7]:
         power = sim["power_network"]
         st.subheader("Mine electrical network · dispatch and load response")
-        st.caption("Grid import, solar, diesel reserve, and battery storage supply site auxiliaries, water pumps, and the concentrator. Four radial feeders estimate voltage drop, reactive flow, current, and I²R loss with a linearized DistFlow approximation; protection and full AC load-flow behavior are outside this model.")
+        st.caption("Grid import, solar, diesel reserve, and battery storage supply essential services, mine water, factory utilities, the concentrator, and flexible auxiliaries. Under scarcity, the feeder model prioritizes essential controls and water, then steam/compressed-air utilities, then the concentrator. Four radial feeders estimate voltage drop, reactive flow, current, and I²R loss with a linearized DistFlow approximation; protection and full AC load-flow behavior are outside this model.")
         metrics = st.columns(7)
         for col, label, value in zip(metrics,
             ["Mine bus frequency", "Run frequency nadir", "Lowest feeder voltage", "Grid import", "Diesel generation", "Battery reserve", "Distribution losses"],
             [f"{power['frequency_hz']:.2f} Hz", f"{power['frequency_nadir_hz']:.2f} Hz", f"{power['voltage_pu']:.3f} pu", f"{power['grid_import_mw']:.1f} MW",
              f"{power['diesel_mw']:.1f} MW", f"{power['battery_soc_pct']:.1f}%", f"{power['distribution_losses_mw']:.2f} MW"]):
             col.metric(label, value)
-        st.caption(f"Solar {power['solar_mw']:.1f} MW · battery {power['battery_power_mw']:+.1f} MW (positive = discharging) · requested/served plant load {power['requested_load_mw']:.1f}/{power['served_load_mw']:.1f} MW · shed {power['load_shed_mw']:.1f} MW · process/water feeder limits {power['process_feeder_capacity_mw']:.1f}/{power['water_feeder_capacity_mw']:.1f} MW")
+        st.caption(f"Solar {power['solar_mw']:.1f} MW · battery {power['battery_power_mw']:+.1f} MW (positive = discharging) · requested/served plant load {power['requested_load_mw']:.1f}/{power['served_load_mw']:.1f} MW · shed {power['load_shed_mw']:.1f} MW · factory utilities {power['factory_utilities_load_mw']:.2f}/{power['factory_utilities_requested_mw']:.2f} MW ({power['factory_utilities_power_fraction']*100:.0f}%) · process/water feeder limits {power['process_feeder_capacity_mw']:.1f}/{power['water_feeder_capacity_mw']:.1f} MW")
 
         nodes = {
             "grid": (.08, .78, f"Transmission import<br>{power['grid_import_mw']:.1f} / {power['tie_capacity_mw']:.1f} MW"),
@@ -1161,8 +1172,9 @@ def render_dashboard():
             "battery": (.08, .09, f"Battery<br>{power['battery_power_mw']:+.1f} MW · {power['battery_soc_pct']:.0f}%"),
             "bus": (.50, .48, f"Mine bus<br>{power['frequency_hz']:.2f} Hz · {power['voltage_pu']:.3f} pu"),
             "site": (.91, .78, f"Site auxiliaries<br>{power['site_load_mw']:.1f} MW"),
-            "water": (.91, .50, f"Water pumps<br>{power['water_load_mw']:.2f} MW · {power['water_power_fraction']*100:.0f}%"),
-            "process": (.91, .20, f"Concentrator<br>{power['process_load_mw']:.1f} MW · {power['process_power_fraction']*100:.0f}%"),
+            "water": (.91, .62, f"Water pumps<br>{power['water_load_mw']:.2f} MW · {power['water_power_fraction']*100:.0f}%"),
+            "utilities": (.91, .39, f"Factory utilities<br>{power['factory_utilities_load_mw']:.2f} MW · {power['factory_utilities_power_fraction']*100:.0f}%"),
+            "process": (.91, .16, f"Concentrator<br>{power['process_load_mw']:.1f} MW · {power['process_power_fraction']*100:.0f}%"),
         }
         fig = go.Figure()
         source_colors = {"grid": "#277da1", "solar": "#f2a541", "diesel": "#e07a5f", "battery": "#9b5de5"}
@@ -1178,6 +1190,7 @@ def render_dashboard():
         for key, amount, color in [
             ("site", power["site_load_mw"], "#4c78a8"),
             ("water", power["water_load_mw"], "#43aa8b"),
+            ("utilities", power["factory_utilities_load_mw"], "#9b5de5"),
             ("process", power["process_load_mw"], "#e07a5f")]:
             x0, y0, _ = nodes["bus"]
             x1, y1, _ = nodes[key]

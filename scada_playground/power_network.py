@@ -15,7 +15,7 @@ class MinePowerNetwork:
         "Grid generation": ["Turbine generator 01", "Turbine generator 02", "Solar farm", "Battery storage", "Black start unit"],
         "Grid transmission": ["Transmission line A", "Transmission line B", "Grid substation A", "Grid substation B", "Intertie"],
         "Grid distribution": ["Feeder north", "Feeder south", "Feeder east", "Feeder west", "Capacitor bank"],
-        "Mine power network": ["Mine substation A", "Mine substation B", "Pit distribution", "Underground feeders", "Emergency generation"],
+        "Mine power network": ["Mine substation A", "Mine substation B", "Factory utility feeder", "Pit distribution", "Underground feeders", "Emergency generation"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     DISTRIBUTION_FEEDERS = {
@@ -59,6 +59,8 @@ class MinePowerNetwork:
             "process_load_mw": 28.0, "requested_load_mw": 34.5,
             "served_load_mw": 34.5, "load_shed_mw": 0.0,
             "process_power_fraction": 1.0, "water_power_fraction": 1.0,
+            "factory_utilities_power_fraction": 1.0,
+            "factory_utilities_requested_mw": 0.0, "factory_utilities_load_mw": 0.0,
             "unserved_load_mw": 0.0, "power_deficit": False,
             "history": [], "seed": 17,
         }
@@ -116,7 +118,8 @@ class MinePowerNetwork:
         thermal["hotspot_c"] += (target_hotspot - thermal["hotspot_c"]) * (1.0 - math.exp(-seconds / 300.0))
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
-                process_load_mw: float, water_load_mw: float, seed: int = 17) -> None:
+                process_load_mw: float, water_load_mw: float,
+                utility_load_mw: float = 0.0, seed: int = 17) -> None:
         """Dispatch sources and allocate power to site, water, and process loads."""
         initial_state = self.initialize()
         for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
@@ -126,6 +129,9 @@ class MinePowerNetwork:
             state.setdefault(key, initial_state[key])
         state.setdefault("frequency_nadir_hz", state.get("frequency_hz", 50.0))
         state.setdefault("frequency_window_nadir_hz", state.get("frequency_hz", 50.0))
+        state.setdefault("factory_utilities_power_fraction", 1.0)
+        state.setdefault("factory_utilities_requested_mw", 0.0)
+        state.setdefault("factory_utilities_load_mw", 0.0)
         for name, initial in initial_state["transformers"].items():
             state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
@@ -168,9 +174,13 @@ class MinePowerNetwork:
         diesel_cap = 8.0 * generation_factor
         process_request = max(0.0, process_load_mw)
         water_request = max(0.0, water_load_mw)
+        utility_request = max(0.0, utility_load_mw)
         site_request = 6.0
+        process_feeder_request = min(process_request + utility_request,
+                                     state["process_feeder_capacity_mw"])
         dispatch_request = (site_request + min(water_request, state["water_feeder_capacity_mw"])
-                            + min(process_request, state["process_feeder_capacity_mw"]))
+                            + process_feeder_request)
+        total_load_request = site_request + water_request + utility_request + process_request
         estimated_network_losses = max(0.0, state.get("distribution_losses_mw", 0.55))
         source_request = dispatch_request + estimated_network_losses
         mine_thermal = state["transformers"]
@@ -233,30 +243,38 @@ class MinePowerNetwork:
         state["total_generation_mw"] = grid_import + solar + state["diesel_mw"] + max(0.0, state["battery_power_mw"])
 
         available = max(0.0, state["total_generation_mw"] - charge_power - estimated_network_losses)
-        # Preserve 3 MW of essential mine services, then prioritize process water
-        # and the concentrator before shedding the remaining 3 MW of site auxiliaries.
+        # Preserve critical controls and water first, then factory utility services,
+        # then the concentrator; flexible site auxiliaries are last.
         served_critical_site = min(3.0, available)
         available = max(0.0, available - served_critical_site)
         served_water = min(water_request, state["water_feeder_capacity_mw"], available)
         available = max(0.0, available - served_water)
-        served_process = min(process_request, state["process_feeder_capacity_mw"], available)
+        feeder_headroom = max(0.0, state["process_feeder_capacity_mw"])
+        served_utility = min(utility_request, feeder_headroom, available)
+        feeder_headroom -= served_utility
+        available = max(0.0, available - served_utility)
+        served_process = min(process_request, feeder_headroom, available)
         available = max(0.0, available - served_process)
         served_flexible_site = min(3.0, available)
         served_site = served_critical_site + served_flexible_site
         state["process_requested_mw"] = process_request
         state["water_requested_mw"] = water_request
+        state["factory_utilities_requested_mw"] = utility_request
+        state["factory_utilities_load_mw"] = served_utility
         state["process_load_mw"] = served_process
         state["water_load_mw"] = served_water
         state["site_load_mw"] = served_site
-        state["requested_load_mw"] = dispatch_request
+        state["requested_load_mw"] = total_load_request
         state["source_requested_mw"] = source_request
-        state["served_load_mw"] = served_site + served_water + served_process
+        state["served_load_mw"] = served_site + served_water + served_utility + served_process
         state["load_shed_mw"] = max(0.0, site_request - served_site)
-        state["unserved_load_mw"] = max(0.0, dispatch_request - state["served_load_mw"] - charge_power)
+        state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
         state["process_power_fraction"] = (min(1.0, served_process / process_request)
                                              if process_request > 1e-6 else 1.0)
         state["water_power_fraction"] = (min(1.0, served_water / water_request)
                                           if water_request > 1e-6 else 1.0)
+        state["factory_utilities_power_fraction"] = (min(1.0, served_utility / utility_request)
+            if utility_request > 1e-6 else 1.0)
         state["power_deficit"] = state["unserved_load_mw"] > 0.05
 
         # Aggregate swing response with primary damping. Evaluate against the load
@@ -267,7 +285,9 @@ class MinePowerNetwork:
             extra_shed = min(3.0 - state["load_shed_mw"], max(0.0, 1.5 - state["load_shed_mw"]))
             state["load_shed_mw"] += extra_shed
             state["site_load_mw"] = max(3.0, state["site_load_mw"] - extra_shed)
-            state["served_load_mw"] = state["site_load_mw"] + served_water + served_process
+            state["served_load_mw"] = (state["site_load_mw"] + served_water
+                                        + served_utility + served_process)
+            state["unserved_load_mw"] = max(0.0, total_load_request - state["served_load_mw"])
             net = (state["total_generation_mw"] - connected_load_at_tick_start - charge_power
                    - estimated_network_losses)
         previous_frequency = state["frequency_hz"]
@@ -300,8 +320,10 @@ class MinePowerNetwork:
         # state carries across scans, so sustained loading can trigger cooling
         # stages and eventually reduce the transformer transfer limit.
         transformer = state["transformers"]
-        mine_a_mw = state["process_load_mw"] * 0.54 + state["water_load_mw"] * 0.54 + state["site_load_mw"] * 0.54
-        mine_b_mw = state["process_load_mw"] * 0.46 + state["water_load_mw"] * 0.46 + state["site_load_mw"] * 0.46
+        mine_a_mw = (state["process_load_mw"] + state["factory_utilities_load_mw"]
+                     + state["water_load_mw"] + state["site_load_mw"]) * 0.54
+        mine_b_mw = (state["process_load_mw"] + state["factory_utilities_load_mw"]
+                     + state["water_load_mw"] + state["site_load_mw"]) * 0.46
         grid_a_mw = state["grid_import_mw"] * 0.52
         grid_b_mw = state["grid_import_mw"] * 0.48
         self._advance_transformer(transformer["mine_a"], mine_a_mw * 1.02, 24.0, 1)
@@ -312,6 +334,7 @@ class MinePowerNetwork:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "frequency_hz", "voltage_pu", "grid_import_mw", "solar_mw",
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
+                "factory_utilities_load_mw", "factory_utilities_power_fraction",
                 "load_shed_mw", "process_power_fraction", "water_power_fraction",
                 "frequency_rocof_hz_s", "frequency_nadir_hz",
                 "frequency_window_nadir_hz", "distribution_losses_mw")}
@@ -358,6 +381,12 @@ class MinePowerNetwork:
                 "Pit distribution": {"active_power": (3.6 * state["water_power_fraction"], "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (110.0 * state["water_power_fraction"], "A", 0, 3000), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
                 "Underground feeders": {"active_power": (4.2, "MW", 0, 12), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (125.0, "A", 0, 3000), "breaker_state": (1.0, "bool", 0, 1)},
                 "Emergency generation": {"active_power": (0.0, "MW", 0, 8), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (0.0, "bool", 0, 1), "equipment_running": (0.0, "bool", 0, 1)},
+                "Factory utility feeder": {
+                    "active_power": (state["factory_utilities_load_mw"], "MW", 0, 8),
+                    "requested_power": (state["factory_utilities_requested_mw"], "MW", 0, 8),
+                    "available_fraction": (100 * state["factory_utilities_power_fraction"], "%", 0, 100),
+                    "breaker_state": (float(state["factory_utilities_power_fraction"] > 0.05), "bool", 0, 1),
+                },
             },
         }
         rows = []
