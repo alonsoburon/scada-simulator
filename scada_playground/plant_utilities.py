@@ -56,6 +56,11 @@ class FactoryUtilities:
             },
             "product_tank_inventory_units": 180.0,
             "product_tank_inlet_units_min": 180.0,
+            "product_tank_temperature_c": 12.0,
+            "product_cooling_service_fraction": 1.0,
+            "chilled_water_supply_temperature_c": 6.8,
+            "cooling_demand_kw": 878.0,
+            "cooled_product_rate_units_min": 180.0,
             "filler_rate_units_min": 180.0,
             "filling_buffer_inventory_units": 90.0,
             "case_packer_speed_fraction": 1.0,
@@ -108,9 +113,18 @@ class FactoryUtilities:
             for key, value in unit.items():
                 state["pasteurizers"][name].setdefault(key, value)
 
+    @staticmethod
+    def chilled_water_demand_kw(state: dict) -> float:
+        """Sensible heat duty to cool the current hot product flow to 12 °C."""
+        product_flow = sum(pasteurizer.get("process_rate", 90.0)
+                           for pasteurizer in state["pasteurizers"].values())
+        return max(0.0, product_flow) * 4.186 * (82.0 - 12.0) / 60.0
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
                 wastewater_available_fraction: float = 1.0,
+                chilled_water_service_fraction: float = 1.0,
+                chilled_water_supply_temperature_c: float = 6.8,
                 seed: int = 17) -> None:
         """Advance boiler/header, condensate, compressed-air, and consumer states."""
         had_scan_time = "last_advance_seconds" in state
@@ -239,10 +253,33 @@ class FactoryUtilities:
             pasteurizer["process_rate"] = (0.0 if cip_is_cleaning_line else
                 90.0 * local_steam_service * product_tank_headroom_control)
             pasteurizer["steam_service_fraction"] = local_steam_service
-            pasteurizer["production_rate"] = (pasteurizer["process_rate"]
+            pasteurizer["pasteurized_rate"] = (pasteurizer["process_rate"]
                 if pasteurizer["temperature_c"] >= self.PASTEURIZATION_LIMIT_C else 0.0)
+            raw_product_rate += pasteurizer["pasteurized_rate"]
+
+        state["cooling_demand_kw"] = self.chilled_water_demand_kw(state)
+        chilled_service = max(0.0, min(1.0, chilled_water_service_fraction))
+        # A warm supply header loses plate-exchanger temperature approach.
+        temperature_factor = max(0.0, min(1.0,
+            (15.0 - chilled_water_supply_temperature_c) / 7.0))
+        cooling_service = min(chilled_service, temperature_factor)
+        state["product_cooling_service_fraction"] = cooling_service
+        state["chilled_water_supply_temperature_c"] = chilled_water_supply_temperature_c
+        cooled_product_rate = raw_product_rate * cooling_service
+        state["cooled_product_rate_units_min"] = cooled_product_rate
+        raw_product_rate = cooled_product_rate
+        for pasteurizer in state["pasteurizers"].values():
+            pasteurizer["production_rate"] = pasteurizer["pasteurized_rate"] * cooling_service
             pasteurizer["diverted_rate"] = pasteurizer["process_rate"] - pasteurizer["production_rate"]
-            raw_product_rate += pasteurizer["production_rate"]
+            pasteurizer["cooling_service_fraction"] = cooling_service
+
+        if dt_s > 0:
+            old_product_temp = state["product_tank_temperature_c"]
+            old_product_inventory = state["product_tank_inventory_units"]
+            incoming_units = cooled_product_rate * dt_min
+            thermal_mix = min(1.0, incoming_units / max(1.0, old_product_inventory + incoming_units))
+            mixed_temperature = old_product_temp + (12.0 - old_product_temp) * thermal_mix
+            state["product_tank_temperature_c"] = mixed_temperature + (22.0 - mixed_temperature) * dt_s / 86_400.0
 
         jam_severity = self._event_severity(events, "Conveyor jam", ("Packaging",))
         mechanical_filler = self._event_severity(events, "Mechanical degradation", ("Filling",))
@@ -254,7 +291,11 @@ class FactoryUtilities:
         packer_target_fraction *= recovery_boost
         state["case_packer_speed_fraction"] += max(-0.02, min(0.02,
             packer_target_fraction - state["case_packer_speed_fraction"]))
-        filler_target = 180.0 * state["filling_air_service"] * filler_target_fraction
+        product_temperature = state["product_tank_temperature_c"]
+        product_release_fraction = (1.0 if product_temperature <= 14.0 else
+            max(0.0, min(1.0, (20.0 - product_temperature) / 6.0)))
+        filler_target = (180.0 * state["filling_air_service"] * filler_target_fraction
+                        * product_release_fraction)
         packer_target = 180.0 * state["filling_air_service"] * state["case_packer_speed_fraction"]
         old_product_inventory = state["product_tank_inventory_units"]
         old_package_inventory = state["filling_buffer_inventory_units"]
@@ -293,6 +334,8 @@ class FactoryUtilities:
                 "filler_rate_units_min", "packer_rate_cases_min",
                 "product_tank_inventory_units", "filling_buffer_inventory_units",
                 "product_tank_inlet_units_min", "packer_rate_units_min",
+                "product_tank_temperature_c", "product_cooling_service_fraction",
+                "cooling_demand_kw", "cooled_product_rate_units_min",
                 "finished_cases_total")}
                 | {"pasteurizer_01_temperature_c": state["pasteurizers"]["pasteurizer_01"]["temperature_c"],
                    "pasteurizer_02_temperature_c": state["pasteurizers"]["pasteurizer_02"]["temperature_c"],
@@ -383,7 +426,9 @@ class FactoryUtilities:
                 "inventory": (100 * state["product_tank_inventory_units"] / self.PRODUCT_TANK_CAPACITY_UNITS, "%", 0, 100),
                 "inlet_flow": (state["product_tank_inlet_units_min"], "units/min", 0, 240),
                 "outlet_flow": (state["filler_rate_units_min"], "units/min", 0, 240),
-                "product_temperature": (min(p["temperature_c"] for p in state["pasteurizers"].values()), "°C", 0, 140),
+                "product_temperature": (state["product_tank_temperature_c"], "°C", 0, 140),
+                "cooling_service": (100.0 * state["product_cooling_service_fraction"], "%", 0, 100),
+                "cooling_duty": (state["cooling_demand_kw"], "kW", 0, 2_000),
             },
             ("Filling", "Filler 01"): {
                 "instrument_air_pressure": (air_pressure, "bar", 0, 12),

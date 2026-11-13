@@ -26,6 +26,7 @@ from haulage import HaulTruckFleet
 from power_network import MinePowerNetwork
 from plant_controller import PlantController
 from plant_utilities import FactoryUtilities
+from chilled_water import ChilledWaterPlant
 from site_buildings import SiteBuildings
 from underground_ventilation import UndergroundVentilation
 
@@ -184,6 +185,7 @@ CONCENTRATOR_MODEL = CopperConcentrator()
 HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 POWER_MODEL = MinePowerNetwork()
 UTILITY_MODEL = FactoryUtilities()
+CHILLED_MODEL = ChilledWaterPlant()
 PLANT_CONTROLLER = PlantController()
 BUILDING_MODEL = SiteBuildings()
 VENTILATION_MODEL = UndergroundVentilation()
@@ -227,12 +229,17 @@ def initialize(seed: int = 17) -> None:
                                      "last_change": "Normal"})
         # The wastewater treatment model now owns this area's measurements;
         # discard the generic placeholder tags before publishing its asset tree.
-        tags = [tag for tag in tags if tag["area"] not in {"Wastewater", "Water distribution"}]
+        tags = [tag for tag in tags if tag["area"] not in {"Wastewater", "Water distribution", "Chilled water"}]
         concentrator_state = CONCENTRATOR_MODEL.initialize()
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
         utility_state = UTILITY_MODEL.initialize()
-        UTILITY_MODEL.advance(utility_state, 0, [], seed=seed)
+        chilled_state = CHILLED_MODEL.initialize()
+        CHILLED_MODEL.advance(chilled_state, 0, [],
+            cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(utility_state), seed=seed)
+        UTILITY_MODEL.advance(utility_state, 0, [],
+            chilled_water_service_fraction=chilled_state["cooling_service_fraction"],
+            chilled_water_supply_temperature_c=chilled_state["supply_temperature_c"], seed=seed)
         buildings_state = BUILDING_MODEL.initialize()
         BUILDING_MODEL.advance(buildings_state, 0, [], seed=seed)
         ventilation_state = VENTILATION_MODEL.initialize()
@@ -243,6 +250,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
+        modeled_assets.update(("Chilled water", asset) for asset in
+                              ("Chiller A", "Chiller B", "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
@@ -256,6 +265,9 @@ def initialize(seed: int = 17) -> None:
         water_state["concentrator_recovery_pct"] = concentrator_state["water_recovery_pct"]
         water_state["demand_m3h"] = (water_state["base_demand_m3h"]
                                      + water_state["concentrator_demand_m3h"])
+        tags = [tag for tag in tags
+                if not tag["tag"].startswith(("water_supply_network.", "water_treatment.",
+                                              "water_distribution.", "wastewater."))]
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
         for tag in water_tags:
             tag["dynamic_model"] = True
@@ -267,7 +279,7 @@ def initialize(seed: int = 17) -> None:
         initial_process_power_mw += ventilation_state["fan_power_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
-                            utility_load_mw=utility_state["electric_load_mw"],
+                            utility_load_mw=utility_state["electric_load_mw"] + chilled_state["electric_load_mw"],
                             site_building_load_mw=buildings_state["electric_load_mw"],
                             site_nonbuilding_request_mw=5.6, seed=seed)
         power_tags = POWER_MODEL.telemetry(power_state)
@@ -280,6 +292,7 @@ def initialize(seed: int = 17) -> None:
                           for asset in assets}
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in utility_assets]
         tags.extend(UTILITY_MODEL.telemetry(utility_state, seed))
+        tags.extend(CHILLED_MODEL.telemetry(chilled_state, seed))
         tags.extend(BUILDING_MODEL.telemetry(buildings_state, seed))
         ventilation_tags = VENTILATION_MODEL.telemetry(ventilation_state, seed)
         for tag in ventilation_tags:
@@ -289,6 +302,7 @@ def initialize(seed: int = 17) -> None:
                                 "water_network": water_state,
                                 "power_network": power_state,
                                 "plant_utilities": utility_state,
+                                "chilled_water": chilled_state,
                                 "site_buildings": buildings_state,
                                 "mine_ventilation": ventilation_state,
                                 "concentrator": concentrator_state,
@@ -297,6 +311,7 @@ def initialize(seed: int = 17) -> None:
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
                                 "water_distribution_alarm_states": {},
+                                "chilled_water_alarm_states": {},
                                 "building_alarm_states": {},
                                 "ventilation_alarm_states": {},
                                 "concentrator_alarm_states": {},
@@ -322,6 +337,12 @@ def initialize(seed: int = 17) -> None:
         if "plant_utilities" not in sim:
             sim["plant_utilities"] = UTILITY_MODEL.initialize()
         UTILITY_MODEL.migrate(sim["plant_utilities"])
+        if "chilled_water" not in sim:
+            sim["chilled_water"] = CHILLED_MODEL.initialize()
+            CHILLED_MODEL.advance(sim["chilled_water"], sim.get("tick", 0), [],
+                cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(sim["plant_utilities"]),
+                seed=sim["seed"])
+        CHILLED_MODEL.migrate(sim["chilled_water"])
         if "site_buildings" not in sim:
             sim["site_buildings"] = BUILDING_MODEL.initialize()
             BUILDING_MODEL.advance(sim["site_buildings"], sim.get("tick", 0), [], seed=sim["seed"])
@@ -335,6 +356,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
+        modeled_assets.update(("Chilled water", asset) for asset in
+                              ("Chiller A", "Chiller B", "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
@@ -372,11 +395,13 @@ def initialize(seed: int = 17) -> None:
             water_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw,
-                                utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                                utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
+                                                 + sim["chilled_water"]["electric_load_mw"]),
                                 site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                                 site_nonbuilding_request_mw=5.6,
                                 seed=sim["seed"])
         utility_power_demand = sim["plant_utilities"]["electric_load_mw"]
+        utility_power_demand += sim["chilled_water"]["electric_load_mw"]
         sim["power_network"].setdefault("factory_utilities_requested_mw", utility_power_demand)
         sim["power_network"].setdefault("factory_utilities_load_mw", utility_power_demand)
         sim["power_network"].setdefault("factory_utilities_power_fraction", 1.0)
@@ -390,8 +415,14 @@ def initialize(seed: int = 17) -> None:
         sim["tags"] = [tag for tag in sim["tags"]
                        if (tag["area"], tag["unit"]) not in utility_assets]
         sim["tags"].extend(UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"]))
+        sim["tags"] = [tag for tag in sim["tags"] if tag["area"] != "Chilled water"]
+        sim["tags"].extend(CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"]))
         building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
         sim["tags"].extend(building_tags)
+    unique_tags = {}
+    for tag in st.session_state.sim["tags"]:
+        unique_tags[tag["tag"]] = tag
+    st.session_state.sim["tags"] = list(unique_tags.values())
 
 
 def publish_snapshot() -> dict:
@@ -404,6 +435,7 @@ def publish_snapshot() -> dict:
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
+    chilled_tags = CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
     ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
     haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
@@ -412,6 +444,7 @@ def publish_snapshot() -> dict:
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
+    chilled_by_tag = {tag["tag"]: tag for tag in chilled_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
     ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     for tag in sim["tags"]:
@@ -421,6 +454,8 @@ def publish_snapshot() -> dict:
             tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in utility_by_tag:
             tag.update(utility_by_tag[tag["tag"]])
+        elif tag["tag"] in chilled_by_tag:
+            tag.update(chilled_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
             tag.update(building_by_tag[tag["tag"]])
         elif tag["tag"] in ventilation_by_tag:
@@ -449,6 +484,7 @@ def publish_snapshot() -> dict:
         "water_network": water_diagram[0],
         "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
         "plant_utilities": {key: value for key, value in sim["plant_utilities"].items() if key != "history"},
+        "chilled_water": CHILLED_MODEL.public_state(sim["chilled_water"]),
         "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),
         "mine_ventilation": VENTILATION_MODEL.public_state(sim["mine_ventilation"]),
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
@@ -666,11 +702,19 @@ def advance(force: bool = False) -> None:
     utility_events = [event.__dict__ for event in sim["events"]]
     prior_factory_water_availability = sim["water_network"].get("factory_water_available_fraction", 1.0)
     prior_wastewater_availability = sim["water_network"].get("wastewater_available_fraction", 1.0)
+    CHILLED_MODEL.advance(
+        sim["chilled_water"], sim["tick"], utility_events,
+        cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(sim["plant_utilities"]),
+        power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
+        seed=sim["seed"],
+    )
     UTILITY_MODEL.advance(
         sim["plant_utilities"], sim["tick"], utility_events,
         power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
         water_available_fraction=prior_factory_water_availability,
         wastewater_available_fraction=prior_wastewater_availability,
+        chilled_water_service_fraction=sim["chilled_water"]["cooling_service_fraction"],
+        chilled_water_supply_temperature_c=sim["chilled_water"]["supply_temperature_c"],
         seed=sim["seed"],
     )
     water_events = [event.__dict__ for event in sim["events"]
@@ -684,7 +728,8 @@ def advance(force: bool = False) -> None:
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw,
-                        utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                        utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
+                                         + sim["chilled_water"]["electric_load_mw"]),
                         site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                         site_nonbuilding_request_mw=5.6,
                         motor_starting_load_mw=sim["process_control"]["motor_starting_load_mw"],
@@ -1033,14 +1078,39 @@ def advance(force: bool = False) -> None:
             sim["alarms"].insert(0, {"time": sim["tick"], "area": area,
                 "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
             utility_alarm_states[key] = False
+    chilled = sim["chilled_water"]
+    chilled_alarm_states = sim.setdefault("chilled_water_alarm_states", {})
+    chilled_conditions = (
+        ("low_cooling_storage", chilled["storage_mwh"] < 0.20,
+         chilled["storage_mwh"] > 0.45,
+         "Chilled-water thermal reserve is low; a further chiller loss may warm product cooling", "HIGH"),
+        ("warm_chilled_supply", chilled["supply_temperature_c"] > 9.5,
+         chilled["supply_temperature_c"] < 8.0,
+         "Chilled-water supply temperature is reducing pasteurizer cooler capacity", "HIGH"),
+        ("low_product_cooling", utilities["product_cooling_service_fraction"] < 0.90,
+         utilities["product_cooling_service_fraction"] > 0.97,
+         "Product cooler duty is insufficient; pasteurized product is being diverted", "CRITICAL"),
+    )
+    for key, active, cleared, message, severity in chilled_conditions:
+        was_active = chilled_alarm_states.get(key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Chilled water",
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+            chilled_alarm_states[key] = True
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Chilled water",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+            chilled_alarm_states[key] = False
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
+    chilled_tags = CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
     ventilation_tags = VENTILATION_MODEL.telemetry(sim["mine_ventilation"], sim["seed"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
+    chilled_by_tag = {tag["tag"]: tag for tag in chilled_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
     ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
@@ -1053,6 +1123,8 @@ def advance(force: bool = False) -> None:
             tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in utility_by_tag:
             tag.update(utility_by_tag[tag["tag"]])
+        elif tag["tag"] in chilled_by_tag:
+            tag.update(chilled_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
             tag.update(building_by_tag[tag["tag"]])
         elif tag["tag"] in ventilation_by_tag:
@@ -1794,8 +1866,35 @@ def render_dashboard():
 
     with tabs[9]:
         utilities = sim["plant_utilities"]
-        st.subheader("Factory utilities · steam and instrument air")
-        st.caption("Boilers feed a finite steam header and delayed condensate return; compressors feed a finite receiver and ring main. Pressure changes propagate into pasteurizer temperature and packaging rates with separate process lag. CIP sequences water, caustic, heated sanitation and release steps; water and steam scarcity hold cleaning phases and temporarily remove the selected pasteurizer from production.")
+        chilled = sim["chilled_water"]
+        st.subheader("Factory utilities · steam, air, and chilled water")
+        st.caption("Boilers feed a finite steam header and delayed condensate return; compressors feed a finite receiver and ring main. Two chillers supply the pasteurizer product cooler, and a finite cold-water reserve delays production effects after a chiller trip. If cooler duty falls short, product is diverted before the balance tank; the filler then slows as its finite inventory drains. CIP sequences water, caustic, heated sanitation and release steps; water and steam scarcity hold cleaning phases and temporarily remove the selected pasteurizer from production.")
+        chilled_metrics = st.columns(5)
+        for col, label, value in zip(chilled_metrics,
+            ["Cooling service", "Cooling duty", "Cold reserve", "Supply / return", "Chiller COP"],
+            [f"{chilled['cooling_service_fraction']*100:.1f}%",
+             f"{chilled['cooling_served_kw']:.0f}/{chilled['cooling_demand_kw']:.0f} kW",
+             f"{chilled['storage_mwh']:.2f}/{chilled['storage_capacity_mwh']:.2f} MWh",
+             f"{chilled['supply_temperature_c']:.1f}/{chilled['return_temperature_c']:.1f} °C",
+             f"{chilled['cop']:.2f}"]):
+            col.metric(label, value)
+        chiller_rows = [{"Chiller": name.replace("_", " ").title(),
+                         "Output (kW)": unit["output_kw"],
+                         "Available (kW)": unit["available_capacity_kw"],
+                         "Vibration (mm/s)": unit["vibration_mm_s"],
+                         "Running": unit["running"]}
+                        for name, unit in chilled["chillers"].items()]
+        st.dataframe(pd.DataFrame(chiller_rows).round(2), hide_index=True, width="stretch")
+        chilled_history = pd.DataFrame(chilled["history"])
+        if not chilled_history.empty:
+            cooling_fig = px.line(chilled_history, x="sim_seconds",
+                y=["cooling_demand_kw", "cooling_served_kw"],
+                color_discrete_sequence=["#277da1", "#e07a5f"],
+                labels={"sim_seconds": "Simulated seconds", "value": "Cooling load (kW)",
+                        "variable": "Duty"})
+            cooling_fig.update_layout(title="Product cooler duty and chilled-water supply",
+                uirevision="chilled-water-duty")
+            st.plotly_chart(cooling_fig, width="stretch")
         utility_metrics = st.columns(6)
         for col, label, value in zip(utility_metrics,
             ["Steam header", "Steam service", "Boiler output", "Instrument air", "Air service", "Compressor power"],

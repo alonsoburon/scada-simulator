@@ -285,6 +285,17 @@ def get_plant_utilities_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_chilled_water_state() -> dict[str, Any]:
+    """Read chiller output, thermal storage, supply temperature, and product-cooling service."""
+    data = snapshot()
+    chilled = data.get("chilled_water")
+    if not chilled:
+        raise RuntimeError("Chilled-water model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **chilled}
+
+
+@mcp.tool()
 def list_protocol_faults() -> dict[str, Any]:
     """List active protocol-output faults and their simulation-time expiry."""
     data = snapshot()

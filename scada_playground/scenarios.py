@@ -140,6 +140,22 @@ SCENARIOS = {
             "Compare district meters with total leakage and non-revenue water to distinguish customer demand from network loss.",
         ),
     ),
+    "chilled-water-loss-and-recovery": ScenarioDefinition(
+        scenario_id="chilled-water-loss-and-recovery",
+        name="Chilled-water failure, thermal reserve, and production recovery",
+        description="A plant-wide chilled-water feeder loss draws down thermal storage; once cold reserve is exhausted, pasteurized product is diverted, the product buffer drains, and filling slows until the chillers recover.",
+        duration_seconds=10_800,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                             "target_area": "Chilled water", "duration_seconds": 7_200}),
+        ),
+        expected_observations=(
+            "The chillers ramp down after feeder loss while the chilled-water reserve temporarily carries the pasteurizer cooler load.",
+            "Once thermal storage is depleted, cooling service falls and the product cooler diverts hot product instead of sending it to the balance tank.",
+            "The finite product buffer delays filler starvation; compare cooling service, product temperature, tank inventory, and filler rate.",
+            "After power returns, chiller output ramps up and the product buffer refills before packaging fully recovers.",
+        ),
+    ),
     "mine-water-level-transmitter-drift": ScenarioDefinition(
         scenario_id="mine-water-level-transmitter-drift",
         name="Water-tank transmitter drift",

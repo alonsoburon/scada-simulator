@@ -53,6 +53,15 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("pressure" in note.lower() and "tank" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_chilled_water_scenario_exhausts_reserve_before_power_recovery(self):
+        definition = ScenarioRunner().definition("chilled-water-loss-and-recovery")
+        outage = definition.steps[0]
+        self.assertEqual(outage.parameters["target_area"], "Chilled water")
+        self.assertEqual(outage.parameters["incident_name"], "Utility loss")
+        self.assertGreater(outage.parameters["duration_seconds"], 3_600)
+        self.assertTrue(any("buffer" in note.lower() and "filler" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_instrument_drift_scenario_targets_level_transmitter_not_process(self):
         definition = ScenarioRunner().definition("mine-water-level-transmitter-drift")
         step = definition.steps[0]

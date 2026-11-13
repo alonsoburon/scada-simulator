@@ -21,6 +21,8 @@ class WaterDistributionTests(unittest.TestCase):
         self.assertGreater(pressures["District zone B"], pressures["District zone C"])
         self.assertEqual(self.state["service_fraction"], 1.0)
         self.assertGreater(self.state["leak_flow_m3h"], 1.0)
+        self.step(1)
+        self.assertEqual(self.state["zones"]["District zone A"]["minimum_pressure_kpa"], 150.0)
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state, seed=17)}
         self.assertIn("water_distribution.district_zone_c.line_pressure", tags)
         self.assertIn("water_distribution.leak_monitoring.non_revenue_water", tags)
@@ -38,7 +40,7 @@ class WaterDistributionTests(unittest.TestCase):
         self.assertAlmostEqual(state["customer_served_m3h"] + state["leak_flow_m3h"],
                                result["delivered_m3h"], places=6)
         self.assertGreater(state["unmet_demand_m3h"], 0.0)
-        self.assertAlmostEqual(state["tank_volume_m3"], 0.0, places=9)
+        self.assertLessEqual(state["tank_volume_m3"], 1e-6)
 
     def test_tank_turbidity_mixes_source_quality_and_upset_resuspension(self):
         state = self.model.initialize(initial_tank_volume_m3=0.0)

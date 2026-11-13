@@ -173,6 +173,7 @@ class MineWaterNetwork:
                 "cumulative_concentrator_return_m3": 0.0,
                 "electrical_load_kw": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {},
+                "schema_revision": 3,
                 "distribution": self.DISTRIBUTION.initialize()}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
@@ -212,6 +213,23 @@ class MineWaterNetwork:
 
     def migrate(self, state: dict) -> None:
         """Add the concentrator reclaim circuit to sessions created by older builds."""
+        if state.get("schema_revision") == 3:
+            ready = all(key in state for key in (
+                "nodes", "pumps", "controllers", "valves", "links", "treatment",
+                "wastewater", "distribution", "history"))
+            if ready:
+                ready = (all(key in state["nodes"] for key in self.NODES)
+                         and all(key in state["pumps"] for key in self.PUMPS)
+                         and all(key in state["controllers"] for key in self.PUMPS)
+                         and all(key in state["links"] for key in self.LINKS)
+                         and all(key in state["distribution"] for key in ("zones", "history"))
+                         and all(name in state["distribution"]["zones"]
+                                 for name in self.DISTRIBUTION.ZONES))
+            if ready:
+                ready = all("previous_velocity_m_s" in state["links"][key]
+                            for key in self.LINKS)
+            if ready:
+                return
         defaults = self.initialize()
         for key in ("nodes", "pumps", "controllers", "valves", "links"):
             state.setdefault(key, {})
@@ -226,6 +244,8 @@ class MineWaterNetwork:
                 state["distribution"].setdefault("zones", {})
                 for name, zone in value.items():
                     state["distribution"]["zones"].setdefault(name, zone.copy())
+                    for field, default in zone.items():
+                        state["distribution"]["zones"][name].setdefault(field, default)
             else:
                 state["distribution"].setdefault(key, value)
         for key, value in defaults.items():
@@ -320,6 +340,7 @@ class MineWaterNetwork:
             sample.setdefault("wastewater_effluent_ph", 7.0)
             sample.setdefault("wastewater_effluent_tss_mg_l", 0.0)
             sample.setdefault("wastewater_sludge_hopper_kg", 0.0)
+        state["schema_revision"] = 3
 
     @staticmethod
     def _level(node: dict) -> float:

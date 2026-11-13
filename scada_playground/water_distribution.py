@@ -205,8 +205,8 @@ class WaterDistribution:
         demand_factor = cls._daily_demand_factor(sim_seconds) * cls.UPSET_DEMAND_FACTOR.get(upset, 1.0)
         leak_factor = 1.0 + (1.0 - state["pump_condition_factor"]) * 0.35
         def solve_zones(head_fraction: float) -> dict:
-            return {name: cls._branch_operating_point(
-                state, name, spec, volume_available, demand_factor, leak_factor, head_fraction)
+            return {name: {**spec, **cls._branch_operating_point(
+                state, name, spec, volume_available, demand_factor, leak_factor, head_fraction)}
                 for name, spec in cls.ZONES.items()}
 
         zones = solve_zones(1.0)
@@ -215,9 +215,14 @@ class WaterDistribution:
         # than the requested scan withdrawal, reduce hydraulic head until the
         # pressure-dependent customer demand and leakage fit the available volume.
         max_scan_outflow_m3h = volume_available * 3600.0
-        if requested_outflow_m3h > max_scan_outflow_m3h + 1e-9:
+        if volume_available <= 1e-8:
+            zones = solve_zones(0.0)
+        elif requested_outflow_m3h > max_scan_outflow_m3h + 1e-9:
             low_head, high_head = 0.0, 1.0
-            for _ in range(36):
+            # Twelve pressure trials are enough for this three-branch teaching
+            # network (relative head resolution <0.025%) without dominating a
+            # one-second simulation scan when the reserve tank is nearly dry.
+            for _ in range(12):
                 mid_head = (low_head + high_head) / 2.0
                 trial = solve_zones(mid_head)
                 trial_flow = sum(zone["flow_m3h"] for zone in trial.values())
