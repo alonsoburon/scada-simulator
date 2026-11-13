@@ -647,6 +647,8 @@ def advance(force: bool = False) -> None:
                                           "Water-treatment chemical inventory is low", "MEDIUM"),
         "wastewater_equalization_high": ("Wastewater", water["wastewater"]["equalization_level_pct"] > 85,
                                            "Wastewater equalization tank is high; CIP and backwash headroom is limited", "HIGH"),
+        "wastewater_reaction_tank_high": ("Wastewater", water["wastewater"]["treatment_tank_level_pct"] > 90,
+                                            "Wastewater reaction tank is near capacity; equalization draw may slow", "HIGH"),
         "wastewater_overflow": ("Wastewater", water["wastewater"]["equalization_overflow_m3"] > 0,
                                  "Wastewater equalization overflow is bypassing treatment", "CRITICAL"),
         "wastewater_effluent_quality": ("Wastewater",
@@ -989,7 +991,7 @@ def render_dashboard():
             ["Equalization", "Influent", "Treatment", "Effluent pH / TSS", "Reuse / outfall", "Sludge hopper"],
             [f"{wastewater['equalization_level_pct']:.1f}% · {wastewater['equalization_volume_m3']:.1f} m³",
              f"{wastewater['influent_flow_m3h']:.1f} m³/h",
-             f"{wastewater['treatment_mode']} · {wastewater['treatment_flow_m3h']:.1f} m³/h",
+             f"{wastewater['treatment_mode']} · {wastewater['treatment_tank_level_pct']:.0f}% / {wastewater['treatment_flow_m3h']:.1f} m³/h",
              f"{wastewater['effluent_ph']:.2f} · {wastewater['effluent_tss_mg_l']:.0f} mg/L",
              f"{wastewater['reuse_flow_m3h']:.1f} / {wastewater['outfall_flow_m3h']:.1f} m³/h",
              f"{wastewater['sludge_hopper_kg']:.1f} / {WATER_MODEL.WASTEWATER.SLUDGE_HOPPER_CAPACITY_KG:.0f} kg"]):
@@ -1106,17 +1108,22 @@ def render_dashboard():
             f.update_layout(uirevision="concentrator-water-balance-trend")
             st.plotly_chart(f, width="stretch")
             st.markdown("**Wastewater quality and reuse · distinct scale traces**")
-            wastewater_fig = make_subplots(specs=[[{"secondary_y": True}]])
+            wastewater_fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                vertical_spacing=.10, subplot_titles=("Treatment tank inventory",
+                    "Effluent pH", "Effluent suspended solids"))
             wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_equalization_level_pct"],
-                name="Equalization level · %", line={"color": "#6A4C93"}), secondary_y=False)
+                name="Equalization level · %", line={"color": "#6A4C93"}), row=1, col=1)
+            wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_treatment_tank_level_pct"],
+                name="Reaction tank level · %", line={"color": "#277DA1"}), row=1, col=1)
             wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_effluent_ph"],
-                name="Effluent pH", line={"color": "#E76F51"}), secondary_y=True)
+                name="Effluent pH", line={"color": "#E76F51"}), row=2, col=1)
             wastewater_fig.add_trace(go.Scatter(x=hist["time"], y=hist["wastewater_effluent_tss_mg_l"],
-                name="Effluent TSS · mg/L", line={"color": "#2A9D8F", "dash": "dash"}), secondary_y=True)
-            wastewater_fig.update_yaxes(title_text="Tank level (%)", range=[0, 100], secondary_y=False)
-            wastewater_fig.update_yaxes(title_text="pH / TSS (mg/L)", secondary_y=True)
-            wastewater_fig.update_layout(height=320, xaxis_title="Simulated seconds",
-                legend={"orientation": "h", "y": 1.18}, uirevision="wastewater-quality-trend")
+                name="Effluent TSS · mg/L", line={"color": "#2A9D8F"}), row=3, col=1)
+            wastewater_fig.update_yaxes(title_text="Level (%)", range=[0, 100], row=1, col=1)
+            wastewater_fig.update_yaxes(title_text="pH", range=[0, 14], row=2, col=1)
+            wastewater_fig.update_yaxes(title_text="TSS (mg/L)", rangemode="tozero", row=3, col=1)
+            wastewater_fig.update_layout(height=680, xaxis3_title="Simulated seconds",
+                legend={"orientation": "h", "y": 1.05}, uirevision="wastewater-quality-trend")
             st.plotly_chart(wastewater_fig, width="stretch")
         else:
             st.info("Start or single-step the factory to build level and flow trends.")

@@ -197,6 +197,7 @@ class MineWaterNetwork:
             sample.setdefault("filter_solids_loading_pct", 0.0)
             sample.setdefault("filter_mode", "FILTERING")
             sample.setdefault("wastewater_equalization_level_pct", 0.0)
+            sample.setdefault("wastewater_treatment_tank_level_pct", 0.0)
             sample.setdefault("wastewater_influent_m3h", 0.0)
             sample.setdefault("wastewater_treatment_m3h", 0.0)
             sample.setdefault("wastewater_reuse_m3h", 0.0)
@@ -216,7 +217,8 @@ class MineWaterNetwork:
     def total_inventory_m3(self, state: dict) -> float:
         return (sum(node["volume_m3"] for node in state["nodes"].values())
                 + self.pipe_inventory_m3(state)
-                + state.get("wastewater", {}).get("equalization_volume_m3", 0.0))
+                + state.get("wastewater", {}).get("equalization_volume_m3", 0.0)
+                + state.get("wastewater", {}).get("treatment_tank_volume_m3", 0.0))
 
     def _link_reading(self, state: dict, key: str, spec: dict) -> tuple[float, float]:
         opening_pct = state["valves"][spec["valve"]]
@@ -525,6 +527,7 @@ class MineWaterNetwork:
                                      "filter_solids_loading_pct": 100.0 * state["treatment"]["filter_solids_kg"] / self.TREATMENT.FILTER_CAPACITY_KG,
                                      "filter_mode": state["treatment"]["mode"],
                                      "wastewater_equalization_level_pct": state["wastewater"]["equalization_level_pct"],
+                                     "wastewater_treatment_tank_level_pct": state["wastewater"]["treatment_tank_level_pct"],
                                      "wastewater_influent_m3h": state["wastewater"]["influent_flow_m3h"],
                                      "wastewater_treatment_m3h": state["wastewater"]["treatment_flow_m3h"],
                                      "wastewater_reuse_m3h": state["wastewater"]["reuse_flow_m3h"],
@@ -602,7 +605,8 @@ class MineWaterNetwork:
         add("process_demand", "treatment_backwash_flow", self.TREATMENT.BACKWASH_FLOW_M3H
             if state["treatment"]["mode"] == "BACKWASH" else 0.0, "m³/h", 0, 30)
         rows.extend(self.TREATMENT.telemetry(state["treatment"]))
-        rows.extend(self.WASTEWATER.telemetry(state["wastewater"]))
+        rows.extend(self.WASTEWATER.telemetry(state["wastewater"], state["sensor_rng_seed"],
+                                              state["sim_seconds"]))
         nodes = [{"id": key, "label": spec["label"], "level_pct": state["nodes"][key]["level_pct"],
                   "volume_m3": state["nodes"][key]["volume_m3"], "capacity_m3": spec["capacity_m3"]}
                  for key, spec in self.NODES.items()]
