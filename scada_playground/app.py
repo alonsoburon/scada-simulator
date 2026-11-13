@@ -1085,6 +1085,9 @@ def advance(force: bool = False) -> None:
     utility_conditions = {
         "low_steam_header": ("Boiler house", utilities["steam_header_pressure_bar"] < 6.5,
             utilities["steam_header_pressure_bar"] > 7.0, "Steam header pressure below operating band", "HIGH"),
+        "high_steam_header": ("Boiler house", utilities["steam_header_pressure_bar"] > 9.5,
+            utilities["steam_header_pressure_bar"] < 9.0,
+            "Steam header pressure approaching relief setpoint", "HIGH"),
         "low_instrument_air": ("Compressed air", utilities["air_receiver_pressure_bar"] < 5.8,
             utilities["air_receiver_pressure_bar"] > 6.2, "Instrument-air ring pressure below operating band", "HIGH"),
         "wet_instrument_air": ("Compressed air", utilities["dryer_dew_point_c"] > 0,

@@ -21,10 +21,21 @@ class FactoryUtilities:
         "CIP": ["CIP tank A", "CIP tank B", "CIP supply", "CIP return", "Chemical dosing"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
-    HEADER_CAPACITY_T = 1.5
+    ATMOSPHERIC_PRESSURE_BAR = 1.01325
+    STEAM_REFERENCE_INVENTORY_T = 1.0
+    STEAM_REFERENCE_PRESSURE_BAR_G = 8.0
+    STEAM_HEADER_TEMPERATURE_C = 180.0
+    STEAM_RELIEF_PRESSURE_BAR_G = 10.0
+    STEAM_REFERENCE_ABSOLUTE_PRESSURE_BAR = (
+        STEAM_REFERENCE_PRESSURE_BAR_G + ATMOSPHERIC_PRESSURE_BAR)
+    STEAM_RELIEF_ABSOLUTE_PRESSURE_BAR = (
+        STEAM_RELIEF_PRESSURE_BAR_G + ATMOSPHERIC_PRESSURE_BAR)
+    HEADER_CAPACITY_T = (STEAM_REFERENCE_INVENTORY_T
+                         * STEAM_RELIEF_ABSOLUTE_PRESSURE_BAR
+                         / STEAM_REFERENCE_ABSOLUTE_PRESSURE_BAR)
     RECEIVER_VOLUME_M3 = 80.0  # Receiver plus effective ring-main volume.
     RECEIVER_MAX_PRESSURE_BAR_G = 8.0
-    AIR_STANDARD_PRESSURE_BAR = 1.01325
+    AIR_STANDARD_PRESSURE_BAR = ATMOSPHERIC_PRESSURE_BAR
     AIR_STANDARD_TEMPERATURE_K = 273.15
     AIR_RECEIVER_TEMPERATURE_K = 293.15
     CONDENSATE_CAPACITY_T = 30.0
@@ -43,6 +54,7 @@ class FactoryUtilities:
             },
             "steam_header_inventory_t": 1.0,
             "steam_header_pressure_bar": 8.0,
+            "steam_relief_flow_tph": 0.0,
             "steam_generation_tph": 32.0,
             "steam_demand_tph": 32.0,
             "steam_consumption_tph": 32.0,
@@ -118,6 +130,13 @@ class FactoryUtilities:
             state["pasteurizers"].setdefault(name, unit.copy())
             for key, value in unit.items():
                 state["pasteurizers"][name].setdefault(key, value)
+        state.setdefault("steam_relief_flow_tph", 0.0)
+        steam_pressure = float(state.get("steam_header_pressure_bar", 0.0))
+        if abs(steam_pressure - self._steam_pressure_from_inventory(
+                state["steam_header_inventory_t"])) > 0.05:
+            # Preserve old sessions' indicated pressure while converting their
+            # offset pressure proxy to a mass-based fixed-volume approximation.
+            state["steam_header_inventory_t"] = self._steam_inventory_at_pressure(steam_pressure)
         stored_pressure = float(state.get("air_receiver_pressure_bar", 0.0))
         calculated_pressure = self._air_pressure_from_inventory(state["air_inventory_nm3"])
         if abs(stored_pressure - calculated_pressure) > 0.05:
@@ -147,6 +166,19 @@ class FactoryUtilities:
                                  / cls.AIR_STANDARD_TEMPERATURE_K
                                  * cls.AIR_STANDARD_PRESSURE_BAR)
         return max(0.0, absolute_pressure_bar - cls.AIR_STANDARD_PRESSURE_BAR)
+
+    @classmethod
+    def _steam_pressure_from_inventory(cls, inventory_t: float) -> float:
+        """Approximate fixed-volume header pressure from steam mass at fixed temperature."""
+        absolute_pressure = (max(0.0, inventory_t) / cls.STEAM_REFERENCE_INVENTORY_T
+                             * cls.STEAM_REFERENCE_ABSOLUTE_PRESSURE_BAR)
+        return max(0.0, absolute_pressure - cls.ATMOSPHERIC_PRESSURE_BAR)
+
+    @classmethod
+    def _steam_inventory_at_pressure(cls, gauge_pressure_bar: float) -> float:
+        absolute_pressure = max(0.0, gauge_pressure_bar) + cls.ATMOSPHERIC_PRESSURE_BAR
+        return (absolute_pressure / cls.STEAM_REFERENCE_ABSOLUTE_PRESSURE_BAR
+                * cls.STEAM_REFERENCE_INVENTORY_T)
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
@@ -183,7 +215,7 @@ class FactoryUtilities:
         boiler_capacity_factor = max(0.0, 1.0 - boiler_fault)
         boiler_capacity_factor *= max(0.0, 1.0 - 0.48 * boiler_mechanical)
         steam_demand = 32.0 * (1.0 + 0.38 * steam_demand_fault) + state["cip_steam_demand_tph"]
-        pressure = 5.0 + 4.5 * state["steam_header_inventory_t"] / self.HEADER_CAPACITY_T
+        pressure = self._steam_pressure_from_inventory(state["steam_header_inventory_t"])
         steam_service = max(0.0, min(1.0, (pressure - 5.5) / 1.8))
         actual_steam_demand = steam_demand * steam_service
         pressure_recovery_flow = max(0.0, 8.0 - pressure) * 3.0
@@ -215,10 +247,14 @@ class FactoryUtilities:
         state["steam_generation_tph"] = boiler_total
         state["steam_demand_tph"] = steam_demand
         state["steam_consumption_tph"] = actual_steam_demand
+        proposed_inventory = (state["steam_header_inventory_t"]
+                              + (boiler_total - actual_steam_demand) / 3600.0)
+        state["steam_relief_flow_tph"] = max(
+            0.0, proposed_inventory - self.HEADER_CAPACITY_T) * 3600.0
         state["steam_header_inventory_t"] = max(0.0, min(self.HEADER_CAPACITY_T,
-            state["steam_header_inventory_t"] + (boiler_total - actual_steam_demand) / 3600.0))
-        state["steam_header_pressure_bar"] = (5.0 + 4.5 * state["steam_header_inventory_t"]
-                                               / self.HEADER_CAPACITY_T)
+                                                          proposed_inventory))
+        state["steam_header_pressure_bar"] = self._steam_pressure_from_inventory(
+            state["steam_header_inventory_t"])
         state["steam_service_fraction"] = max(0.0, min(1.0,
             (state["steam_header_pressure_bar"] - 5.5) / 1.8))
 
@@ -357,7 +393,8 @@ class FactoryUtilities:
 
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
-                "sim_seconds", "steam_header_pressure_bar", "steam_generation_tph",
+                "sim_seconds", "steam_header_pressure_bar", "steam_relief_flow_tph",
+                "steam_generation_tph",
                 "steam_demand_tph", "steam_service_fraction", "condensate_inventory_t",
                 "air_receiver_pressure_bar", "air_supply_nm3_min", "air_demand_nm3_min",
                 "air_service_fraction", "dryer_dew_point_c",
@@ -407,7 +444,8 @@ class FactoryUtilities:
             },
             ("Boiler house", "Steam header"): {
                 "line_pressure": (pressure, "bar", 0, 20), "steam_flow": (steam, "t/h", 0, 50),
-                "steam_temperature": (170 + 5 * pressure, "°C", 0, 250),
+                "safety_relief_flow": (state["steam_relief_flow_tph"], "t/h", 0, 50),
+                "steam_temperature": (self.STEAM_HEADER_TEMPERATURE_C, "°C", 0, 250),
                 "header_inventory": (100 * state["steam_header_inventory_t"] / self.HEADER_CAPACITY_T, "%", 0, 100),
                 "service_fraction": (100 * state["steam_service_fraction"], "%", 0, 100),
             },
