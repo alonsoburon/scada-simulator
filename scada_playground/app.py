@@ -273,8 +273,7 @@ def initialize(seed: int = 17) -> None:
             tag["dynamic_model"] = True
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
-        initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
-                                     + concentrator_state["crusher_power_mw"] + 1.0)
+        initial_process_power_mw = concentrator_state["total_power_mw"]
         initial_water_power_mw = water_state["electrical_load_kw"] / 1000.0
         initial_process_power_mw += ventilation_state["fan_power_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
@@ -389,8 +388,7 @@ def initialize(seed: int = 17) -> None:
             sim["tags"].append(tag)
         if "power_network" not in sim:
             sim["power_network"] = POWER_MODEL.initialize()
-            process_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                               + sim["concentrator"]["crusher_power_mw"] + 1.0
+            process_load_mw = (sim["concentrator"]["total_power_mw"]
                                + sim["mine_ventilation"]["fan_power_kw"] / 1000.0)
             water_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
@@ -721,8 +719,7 @@ def advance(force: bool = False) -> None:
                     if event.area in ("Water supply network", "Water distribution", "Water treatment",
                                       "Wastewater", "Mine power network", "Whole factory")]
     concentrator_events = [event.__dict__ for event in sim["events"]]
-    process_power_load_mw = (sim["concentrator"]["sag_power_mw"] + sim["concentrator"]["ball_power_mw"]
-                             + sim["concentrator"]["crusher_power_mw"] + 1.0
+    process_power_load_mw = (sim["concentrator"]["total_power_mw"]
                              + sim["mine_ventilation"]["fan_power_kw"] / 1000.0)
     water_power_load_mw = sim["water_network"]["electrical_load_kw"] / 1000.0
     POWER_MODEL.advance(sim["power_network"], sim["tick"], concentrator_events,
@@ -1553,7 +1550,7 @@ def render_dashboard():
             ("Copper recovery", f"{plant['copper_recovery_pct']:.1f}%"),
             ("Product P80", f"{plant['p80_microns']:.0f} µm"),
             ("Concentrate", f"{plant['concentrate_tph']:.1f} t/h"),
-            ("Process power", f"{plant['sag_power_mw'] + plant['ball_power_mw'] + plant['crusher_power_mw']:.1f} MW"),
+            ("Concentrator load", f"{plant['total_power_mw']:.1f} MW"),
             ("Water makeup", f"{plant['water_makeup_m3h']:.0f} m³/h"),
         ]
         for col, (label, value) in zip(metric_cols, metric_values):

@@ -15,7 +15,9 @@ class MinePowerNetwork:
         "Grid generation": ["Turbine generator 01", "Turbine generator 02", "Solar farm", "Battery storage", "Black start unit"],
         "Grid transmission": ["Transmission line A", "Transmission line B", "Grid substation A", "Grid substation B", "Intertie"],
         "Grid distribution": ["Distribution incomer", "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Capacitor bank"],
-        "Mine power network": ["Mine substation A", "Mine substation B", "Factory utility feeder", "Pit distribution", "Underground feeders", "Emergency generation"],
+        "Mine power network": ["Mine substation A", "Mine substation B", "Concentrator substation",
+                               "Factory utility feeder", "Pit distribution", "Underground feeders",
+                               "Emergency generation"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     FAULT_RESISTANCE_PU = {"Small": 0.12, "Medium": 0.04, "Large": 0.005}
@@ -74,7 +76,7 @@ class MinePowerNetwork:
                 "trip_count": 0, "lockout": False, "last_trip_reason": "",
                 "relay_operation_count": 0, "breaker_failure_count": 0},
             "tie_capacity_mw": 44.0, "mine_transformer_capacity_mw": 39.0,
-            "process_feeder_capacity_mw": 32.0, "water_feeder_capacity_mw": 2.5,
+            "process_feeder_capacity_mw": 36.0, "water_feeder_capacity_mw": 2.5,
             "solar_mw": 2.2, "diesel_mw": 0.0, "diesel_available_mw": 8.0,
             "diesel_start_timer_s": 0, "diesel_started": False,
             "diesel_governor_bias_mw": 0.0, "diesel_dispatch_target_mw": 0.0,
@@ -294,7 +296,7 @@ class MinePowerNetwork:
 
         state["tie_capacity_mw"] = 44.0 * tie_factor
         state["mine_transformer_capacity_mw"] = 39.0 * mine_factor
-        state["process_feeder_capacity_mw"] = 32.0 * process_factor * mine_factor
+        state["process_feeder_capacity_mw"] = 36.0 * process_factor * mine_factor
         state["water_feeder_capacity_mw"] = 2.5 * water_factor * mine_factor
 
         solar = (2.2 + 0.65 * math.sin(sim_seconds / 430.0) + 0.22 * math.sin(sim_seconds / 71.0))
@@ -736,7 +738,18 @@ class MinePowerNetwork:
             {"tag": "mine_power_network.concentrator_substation.active_power", "area": "Mine power network",
              "unit": "Concentrator substation", "sensor": "active_power", "units": "MW",
              "value": round(state["process_load_mw"], 3), "quality": "GOOD", "low": 0, "high": 50,
-             "base": 25, "phase": 0.0, "last_change": "Process electrical demand"},
+             "base": 25, "phase": 0.0, "last_change": "Served process electrical load"},
+            {"tag": "mine_power_network.concentrator_substation.requested_power", "area": "Mine power network",
+             "unit": "Concentrator substation", "sensor": "requested_power", "units": "MW",
+             "value": round(state.get("process_requested_mw", state["process_load_mw"]), 3),
+             "quality": "GOOD", "low": 0, "high": 50, "base": 25, "phase": 0.0,
+             "last_change": "Process electrical load and motor-starting demand"},
+            {"tag": "mine_power_network.concentrator_substation.unserved_power", "area": "Mine power network",
+             "unit": "Concentrator substation", "sensor": "unserved_power", "units": "MW",
+             "value": round(max(0.0, state.get("process_requested_mw", state["process_load_mw"])
+                                 - state["process_load_mw"]), 3),
+             "quality": "GOOD", "low": 0, "high": 50, "base": 0, "phase": 0.0,
+             "last_change": "Unserved process load"},
             {"tag": "mine_power_network.water_pump_station.pump_load", "area": "Mine power network",
              "unit": "Water pump station", "sensor": "active_power", "units": "MW",
              "value": round(state["water_load_mw"], 3), "quality": "GOOD", "low": 0, "high": 2,

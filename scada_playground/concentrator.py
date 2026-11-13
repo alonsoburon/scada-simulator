@@ -18,7 +18,8 @@ class CopperConcentrator:
     AREA_ASSETS = {
         "Open-pit mining": ["Pit sector A"],
         "Crushing and screening": ["Primary crusher", "Ore conveyors"],
-        "Grinding and flotation": ["SAG mill", "Ball mill 01", "Cyclone cluster", "Flotation cells"],
+        "Grinding and flotation": ["SAG mill", "Ball mill 01", "Cyclone cluster", "Flotation cells",
+                                   "Flotation air blower"],
         "Concentrate handling": ["Concentrate thickener", "Filter press"],
         "Tailings and reclaim": ["Tailings thickener", "Tailings pump station A"],
     }
@@ -114,6 +115,11 @@ class CopperConcentrator:
             "water_available_fraction": 1.0, "water_recovery_pct": 42.0,
             "fresh_water_shortage_m3h": 0.0,
             "sag_power_mw": 15.0, "ball_power_mw": 8.7, "crusher_power_mw": 2.2,
+            "conveyor_power_mw": 0.45, "flotation_air_power_mw": 1.62,
+            "flotation_aux_power_mw": 0.35, "tailings_pump_power_mw": 0.62,
+            "tailings_thickener_power_mw": 0.18, "concentrate_thickener_power_mw": 0.11,
+            "filter_press_power_mw": 0.12, "process_aux_power_mw": 0.50,
+            "total_power_mw": 29.85,
             "flotation_air_nm3_min": 540.0, "reagent_l_h": 245.0,
             "crusher_condition": 1.0, "sag_condition": 1.0, "ball_condition": 1.0,
             "flotation_condition": 1.0, "tailings_condition": 1.0,
@@ -145,6 +151,10 @@ class CopperConcentrator:
                     "concentrate_cake_copper_inventory_t", "cumulative_concentrate_copper_produced_t",
                     "cumulative_concentrate_copper_shipped_t", "tailings_thickener_copper_inventory_t",
                     "cumulative_tailings_copper_received_t", "cumulative_tailings_copper_pumped_t",
+                    "conveyor_power_mw", "flotation_air_power_mw", "flotation_aux_power_mw",
+                    "tailings_pump_power_mw", "tailings_thickener_power_mw",
+                    "concentrate_thickener_power_mw", "filter_press_power_mw",
+                    "process_aux_power_mw", "total_power_mw",
                     "concentrate_thickener_capacity_t", "filter_press_phase",
                     "filter_press_cycle_s", "filter_press_batch_t",
                     "filter_press_batch_capacity_t", "filter_press_cycle_count",
@@ -209,6 +219,37 @@ class CopperConcentrator:
         for copper_key, (solids_key, grade_fraction) in legacy_grade_inventory.items():
             if copper_key in missing:
                 state[copper_key] = max(0.0, state.get(solids_key, 0.0)) * grade_fraction
+        power_components = ("conveyor_power_mw", "flotation_air_power_mw", "flotation_aux_power_mw",
+                            "tailings_pump_power_mw", "tailings_thickener_power_mw",
+                            "concentrate_thickener_power_mw", "filter_press_power_mw",
+                            "process_aux_power_mw", "total_power_mw")
+        if any(key in missing for key in power_components):
+            state["conveyor_power_mw"] = (0.45 * state.get("crushed_ore_tph", 0.0) / 1_200.0
+                                          * state.get("conveyors_motor_running", 1.0))
+            state["flotation_air_power_mw"] = (
+                state.get("flotation_air_nm3_min", 0.0) * 60.0 * 0.05 / 1_000.0)
+            state["flotation_aux_power_mw"] = (0.35 * min(1.0, state.get("plant_feed_tph", 0.0) / 900.0)
+                                               * state.get("flotation_motor_running", 1.0))
+            state["tailings_pump_power_mw"] = (
+                0.62 * min(1.0, state.get("tailings_tph", 0.0) / 1_400.0)
+                / max(state.get("tailings_condition", 1.0), 0.35)
+                * state.get("tailings_motor_running", 1.0))
+            state["tailings_thickener_power_mw"] = (
+                0.18 * min(1.0, state.get("tailings_thickener_feed_tph", 0.0) / 900.0)
+                * state.get("tailings_thickener_motor_running", 1.0))
+            state["concentrate_thickener_power_mw"] = (
+                0.11 * min(1.0, state.get("concentrate_tph", 0.0) / 26.0)
+                * (1.0 + 1.0 - state.get("concentrate_condition", 1.0))
+                * state.get("concentrate_thickener_motor_running", 1.0))
+            state["filter_press_power_mw"] = (
+                0.12 * state.get("filter_press_motor_running", 1.0)
+                * float(state.get("filter_press_phase") in ("FILLING", "SQUEEZING")))
+            state["process_aux_power_mw"] = 0.50
+            state["total_power_mw"] = sum(state.get(key, 0.0) for key in (
+                "sag_power_mw", "ball_power_mw", "crusher_power_mw", "conveyor_power_mw",
+                "flotation_air_power_mw", "flotation_aux_power_mw", "tailings_pump_power_mw",
+                "tailings_thickener_power_mw", "concentrate_thickener_power_mw",
+                "filter_press_power_mw", "process_aux_power_mw"))
         if previous_grind_revision < 2:
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
                         "cyclone_overflow_fraction", "circulating_load_ratio", "coarse_breakage_per_pass",
@@ -259,6 +300,13 @@ class CopperConcentrator:
     @staticmethod
     def _smooth(old: float, requested: float, seconds: int = 90) -> float:
         return old + (requested - old) / max(seconds, 1)
+
+    @staticmethod
+    def _motor_current_a(power_mw: float, voltage_kv: float = 6.6,
+                         power_factor: float = 0.90, efficiency: float = 0.95) -> float:
+        """Estimate balanced three-phase line current from real motor input power."""
+        denominator = math.sqrt(3.0) * voltage_kv * power_factor * efficiency
+        return max(0.0, power_mw) * 1_000.0 / max(denominator, 1e-9)
 
     @staticmethod
     def _log_size_percentile(class_fractions: tuple[float, float, float], percentile: float = 0.80) -> float:
@@ -380,20 +428,21 @@ class CopperConcentrator:
         state["flotation_condition"] = 1.0 - grinding_wear * 0.28
         state["tailings_condition"] = 1.0 - tailings_wear * 0.65
         state["concentrate_condition"] = 1.0 - concentrate_wear * 0.35
+        power_factor = (max(0.0, min(1.0, power_available_fraction))
+                        if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
 
         # ROM receiving is finite storage. Integrated runs receive discrete truck
         # payloads; standalone model experiments retain a smooth mine-source input.
         scheduled_rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
         jam_factor = 0.0 if jam >= 0.78 else 1.0 - jam
         crusher_running = equipment_available.get("crusher", True) and equipment_available.get("conveyors", True)
-        crusher_capacity = (1_460.0 * state["crusher_condition"] * jam_factor) if crusher_running else 0.0
+        crusher_capacity = (1_460.0 * state["crusher_condition"] * jam_factor * power_factor
+                            if crusher_running else 0.0)
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
-        power_factor = (max(0.0, min(1.0, power_available_fraction))
-                        if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
         dt_h = 1.0 / 3600.0
         tailings_capacity_t = state["tailings_thickener_capacity_t"]
-        tailings_sink_ready = (equipment_available.get("tailings_thickener", True)
+        tailings_sink_ready = (power_factor > 0.05 and equipment_available.get("tailings_thickener", True)
                                and equipment_available.get("tailings_pump", True))
         tailings_backpressure = 1.0
         if not tailings_sink_ready:
@@ -406,7 +455,7 @@ class CopperConcentrator:
                 / max(0.14 * water_capacity, 1.0)))
             tailings_backpressure = min(tailings_backpressure, water_backpressure)
         concentrate_capacity_t = state["concentrate_thickener_capacity_t"]
-        concentrate_sink_ready = (equipment_available.get("concentrate_thickener", True)
+        concentrate_sink_ready = (power_factor > 0.05 and equipment_available.get("concentrate_thickener", True)
                                   and equipment_available.get("filter_press", True))
         concentrate_backpressure = 1.0
         if not concentrate_sink_ready:
@@ -533,7 +582,8 @@ class CopperConcentrator:
         if circuit_running:
             state["p80_microns"] = self._smooth(state["p80_microns"], target_p80, 240)
 
-        flotation_air = 540.0 * (1 - grinding_wear * 0.3) * power_factor
+        flotation_air = (540.0 * (1 - grinding_wear * 0.3) * power_factor
+                         if equipment_available.get("flotation", True) else 0.0)
         reagent = 245.0 * (1 + 0.12 * math.sin(sim_seconds / 600))
         pulp_flow_m3h = cyclone_overflow * (1.0 / 2.7 + state["water_specific_m3_t"])
         state["flotation_residence_time_min"] = min(90.0, 540.0 * 60.0 / max(pulp_flow_m3h, 1.0))
@@ -577,7 +627,7 @@ class CopperConcentrator:
         state["filter_press_cake_tph"] = 0.0
         state["filter_press_filtrate_m3h"] = 0.0
         press_cake_copper_tph = 0.0
-        press_ready = (equipment_available.get("filter_press", True)
+        press_ready = (power_factor > 0.05 and equipment_available.get("filter_press", True)
                        and equipment_available.get("concentrate_thickener", True))
         if press_ready:
             if state["filter_press_phase"] == "FILLING":
@@ -585,7 +635,7 @@ class CopperConcentrator:
                                         - state["filter_press_batch_t"])
                 available_concentrate_t = (state["concentrate_thickener_inventory_t"]
                                            + concentrate * dt_h - 10.0)
-                press_feed = min(42.0 * state["concentrate_condition"],
+                press_feed = min(42.0 * state["concentrate_condition"] * power_factor,
                                  max(0.0, available_concentrate_t) / dt_h,
                                  remaining_batch_t / dt_h)
                 state["filter_press_feed_tph"] = press_feed
@@ -666,7 +716,7 @@ class CopperConcentrator:
 
         # Tailings are a separate solids stream. A stopped thickener/pump train
         # fills its finite inventory, which eventually backpressures flotation.
-        tailings_pump_capacity = (1_400.0 * state["tailings_condition"]
+        tailings_pump_capacity = (1_400.0 * state["tailings_condition"] * power_factor
                                   if tailings_sink_ready else 0.0)
         pumpable_tailings_t = (state["tailings_thickener_inventory_t"] + tailings * dt_h)
         tailings_inventory_error = max(0.0, state["tailings_thickener_inventory_t"] - 1_100.0)
@@ -717,8 +767,10 @@ class CopperConcentrator:
             + (tailings_water_feed - tailings_underflow_water) * dt_h)
         target_water_hold_m3 = state["tailings_thickener_inventory_t"] * underflow_water_ratio
         excess_water_m3 = max(0.0, water_inventory_before_overflow - target_water_hold_m3)
-        thickener_online = equipment_available.get("tailings_thickener", True)
-        overflow_capacity_m3 = (state["tailings_thickener_overflow_capacity_m3h"] * dt_h
+        thickener_online = (power_factor > 0.05
+                            and equipment_available.get("tailings_thickener", True))
+        overflow_capacity_m3 = (state["tailings_thickener_overflow_capacity_m3h"]
+                                * power_factor * dt_h
                                 if thickener_online else 0.0)
         tailings_overflow_m3 = min(excess_water_m3, overflow_capacity_m3)
         water_after_overflow_m3 = water_inventory_before_overflow - tailings_overflow_m3
@@ -738,7 +790,7 @@ class CopperConcentrator:
         state["cumulative_tailings_water_spill_m3"] += water_spill_m3
         concentrate_underflow_water = concentrate * (1.0 / 0.60 - 1.0)
         concentrate_overflow = max(0.0, concentrate_water_feed - concentrate_underflow_water)
-        concentrate_thickener_return = (concentrate_overflow * 0.92
+        concentrate_thickener_return = (concentrate_overflow * 0.92 * power_factor
                                         if equipment_available.get("concentrate_thickener", True) else 0.0)
         filtrate_return = (state["filter_press_filtrate_m3h"]
                            if equipment_available.get("filter_press", True) else 0.0)
@@ -766,21 +818,44 @@ class CopperConcentrator:
         state["sag_running"] = float(sag_rate > 5 and equipment_available.get("sag_mill", True))
         state["ball_running"] = float(ball_rate > 5 and equipment_available.get("ball_mill", True))
         state["flotation_running"] = float(cyclone_overflow > 5 and equipment_available.get("flotation", True))
-        state["crusher_motor_running"] = float(equipment_available.get("crusher", True))
-        state["conveyors_motor_running"] = float(equipment_available.get("conveyors", True))
-        state["sag_motor_running"] = float(equipment_available.get("sag_mill", True))
-        state["ball_motor_running"] = float(equipment_available.get("ball_mill", True))
-        state["flotation_motor_running"] = float(equipment_available.get("flotation", True))
-        state["tailings_motor_running"] = float(equipment_available.get("tailings_pump", True))
+        powered = power_factor > 0.05
+        state["crusher_motor_running"] = float(powered and equipment_available.get("crusher", True))
+        state["conveyors_motor_running"] = float(powered and equipment_available.get("conveyors", True))
+        state["sag_motor_running"] = float(powered and equipment_available.get("sag_mill", True))
+        state["ball_motor_running"] = float(powered and equipment_available.get("ball_mill", True))
+        state["flotation_motor_running"] = float(powered and equipment_available.get("flotation", True))
+        state["tailings_motor_running"] = float(powered and equipment_available.get("tailings_pump", True))
         state["crusher_vibration_mm_s"] = 2.4 + crushing_wear * 12 + jam * 5
         state["sag_vibration_mm_s"] = 2.8 + grinding_wear * 10
         state["ball_vibration_mm_s"] = 2.4 + grinding_wear * 9
         state["flotation_vibration_mm_s"] = 1.8 + grinding_wear * 5
         state["tailings_vibration_mm_s"] = 2.1 + tailings_wear * 13
         state["concentrate_condition"] = 1.0 - concentrate_wear * 0.35
-        state["tailings_thickener_motor_running"] = float(equipment_available.get("tailings_thickener", True))
-        state["concentrate_thickener_motor_running"] = float(equipment_available.get("concentrate_thickener", True))
-        state["filter_press_motor_running"] = float(equipment_available.get("filter_press", True))
+        state["tailings_thickener_motor_running"] = float(
+            powered and equipment_available.get("tailings_thickener", True))
+        state["concentrate_thickener_motor_running"] = float(
+            powered and equipment_available.get("concentrate_thickener", True))
+        state["filter_press_motor_running"] = float(powered and equipment_available.get("filter_press", True))
+        state["conveyor_power_mw"] = 0.45 * (crushed_rate / 1_200.0) * state["conveyors_motor_running"]
+        state["flotation_air_power_mw"] = flotation_air * 60.0 * 0.05 / 1_000.0
+        state["flotation_aux_power_mw"] = (0.35 * min(1.0, cyclone_overflow / 900.0)
+                                           * state["flotation_motor_running"])
+        state["tailings_pump_power_mw"] = (0.62 * min(1.0, tailings_pumped / 1_400.0)
+                                            / max(state["tailings_condition"], 0.35)
+                                            * state["tailings_motor_running"])
+        state["tailings_thickener_power_mw"] = (0.18 * min(1.0, tailings / 900.0)
+                                                * state["tailings_thickener_motor_running"])
+        state["concentrate_thickener_power_mw"] = (0.11 * min(1.0, concentrate / 26.0)
+                                                   * (1.0 + (1.0 - state["concentrate_condition"]))
+                                                   * state["concentrate_thickener_motor_running"])
+        state["filter_press_power_mw"] = (0.12 * state["filter_press_motor_running"]
+                                          * float(state["filter_press_phase"] in ("FILLING", "SQUEEZING")))
+        state["process_aux_power_mw"] = 0.50
+        state["total_power_mw"] = sum(state[key] for key in (
+            "sag_power_mw", "ball_power_mw", "crusher_power_mw", "conveyor_power_mw",
+            "flotation_air_power_mw", "flotation_aux_power_mw", "tailings_pump_power_mw",
+            "tailings_thickener_power_mw", "concentrate_thickener_power_mw",
+            "filter_press_power_mw", "process_aux_power_mw"))
 
         if sim_seconds % 15 == 0:
             state["history"].append({"time": sim_seconds, "rom_stockpile_t": state["rom_stockpile_t"],
@@ -802,7 +877,7 @@ class CopperConcentrator:
                 "concentrate_cake_inventory_t": state["concentrate_cake_inventory_t"],
                 "water_makeup_m3h": state["water_makeup_m3h"],
                 "concentrator_reclaim_m3h": state["concentrator_reclaim_m3h"],
-                "power_mw": state["sag_power_mw"] + state["ball_power_mw"] + state["crusher_power_mw"]})
+                "power_mw": state["total_power_mw"]})
             state["history"] = state["history"][-1_440:]
 
         # Measurement drift is applied only to the process quality/reading surface,
@@ -821,25 +896,25 @@ class CopperConcentrator:
             "Crushing and screening": {
                 "Primary crusher": {"ore_rate": (state["crushed_ore_tph"], "t/h", 0, 2_000),
                     "motor_power": (state["crusher_power_mw"], "MW", 0, 5),
-                    "motor_current": (state["crusher_power_mw"] * 31.0, "A", 0, 250),
+                    "motor_current": (self._motor_current_a(state["crusher_power_mw"]), "A", 0, 500),
                     "vibration_rms": (state["crusher_vibration_mm_s"], "mm/s", 0, 30),
                     "equipment_running": (state.get("crusher_motor_running", state["crushing_running"]), "bool", 0, 1)},
                 "Ore conveyors": {"ore_rate": (state["crushed_ore_tph"], "t/h", 0, 2_000),
                     "stockpile_inventory": (state["crushed_stockpile_t"], "t", 0, 8_000),
-                    "motor_power": (0.45 * state["crushing_running"], "MW", 0, 1),
+                    "motor_power": (state["conveyor_power_mw"], "MW", 0, 1),
                     "belt_speed": (3.1 * state["crushing_running"], "m/s", 0, 8),
                     "equipment_running": (state.get("conveyors_motor_running", state["crushing_running"]), "bool", 0, 1)},
             },
             "Grinding and flotation": {
                 "SAG mill": {"ore_rate": (state["sag_feed_tph"], "t/h", 0, 2_000),
                     "motor_power": (state["sag_power_mw"], "MW", 0, 30),
-                    "motor_current": (state["sag_power_mw"] * 41.0, "A", 0, 2_500),
+                    "motor_current": (self._motor_current_a(state["sag_power_mw"]), "A", 0, 2_500),
                     "vibration_rms": (state["sag_vibration_mm_s"], "mm/s", 0, 30),
                     "equipment_running": (state.get("sag_motor_running", state["sag_running"]), "bool", 0, 1),
                     "ore_hardness": (state["ore_hardness_kwh_t"], "kWh/t", 8, 32)},
                 "Ball mill 01": {"ore_rate": (state["ball_circuit_feed_tph"], "t/h", 0, 4_000),
                     "motor_power": (state["ball_power_mw"], "MW", 0, 20),
-                    "motor_current": (state["ball_power_mw"] * 44.0, "A", 0, 2_500),
+                    "motor_current": (self._motor_current_a(state["ball_power_mw"]), "A", 0, 2_500),
                     "vibration_rms": (state["ball_vibration_mm_s"], "mm/s", 0, 30),
                     "coarse_breakage_per_pass": (100 * state["coarse_breakage_per_pass"], "%", 0, 100),
                     "intermediate_breakage_per_pass": (100 * state["intermediate_breakage_per_pass"], "%", 0, 100),
@@ -861,8 +936,12 @@ class CopperConcentrator:
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),
                     "air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),
                     "reagent_rate": (state["reagent_l_h"], "L/h", 0, 1_000),
+                    "cell_drive_power": (state["flotation_aux_power_mw"], "MW", 0, 2),
                     "residence_time": (state["flotation_residence_time_min"], "min", 0, 90),
                     "equipment_running": (state.get("flotation_motor_running", state["flotation_running"]), "bool", 0, 1)},
+                "Flotation air blower": {"air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),
+                    "motor_power": (state["flotation_air_power_mw"], "MW", 0, 5),
+                    "equipment_running": (float(state["flotation_air_nm3_min"] > 1), "bool", 0, 1)},
             },
             "Concentrate handling": {
                 "Concentrate thickener": {
@@ -871,8 +950,7 @@ class CopperConcentrator:
                     "tank_level": (8 + state["concentrate_thickener_inventory_t"]
                                    / state["concentrate_thickener_capacity_t"] * 84, "%", 0, 100),
                     "underflow_rate": (state["filter_press_feed_tph"], "t/h", 0, 60),
-                    "motor_power": (0.11 * state["concentrate_condition"]
-                                    * state["concentrate_thickener_motor_running"], "MW", 0, 1),
+                    "motor_power": (state["concentrate_thickener_power_mw"], "MW", 0, 1),
                     "equipment_running": (state["concentrate_thickener_motor_running"], "bool", 0, 1)},
                 "Filter press": {
                     "feed_rate": (state["filter_press_feed_tph"], "t/h", 0, 60),
@@ -880,6 +958,7 @@ class CopperConcentrator:
                     "cake_stockpile": (state["concentrate_cake_inventory_t"], "t", 0, 500),
                     "cake_copper_inventory": (state["concentrate_cake_copper_inventory_t"], "t Cu", 0, 125),
                     "cake_moisture": (9.0 + (1 - state["concentrate_condition"]) * 12, "%", 0, 40),
+                    "motor_power": (state["filter_press_power_mw"], "MW", 0, 1),
                     "cycle_count": (float(state["filter_press_cycle_count"]), "cycles", 0, 100_000),
                     "equipment_running": (state["filter_press_motor_running"], "bool", 0, 1)},
             },
@@ -890,6 +969,7 @@ class CopperConcentrator:
                                      / max(state["tailings_thickener_inventory_t"], 1e-9), "% Cu", 0, 2),
                     "tank_level": (state["tailings_thickener_inventory_t"]
                                    / state["tailings_thickener_capacity_t"] * 100, "%", 0, 100),
+                    "motor_power": (state["tailings_thickener_power_mw"], "MW", 0, 1),
                     "water_inventory": (state["tailings_thickener_water_inventory_m3"], "m³", 0,
                                         state["tailings_thickener_water_capacity_m3"]),
                     "water_level": (state["tailings_thickener_water_inventory_m3"]
@@ -900,10 +980,8 @@ class CopperConcentrator:
                     "underflow_rate": (state["tailings_tph"], "t/h", 0, 2_000),
                     "equipment_running": (state["tailings_thickener_motor_running"], "bool", 0, 1)},
                 "Tailings pump station A": {"ore_rate": (state["tailings_tph"], "t/h", 0, 2_000),
-                    "motor_power": (0.62 * state["tailings_condition"]
-                                    * state["tailings_motor_running"], "MW", 0, 2),
-                    "motor_current": (62 * state["tailings_condition"]
-                                      * state["tailings_motor_running"], "A", 0, 250),
+                    "motor_power": (state["tailings_pump_power_mw"], "MW", 0, 2),
+                    "motor_current": (self._motor_current_a(state["tailings_pump_power_mw"]), "A", 0, 250),
                     "vibration_rms": (state["tailings_vibration_mm_s"], "mm/s", 0, 30),
                     "equipment_running": (state.get("tailings_motor_running", float(state["tailings_tph"] > 5)), "bool", 0, 1)},
             },
