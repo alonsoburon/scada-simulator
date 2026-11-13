@@ -574,6 +574,25 @@ def reset_feeder_protection(sim: dict, target_asset: str) -> None:
                                         fault_active=fault_active)
 
 
+def maintain_process_equipment(sim: dict, target_asset: str) -> float:
+    """Perform a simulated repair only after the selected process asset is isolated."""
+    match = next(((key, values) for key, values in CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT.items()
+                  if target_asset.casefold() in (key.casefold(), values[0].casefold())), None)
+    if match is None:
+        raise ValueError(f"Unknown process equipment: {target_asset!r}")
+    equipment, (label, controller_key) = match
+    area = CONCENTRATOR_MODEL.MAINTENANCE_AREAS[equipment]
+    active_fault = any(event.name == "Mechanical degradation"
+                       and event.area in (area, "Whole factory") for event in sim["events"])
+    equipment_stopped = (sim["process_control"]["equipment"][controller_key]["state"] == "STOPPED")
+    previous = CONCENTRATOR_MODEL.perform_maintenance(
+        sim["concentrator"], label, equipment_stopped=equipment_stopped, fault_active=active_fault)
+    sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": "INFO",
+        "message": f"Maintenance completed on {label}; condition restored from {previous * 100:.1f}% to 100%",
+        "state": "ACTIVE / UNACK"})
+    return previous
+
+
 def process_mcp_commands() -> list[tuple[str, dict]]:
     """Apply localhost MCP requests inside the simulator's owning Streamlit session."""
     if not MCP_COMMAND_DIR.exists():
@@ -635,6 +654,11 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 target_asset = command.get("target_asset", "")
                 reset_feeder_protection(sim, target_asset)
                 message = f"Feeder protection lockout manually reset for {target_asset}; trip history was retained."
+            elif action == "maintain_equipment":
+                target_asset = command.get("target_asset", "")
+                previous = maintain_process_equipment(sim, target_asset)
+                message = (f"Maintenance completed on {target_asset}; equipment condition restored "
+                           f"from {previous * 100:.1f}% to 100%.")
             elif action == "process_control":
                 control = sim["process_control"]
                 process_action = command.get("process_action", "").upper()
@@ -1586,6 +1610,31 @@ def render_dashboard():
                         st.success(f"Reset {len(cleared)} trip(s). Inspect the condition, then start manually.")
                     except ValueError as error:
                         st.error(str(error))
+            st.markdown("**Equipment condition and maintenance**")
+            condition_rows = [{"Equipment": values[0],
+                               "Condition": f"{plant['equipment_health'][name] * 100:.1f}%",
+                               "Control state": control["equipment"][values[1]]["state"]}
+                              for name, values in CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT.items()]
+            st.dataframe(pd.DataFrame(condition_rows), hide_index=True, width="stretch")
+            maintenance_options = list(CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT)
+            maintenance_choice = st.selectbox(
+                "Asset for maintenance",
+                maintenance_options,
+                format_func=lambda key: CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT[key][0],
+                key=f"maintenance_asset_{sim['simulation_id']}")
+            maintenance_label = CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT[maintenance_choice][0]
+            maintenance_area = CONCENTRATOR_MODEL.MAINTENANCE_AREAS[maintenance_choice]
+            maintenance_fault_active = any(event.name == "Mechanical degradation"
+                and event.area in (maintenance_area, "Whole factory") for event in sim["events"])
+            maintenance_stopped = (control["equipment"][maintenance_choice]["state"] == "STOPPED")
+            if st.button("Perform maintenance", disabled=not maintenance_stopped or maintenance_fault_active,
+                         key=f"perform_maintenance_{sim['simulation_id']}"):
+                previous = maintain_process_equipment(sim, maintenance_label)
+                st.success(f"{maintenance_label}: condition restored from {previous * 100:.1f}% to 100%.")
+            if not maintenance_stopped:
+                st.caption("Stop the process first. Maintenance is only available when the selected asset is stopped.")
+            elif maintenance_fault_active:
+                st.caption("Clear the active mechanical fault before maintaining this asset.")
             equipment_rows = [{"Equipment": PLANT_CONTROLLER.LABELS[name],
                                "State": item["state"], "Elapsed (s)": item["elapsed_s"],
                                "Trips": item["trips"], "Trip reason": item["trip_reason"] or "—"}

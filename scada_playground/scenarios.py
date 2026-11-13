@@ -88,6 +88,7 @@ SCENARIOS = {
             "Mine block grade changes at the ROM stockpile while the blended flotation feed grade moves more slowly as copper-bearing ore turns over through ROM, crushed-ore, and SAG buffers.",
             "Six well-mixed flotation cells hold copper between scans; changes in grind, air, reagent, and residence time alter the kinetic rate before concentrate and tailings assays settle.",
             "Grinding degradation limits fresh-feed capacity and shifts power, cyclone recirculating load, and copper recovery.",
+            "Mechanical degradation slowly lowers persistent asset condition; when the incident clears the damage remains until the asset is stopped and maintained.",
             "Mine power disturbance derates the concentrator and the coupled water pump station; inventory buffers delay process effects.",
             "After the faults clear, process variables and inventories recover at different rates.",
         ),

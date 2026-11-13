@@ -25,6 +25,24 @@ class CopperConcentrator:
     }
     STAGES = ("crushing", "sag_mill", "ball_mill", "cyclone", "flotation",
               "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump")
+    MAINTAINABLE_EQUIPMENT = {
+        "crusher": ("Primary crusher", "crusher"),
+        "conveyors": ("Ore conveyors", "conveyors"),
+        "sag_mill": ("SAG mill", "sag_mill"),
+        "ball_mill": ("Ball mill", "ball_mill"),
+        "flotation": ("Flotation cells", "flotation"),
+        "concentrate_thickener": ("Concentrate thickener", "concentrate_thickener"),
+        "filter_press": ("Filter press", "filter_press"),
+        "tailings_thickener": ("Tailings thickener", "tailings_thickener"),
+        "tailings_pump": ("Tailings pump", "tailings_pump"),
+    }
+    MAINTENANCE_AREAS = {
+        "crusher": "Crushing and screening", "conveyors": "Crushing and screening",
+        "sag_mill": "Grinding and flotation", "ball_mill": "Grinding and flotation",
+        "flotation": "Grinding and flotation",
+        "concentrate_thickener": "Concentrate handling", "filter_press": "Concentrate handling",
+        "tailings_thickener": "Tailings and reclaim", "tailings_pump": "Tailings and reclaim",
+    }
     SIGNALS = (
         ("ore_rate", "t/h", 0, 2_000), ("motor_power", "MW", 0, 30),
         ("motor_current", "A", 0, 2_500), ("vibration_rms", "mm/s", 0, 30),
@@ -124,6 +142,7 @@ class CopperConcentrator:
             "crusher_condition": 1.0, "sag_condition": 1.0, "ball_condition": 1.0,
             "flotation_condition": 1.0, "tailings_condition": 1.0,
             "concentrate_condition": 1.0,
+            "equipment_health": {name: 1.0 for name in self.MAINTAINABLE_EQUIPMENT},
             "crusher_vibration_mm_s": 2.4, "sag_vibration_mm_s": 2.8,
             "ball_vibration_mm_s": 2.4, "flotation_vibration_mm_s": 1.8,
             "tailings_vibration_mm_s": 2.1, "crushing_running": 1.0,
@@ -204,6 +223,9 @@ class CopperConcentrator:
                 sample.setdefault(key, history_defaults[key])
         previous_water_revision = state.get("water_model_revision", 0)
         defaults = self.initialize()
+        health = state.setdefault("equipment_health", defaults["equipment_health"].copy())
+        for name in self.MAINTAINABLE_EQUIPMENT:
+            health.setdefault(name, 1.0)
         missing = {key for key in keys if key not in state}
         for key in keys:
             state.setdefault(key, defaults[key])
@@ -296,6 +318,29 @@ class CopperConcentrator:
         factors = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
         return max((factors[event["severity"]] for event in events
                     if event["name"] == name and event["area"] in (*areas, "Whole factory")), default=0.0)
+
+    @staticmethod
+    def _mechanical_damage_rate_per_s(severity_factor: float) -> float:
+        """Translate event severity to latent damage; large failures trip quickly."""
+        if severity_factor <= 0.0:
+            return 0.0
+        return 0.25 / 3_600.0 * (severity_factor / 0.78) ** 2
+
+    def perform_maintenance(self, state: dict, equipment_name: str, *,
+                            equipment_stopped: bool, fault_active: bool = False) -> float:
+        """Restore one process asset to healthy condition while it is safely stopped."""
+        match = next((key for key, (label, _) in self.MAINTAINABLE_EQUIPMENT.items()
+                      if equipment_name.casefold() in (key.casefold(), label.casefold())), None)
+        if match is None:
+            raise ValueError(f"Unknown maintainable equipment: {equipment_name!r}")
+        if not equipment_stopped:
+            raise ValueError("Stop the equipment before carrying out maintenance")
+        if fault_active:
+            raise ValueError("Clear the active mechanical fault before carrying out maintenance")
+        state.setdefault("equipment_health", {}).setdefault(match, 1.0)
+        previous = state["equipment_health"][match]
+        state["equipment_health"][match] = 1.0
+        return previous
 
     @staticmethod
     def _smooth(old: float, requested: float, seconds: int = 90) -> float:
@@ -423,12 +468,27 @@ class CopperConcentrator:
         grinding_wear = self._severity(events, "Mechanical degradation", ("Grinding and flotation",))
         concentrate_wear = self._severity(events, "Mechanical degradation", ("Concentrate handling",))
         tailings_wear = self._severity(events, "Mechanical degradation", ("Tailings and reclaim",))
-        state["crusher_condition"] = 1.0 - crushing_wear * 0.55
-        state["sag_condition"] = 1.0 - grinding_wear * 0.48
-        state["ball_condition"] = 1.0 - grinding_wear * 0.40
-        state["flotation_condition"] = 1.0 - grinding_wear * 0.28
-        state["tailings_condition"] = 1.0 - tailings_wear * 0.65
-        state["concentrate_condition"] = 1.0 - concentrate_wear * 0.35
+        health = state["equipment_health"]
+        area_faults = {"crushing": crushing_wear, "grinding": grinding_wear,
+                       "concentrate": concentrate_wear, "tailings": tailings_wear}
+        equipment_areas = {"crusher": "crushing", "conveyors": "crushing",
+                           "sag_mill": "grinding", "ball_mill": "grinding",
+                           "flotation": "grinding",
+                           "concentrate_thickener": "concentrate", "filter_press": "concentrate",
+                           "tailings_thickener": "tailings", "tailings_pump": "tailings"}
+        for name, area in equipment_areas.items():
+            if equipment_available.get(name, True):
+                health[name] = max(0.35, health[name]
+                                   - self._mechanical_damage_rate_per_s(area_faults[area]))
+        state["crusher_condition"] = health["crusher"] * (1.0 - crushing_wear * 0.55)
+        state["conveyors_condition"] = health["conveyors"] * (1.0 - crushing_wear * 0.25)
+        state["sag_condition"] = health["sag_mill"] * (1.0 - grinding_wear * 0.48)
+        state["ball_condition"] = health["ball_mill"] * (1.0 - grinding_wear * 0.40)
+        state["flotation_condition"] = health["flotation"] * (1.0 - grinding_wear * 0.28)
+        state["tailings_condition"] = (health["tailings_pump"] * health["tailings_thickener"]
+                                        * (1.0 - tailings_wear * 0.65))
+        state["concentrate_condition"] = (health["concentrate_thickener"] * health["filter_press"]
+                                           * (1.0 - concentrate_wear * 0.35))
         power_factor = (max(0.0, min(1.0, power_available_fraction))
                         if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
 
@@ -437,7 +497,8 @@ class CopperConcentrator:
         scheduled_rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
         jam_factor = 0.0 if jam >= 0.78 else 1.0 - jam
         crusher_running = equipment_available.get("crusher", True) and equipment_available.get("conveyors", True)
-        crusher_capacity = (1_460.0 * state["crusher_condition"] * jam_factor * power_factor
+        crusher_capacity = (1_460.0 * state["crusher_condition"] * state["conveyors_condition"]
+                            * jam_factor * power_factor
                             if crusher_running else 0.0)
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
@@ -832,12 +893,17 @@ class CopperConcentrator:
         state["ball_motor_running"] = float(powered and equipment_available.get("ball_mill", True))
         state["flotation_motor_running"] = float(powered and equipment_available.get("flotation", True))
         state["tailings_motor_running"] = float(powered and equipment_available.get("tailings_pump", True))
-        state["crusher_vibration_mm_s"] = 2.4 + crushing_wear * 12 + jam * 5
-        state["sag_vibration_mm_s"] = 2.8 + grinding_wear * 10
-        state["ball_vibration_mm_s"] = 2.4 + grinding_wear * 9
-        state["flotation_vibration_mm_s"] = 1.8 + grinding_wear * 5
-        state["tailings_vibration_mm_s"] = 2.1 + tailings_wear * 13
-        state["concentrate_condition"] = 1.0 - concentrate_wear * 0.35
+        state["crusher_vibration_mm_s"] = (2.4 + crushing_wear * 10
+                                             + (1.0 - health["crusher"]) * 12 + jam * 5)
+        state["sag_vibration_mm_s"] = (2.8 + grinding_wear * 8
+                                       + (1.0 - health["sag_mill"]) * 12)
+        state["ball_vibration_mm_s"] = (2.4 + grinding_wear * 7
+                                        + (1.0 - health["ball_mill"]) * 10)
+        state["flotation_vibration_mm_s"] = (1.8 + grinding_wear * 4
+                                             + (1.0 - health["flotation"]) * 8)
+        tailings_health = min(health["tailings_pump"], health["tailings_thickener"])
+        state["tailings_vibration_mm_s"] = (2.1 + tailings_wear * 11
+                                            + (1.0 - tailings_health) * 12)
         state["tailings_thickener_motor_running"] = float(
             powered and equipment_available.get("tailings_thickener", True))
         state["concentrate_thickener_motor_running"] = float(
@@ -1012,6 +1078,13 @@ class CopperConcentrator:
                         "value": round(min(high, max(low, value)), 3), "quality": "GOOD", "low": low,
                         "high": high, "base": (low + high) / 2, "phase": 0.0,
                         "last_change": "Dynamic concentrator process model"})
+        for equipment, (label, _controller_key) in self.MAINTAINABLE_EQUIPMENT.items():
+            area = self.MAINTENANCE_AREAS[equipment]
+            tag = f"{area.lower().replace(' ', '_')}.{label.lower().replace(' ', '_')}.condition"
+            rows.append({"tag": tag, "area": area, "unit": label, "sensor": "condition",
+                         "units": "%", "value": round(100.0 * state["equipment_health"][equipment], 2),
+                         "quality": "GOOD", "low": 0.0, "high": 100.0, "base": 100.0,
+                         "phase": 0.0, "last_change": "Persistent asset condition; maintenance restores health"})
         for sensor, value, units, limit, description in (
                 ("water_demand", state["gross_process_water_m3h"], "m³/h", 1_200,
                  "Concentrator gross process-water draw"),

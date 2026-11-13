@@ -326,14 +326,15 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 
 @mcp.tool()
 def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident",
-                                     "reset_feeder_protection"],
+                                     "reset_feeder_protection", "maintain_equipment"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
                        target_asset: str = "", fault_location_pct: float = 90.0,
                        primary_breaker_failure: bool = False,
                        target_tag: str = "") -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
-    or manually reset a locked-out distribution feeder after its fault has cleared.
+    manually reset a locked-out distribution feeder after its fault has cleared, or maintain a
+    stopped process asset after its active mechanical fault has cleared.
 
     For incident injection, pass a known incident_name, severity Small/Medium/Large,
     and target_area (an area name or Whole factory). Electrical fault also requires
@@ -341,10 +342,12 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
     Signal drift accepts target_tag to bias one analog measurement without changing process state.
     For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
+    For maintain_equipment, target_asset must be one of the named concentrator assets; the asset
+    must be STOPPED and its mechanical fault cleared before maintenance is allowed.
     No physical device can be controlled.
     """
     allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
-               "reset_feeder_protection"}
+               "reset_feeder_protection", "maintain_equipment"}
     if action not in allowed:
         raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
     if action == "inject_incident":
@@ -377,6 +380,17 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
         if target_area != "Grid distribution" or target_asset not in {
                 "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Distribution incomer"}:
             raise ValueError("reset_feeder_protection requires Grid distribution and a feeder/incomer target_asset")
+    if action == "maintain_equipment":
+        data = snapshot()
+        health = data.get("concentrator", {}).get("equipment_health", {})
+        if target_asset not in health:
+            # Asset display labels are also accepted by the simulator command handler.
+            labels = {tag.get("asset") for tag in data.get("tags", [])
+                      if tag.get("sensor") == "condition" and tag.get("area") in {
+                          "Crushing and screening", "Grinding and flotation",
+                          "Concentrate handling", "Tailings and reclaim"}}
+            if target_asset not in labels:
+                raise ValueError("maintain_equipment requires a named concentrator asset in target_asset")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds, "target_asset": target_asset or None,
