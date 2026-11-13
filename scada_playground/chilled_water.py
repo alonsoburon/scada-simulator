@@ -140,7 +140,14 @@ class ChilledWaterPlant:
             target = min(capacity_by_unit[name], remaining_target)
             prior = unit["output_kw"]
             ramp = 18.0 if target > prior else 35.0
-            unit["output_kw"] = max(0.0, prior + max(-ramp, min(ramp, target - prior)))
+            if unit["available_fraction"] <= 0.01:
+                # A tripped compressor cannot keep making refrigeration; the
+                # chilled-water store, not fictitious compressor output, bridges
+                # the scan after a total electrical loss.
+                unit["output_kw"] = 0.0
+            else:
+                unit["output_kw"] = min(capacity_by_unit[name], max(0.0,
+                    prior + max(-ramp, min(ramp, target - prior))))
             unit["running"] = unit["output_kw"] > 5.0
             remaining_target = max(0.0, remaining_target - target)
 
