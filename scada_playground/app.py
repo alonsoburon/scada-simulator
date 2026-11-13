@@ -220,6 +220,9 @@ def initialize(seed: int = 17) -> None:
                                      "low": low, "high": high, "base": gps_base, "value": gps_base,
                                      "quality": "GOOD", "unit_no": ui, "phase": rng.random() * 6.28,
                                      "last_change": "Normal"})
+        # The wastewater treatment model now owns this area's measurements;
+        # discard the generic placeholder tags before publishing its asset tree.
+        tags = [tag for tag in tags if tag["area"] != "Wastewater"]
         concentrator_state = CONCENTRATOR_MODEL.initialize()
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
