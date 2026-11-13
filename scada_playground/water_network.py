@@ -77,6 +77,9 @@ class MineWaterNetwork:
                                  "minor_loss_k": 18.0, "valve_loss_k": 1.8, "max_flow_m3h": 340.0,
                                  "pump": "Concentrator reclaim pump", "valve": "Concentrator reclaim valve"},
     }
+    WATER_DENSITY_KG_M3 = 998.0
+    PIPE_WAVE_SPEED_M_S = 1_000.0
+    PIPE_RATING_KPA = 2_500.0
 
     def initialize(self) -> dict:
         nodes = {}
@@ -106,7 +109,9 @@ class MineWaterNetwork:
                 "valves": {name: 92.0 for name in ("Raw transfer valve", "Process feed valve",
                                                       "Reclaim return valve", "Reclaim transfer valve",
                                                       "Concentrator reclaim valve")},
-                "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True}
+                "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True,
+                                 "surge_pressure_kpa": 0.0, "surge_peak_kpa": 0.0,
+                                 "minimum_surge_pressure_kpa": 0.0, "previous_velocity_m_s": 0.0}
                           for key in self.LINKS},
                 "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
                 "factory_cip_demand_m3h": 0.0, "factory_cip_effluent_m3h": 0.0,
@@ -136,8 +141,11 @@ class MineWaterNetwork:
             delay = min(delay, 21_600)
             state["links"][key].update(flow_m3h=flow, inlet_flow_m3h=flow, outlet_flow_m3h=flow,
                                         pressure_kpa=pressure, available=flow > 0.1,
+                                        pressure_rating_kpa=self.PIPE_RATING_KPA,
                                         pipe_volume_m3=pipe_volume, transport_delay_s=delay,
                                         transport_queue=deque([flow / 3600.0] * delay))
+            state["links"][key]["previous_velocity_m_s"] = (
+                flow / 3600.0 / (math.pi * spec["diameter_m"] ** 2 / 4.0))
             if key == "reclaim_transfer":
                 state["links"][key]["quality_transport_queue"] = deque(
                     [{"turbidity_ntu": 4.0, "chlorine_residual_mg_l": 0.45} for _ in range(delay)])
@@ -166,6 +174,18 @@ class MineWaterNetwork:
         for key, value in defaults.items():
             if key not in {"nodes", "pumps", "controllers", "valves", "links", "treatment", "wastewater"}:
                 state.setdefault(key, value)
+        for key in self.LINKS:
+            link = state["links"][key]
+            if "previous_velocity_m_s" not in link:
+                spec = self.LINKS[key]
+                link["previous_velocity_m_s"] = (
+                    link.get("inlet_flow_m3h", 0.0) / 3600.0
+                    / (math.pi * spec["diameter_m"] ** 2 / 4.0))
+            link.setdefault("surge_pressure_kpa", 0.0)
+            link.setdefault("surge_peak_kpa", 0.0)
+            link.setdefault("minimum_surge_pressure_kpa", 0.0)
+            link.setdefault("previous_velocity_m_s", 0.0)
+            link.setdefault("pressure_rating_kpa", self.PIPE_RATING_KPA)
         if "treatment" not in state:
             state["treatment"] = self.TREATMENT.initialize()
             state["treatment"]["last_advance_seconds"] = state.get("sim_seconds", 0)
@@ -363,6 +383,21 @@ class MineWaterNetwork:
         def transfer(key: str, available_m3: float = float("inf")) -> None:
             link = state["links"][key]
             incoming = min(requested[key], max(0.0, available_m3) * 3600.0)
+            area = math.pi * self.LINKS[key]["diameter_m"] ** 2 / 4.0
+            velocity = incoming / 3600.0 / area
+            # Joukowsky gives the pressure step for a rapid velocity change.
+            # At the one-second simulator scan, acoustic reflections are represented
+            # by a damped wave with a length-dependent round-trip time.
+            delta_velocity = velocity - link.get("previous_velocity_m_s", velocity)
+            wave_step_kpa = -self.WATER_DENSITY_KG_M3 * self.PIPE_WAVE_SPEED_M_S * delta_velocity / 1000.0
+            round_trip_s = max(0.5, 2.0 * self.LINKS[key]["length_m"] / self.PIPE_WAVE_SPEED_M_S)
+            decay = math.exp(-1.0 / round_trip_s)
+            surge = link.get("surge_pressure_kpa", 0.0) * decay + wave_step_kpa
+            link["surge_pressure_kpa"] = surge
+            link["surge_peak_kpa"] = max(link.get("surge_peak_kpa", 0.0), surge)
+            link["minimum_surge_pressure_kpa"] = min(
+                link.get("minimum_surge_pressure_kpa", 0.0), surge)
+            link["previous_velocity_m_s"] = velocity
             link["transport_queue"].append(incoming / 3600.0)
             delivered = link["transport_queue"].popleft() * 3600.0
             inlet[key], outlet[key] = incoming, delivered
@@ -566,6 +601,13 @@ class MineWaterNetwork:
             add(key, "flow_rate", reading["inlet_flow_m3h"], "m³/h", 0, link["max_flow_m3h"], 0.01)
             add(key, "arrival_flow_rate", reading["outlet_flow_m3h"], "m³/h", 0, link["max_flow_m3h"], 0.01)
             add(key, "pressure_drop", reading["pressure_kpa"], "kPa", 0, 1200, 0.008)
+            steady_discharge = (state["pumps"][link["pump"]]["pump_head_m"] * 9.80665
+                                if link["pump"] else reading["pressure_kpa"])
+            absolute_gauge = max(0.0, steady_discharge + reading["surge_pressure_kpa"])
+            add(key, "transient_gauge_pressure", absolute_gauge, "kPa", 0, 5000, 0.004,
+                "Joukowsky pressure transient estimate")
+            add(key, "water_hammer_surge", reading["surge_pressure_kpa"], "kPa", -5000, 5000,
+                0.002, "Joukowsky pressure transient estimate")
             velocity = reading["inlet_flow_m3h"] / 3600 / area
             add(key, "line_velocity", velocity, "m/s", 0, 5, 0.005)
             add(key, "transport_delay", reading["transport_delay_s"], "s", 0, 21_600)

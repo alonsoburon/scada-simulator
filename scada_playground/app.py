@@ -689,6 +689,19 @@ def advance(force: bool = False) -> None:
                            "Raw water tank high level", "HIGH"),
         "tank_spill": ("Water supply network", any(node["overflow_m3"] > 0 for node in water["nodes"].values()),
                        "Water tank overflow detected", "HIGH"),
+        "pipe_surge_overpressure": ("Water supply network", any(
+            water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
+            + link["surge_pressure_kpa"] > link["pressure_rating_kpa"]
+            for key, link in water["links"].items()
+            if WATER_MODEL.LINKS[key]["pump"]),
+            "Estimated pipe transient pressure exceeds line rating", "CRITICAL"),
+        "pipe_surge_low_pressure": ("Water supply network", any(
+            water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["running"]
+            and link["surge_pressure_kpa"] < -20.0
+            and (water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
+                 + link["surge_pressure_kpa"]) < 20.0
+            for key, link in water["links"].items() if WATER_MODEL.LINKS[key]["pump"]),
+            "Estimated transient pressure is near vapor pressure; column separation risk", "HIGH"),
     }
     prior_states = sim.setdefault("water_alarm_states", {})
     for alarm_key, (area, active, message, severity) in conditions.items():
@@ -1023,7 +1036,7 @@ def render_dashboard():
         water = sim["water_network"]
         diagram = published_snapshot["water_network"]
         st.markdown("### Mine water circuit · hydraulic network and level control")
-        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow and water-quality packets, so a pump trip can leave downstream flow running until the line empties.")
+        st.caption("Pipe flow uses Darcy–Weisbach friction, minor losses, valve opening, static elevation, and pump affinity curves. PI controllers regulate tank levels; VFD ramps limit speed changes. Full pipes carry delayed flow and water-quality packets, so a pump trip can leave downstream flow running until the line empties. Rapid flow changes also produce a damped pressure-wave estimate and transient pressure alarms.")
         metric_cols = st.columns(6)
         for col, label, value in zip(metric_cols, ["Total water demand", "Concentrator make-up", "Concentrator return",
                                                    "Background reclaim loop", "Water in transit", "Unmet demand"],

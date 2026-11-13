@@ -170,6 +170,33 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(self.state["links"]["process_feed"]["outlet_flow_m3h"], initial_flow)
         self.assertGreater(initial_delay, 1)
 
+    def test_rapid_pump_trip_creates_a_damped_water_hammer_pressure_wave(self):
+        outage = {"name": "Utility loss", "area": "Water supply network", "severity": "Large"}
+        normal_velocity = self.state["links"]["process_feed"]["previous_velocity_m_s"]
+        self.assertGreater(normal_velocity, 0.1)
+
+        self.model.advance(self.state, 1, [outage])
+        link = self.state["links"]["process_feed"]
+        self.assertEqual(link["inlet_flow_m3h"], 0.0)
+        self.assertGreater(link["surge_pressure_kpa"], 100.0)
+        initial_surge = link["surge_pressure_kpa"]
+
+        self.model.advance(self.state, 2, [outage])
+        self.assertGreater(link["surge_pressure_kpa"], 0.0)
+        self.assertLess(link["surge_pressure_kpa"], initial_surge)
+        tags, _ = self.model.telemetry(self.state)
+        by_id = {tag["tag"]: tag for tag in tags}
+        self.assertIn("water_supply_network.process_feed.water_hammer_surge", by_id)
+        self.assertGreater(by_id["water_supply_network.process_feed.transient_gauge_pressure"]["value"], 0)
+
+    def test_legacy_pipe_state_migrates_without_a_false_startup_surge(self):
+        link = self.state["links"]["process_feed"]
+        del link["previous_velocity_m_s"]
+        self.model.migrate(self.state)
+        self.assertAlmostEqual(link["previous_velocity_m_s"], link["inlet_flow_m3h"] / 3600 / (
+            3.141592653589793 * self.model.LINKS["process_feed"]["diameter_m"] ** 2 / 4))
+        self.assertEqual(link["surge_pressure_kpa"], 0.0)
+
     def test_measurement_noise_is_seeded_and_repeatable(self):
         first, _ = self.model.telemetry(self.state)
         second, _ = self.model.telemetry(self.state)
