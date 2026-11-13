@@ -406,7 +406,10 @@ def publish_snapshot() -> dict:
                    for vehicle_type, route in FLEET_ROUTES.items()],
     }
     SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = SNAPSHOT_PATH.with_suffix(".tmp")
+    # Separate UI sessions can publish at once; use a per-simulation temp file
+    # so one writer cannot replace another writer's temporary snapshot.
+    tmp_path = SNAPSHOT_PATH.with_name(
+        f"{SNAPSHOT_PATH.stem}.{sim['simulation_id']}.tmp")
     tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp_path, SNAPSHOT_PATH)
     return payload
