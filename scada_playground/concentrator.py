@@ -63,6 +63,9 @@ class CopperConcentrator:
             "cyclone_overflow_tph": 870.0, "tailings_tph": 849.0, "concentrate_tph": 21.0,
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
             "concentrate_grade_pct": 25.0, "p80_microns": 150.0,
+            "grind_coarse_fraction": 0.43, "grind_intermediate_fraction": 0.37,
+            "grind_fine_fraction": 0.20, "cyclone_overflow_fraction": 0.3909,
+            "circulating_load_ratio": 1.557, "flotation_residence_time_min": 29.0,
             "ore_hardness_kwh_t": 17.0, "ore_hardness_factor": 1.0,
             "water_makeup_m3h": 443.0, "gross_process_water_m3h": 783.0,
             "concentrator_reclaim_m3h": 340.0, "tailings_reclaim_water_m3h": 335.0,
@@ -117,9 +120,19 @@ class CopperConcentrator:
                     "tailings_thickener_overflow_water_m3h", "tailings_underflow_water_m3h",
                     "tailings_thickener_spill_m3", "cumulative_tailings_water_feed_m3",
                     "cumulative_tailings_underflow_water_m3", "cumulative_tailings_overflow_water_m3",
-                    "cumulative_tailings_water_spill_m3")
+                    "cumulative_tailings_water_spill_m3", "grind_coarse_fraction",
+                    "grind_intermediate_fraction", "grind_fine_fraction",
+                    "cyclone_overflow_fraction", "circulating_load_ratio",
+                    "flotation_residence_time_min")
+        history_defaults = {"tailings_thickener_water_inventory_m3": 0.0,
+            "grind_coarse_fraction": 0.43, "grind_intermediate_fraction": 0.37,
+            "grind_fine_fraction": 0.20, "cyclone_overflow_fraction": 0.3909,
+            "circulating_load_ratio": 1.557, "flotation_residence_time_min": 29.0}
         for sample in state.get("history", []):
             sample.setdefault("tailings_thickener_water_inventory_m3", 0.0)
+            for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
+                        "cyclone_overflow_fraction", "circulating_load_ratio", "flotation_residence_time_min"):
+                sample.setdefault(key, history_defaults[key])
         if all(key in state for key in keys) and state.get("water_model_revision", 0) >= 3:
             return
         previous_water_revision = state.get("water_model_revision", 0)
@@ -168,6 +181,17 @@ class CopperConcentrator:
     @staticmethod
     def _smooth(old: float, requested: float, seconds: int = 90) -> float:
         return old + (requested - old) / max(seconds, 1)
+
+    @staticmethod
+    def _log_size_percentile(class_fractions: tuple[float, float, float], percentile: float = 0.80) -> float:
+        """Estimate a size percentile from fine, intermediate and coarse log bins."""
+        cumulative = 0.0
+        for fraction, low, high in zip(class_fractions, (20.0, 75.0, 200.0), (75.0, 200.0, 1_500.0)):
+            if cumulative + fraction >= percentile:
+                position = min(1.0, max(0.0, (percentile - cumulative) / max(fraction, 1e-9)))
+                return low * (high / low) ** position
+            cumulative += fraction
+        return 1_500.0
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
@@ -246,8 +270,24 @@ class CopperConcentrator:
         ball_power_cap = (16.5 * state["ball_condition"] * power_factor
                           if equipment_available.get("ball_mill", True) else 0.0)
         sag_capacity = sag_power_cap * 1_000.0 / max(state["ore_hardness_kwh_t"] * 1.04, 1.0)
-        cyclone_recirculating_load = min(2.15, max(1.4, 2.0 + (state["p80_microns"] - 150.0) / 180.0))
-        ball_capacity = ball_power_cap * 1_000.0 / (8.6 * state["ore_hardness_factor"] * cyclone_recirculating_load)
+        size_fractions = (state["grind_coarse_fraction"], state["grind_intermediate_fraction"],
+                          state["grind_fine_fraction"])
+        cyclone_partition = (0.08, 0.45, 0.95)
+        cyclone_overflow_fraction = sum(fraction * partition
+                                        for fraction, partition in zip(size_fractions, cyclone_partition))
+        cyclone_overflow_fraction = min(0.85, max(0.12, cyclone_overflow_fraction))
+        cyclone_recirculating_load = (1.0 - cyclone_overflow_fraction) / cyclone_overflow_fraction
+        state["cyclone_overflow_fraction"] = cyclone_overflow_fraction
+        state["circulating_load_ratio"] = cyclone_recirculating_load
+        overflow_by_class = tuple(fraction * partition
+                                  for fraction, partition in zip(size_fractions, cyclone_partition))
+        product_size_fractions = (overflow_by_class[2] / cyclone_overflow_fraction,
+                                  overflow_by_class[1] / cyclone_overflow_fraction,
+                                  overflow_by_class[0] / cyclone_overflow_fraction)
+        # Ball-mill power is calibrated against the circulating solids stream:
+        # roughly 4 kWh/t at nominal ore competency reproduces the nominal load.
+        ball_circuit_capacity = ball_power_cap * 1_000.0 / (4.0 * state["ore_hardness_factor"])
+        ball_capacity = ball_circuit_capacity * cyclone_overflow_fraction
         flotation_capacity = (1_240.0 * state["flotation_condition"] * (0.90 + 0.10 * water_factor)
                               if equipment_available.get("flotation", True) else 0.0)
         requested_feed = min(plant_target, sag_capacity, ball_capacity, flotation_capacity)
@@ -280,8 +320,8 @@ class CopperConcentrator:
                            if sag_feeder_enabled else 0.0)
         sag_available_t = state["sag_bin_t"] + sag_feeder_rate / 3600.0
         sag_rate = min(requested_feed, sag_available_t * 3600.0)
-        ball_rate = min(sag_rate * cyclone_recirculating_load, ball_power_cap * 1_000.0 / max(8.6 * state["ore_hardness_factor"], 1))
-        cyclone_overflow = min(sag_rate, ball_rate / cyclone_recirculating_load, flotation_capacity)
+        ball_rate = min(sag_rate / cyclone_overflow_fraction, ball_circuit_capacity)
+        cyclone_overflow = min(sag_rate, ball_rate * cyclone_overflow_fraction, flotation_capacity)
 
         state["rom_feed_curtailed_t"] += curtailed_t
         state["cumulative_rom_received_t"] += rom_received
@@ -296,20 +336,42 @@ class CopperConcentrator:
         state["sag_bin_t"] = min(900.0, max(0.0,
             state["sag_bin_t"] + (sag_feeder_rate - sag_rate) * dt_h))
 
-        # Grind responds with residence-time lag. Harder ore and reduced mill power
-        # make product coarser; cyclone bypass/efficiency moves the cut size.
-        target_p80 = 125.0 + 240.0 * (state["ore_hardness_factor"] - 1.0) + max(0.0, cyclone_recirculating_load - 1.8) * 28
-        target_p80 += max(0.0, 1.0 - power_factor) * 45 + max(0.0, 1.0 - state["ball_condition"]) * 30
-        state["p80_microns"] = self._smooth(state["p80_microns"], min(300.0, max(70.0, target_p80)), 240)
+        # A low-cost three-bin PSD approximation tracks coarse/intermediate/fine
+        # fractions. Specific energy, work index and mill condition set a lagged
+        # size target; cyclone class partitions determine circulating load.
+        energy_per_t = ((state["sag_power_mw"] + state["ball_power_mw"]) * 1_000.0
+                        / max(sag_rate, 1.0))
+        grind_intensity = min(1.45, max(0.55,
+            energy_per_t / max(1.6 * state["ore_hardness_kwh_t"], 1.0)
+            * math.sqrt(state["sag_condition"] * state["ball_condition"])))
+        target_coarse = min(0.58, max(0.28, 0.43 + 0.22 * (1.0 - grind_intensity)))
+        target_fine = min(0.35, max(0.10, 0.20 + 0.30 * (grind_intensity - 1.0)))
+        target_intermediate = max(0.05, 1.0 - target_coarse - target_fine)
+        state["grind_coarse_fraction"] = self._smooth(state["grind_coarse_fraction"], target_coarse, 300)
+        state["grind_intermediate_fraction"] = self._smooth(
+            state["grind_intermediate_fraction"], target_intermediate, 300)
+        state["grind_fine_fraction"] = self._smooth(state["grind_fine_fraction"], target_fine, 300)
+        fraction_total = (state["grind_coarse_fraction"] + state["grind_intermediate_fraction"]
+                          + state["grind_fine_fraction"])
+        for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction"):
+            state[key] /= fraction_total
+        target_p80 = self._log_size_percentile(product_size_fractions)
+        state["p80_microns"] = self._smooth(state["p80_microns"], target_p80, 240)
 
-        # A copper mass balance estimates concentrate tonnage from feed grade,
-        # recovery, and product grade; tailings carry the remaining solids/copper.
-        grind_recovery = 91.0 - max(0.0, state["p80_microns"] - 110.0) * 0.045
-        water_recovery_penalty = (1.0 - water_factor) * 17.0
         flotation_air = 540.0 * (1 - grinding_wear * 0.3) * power_factor
         reagent = 245.0 * (1 + 0.12 * math.sin(sim_seconds / 600))
-        recovery = min(94.0, max(40.0, (grind_recovery - water_recovery_penalty) * state["flotation_condition"]
-                               * (0.96 + 0.04 * min(1.0, flotation_air / 500.0)) - upset * 12.0))
+        pulp_flow_m3h = cyclone_overflow * (1.0 / 2.7 + state["water_specific_m3_t"])
+        state["flotation_residence_time_min"] = min(90.0, 540.0 * 60.0 / max(pulp_flow_m3h, 1.0))
+        product_fine_share = product_size_fractions[0]
+        size_floatability = min(1.15, max(0.65, 0.80 + 0.40 * product_fine_share / 0.486))
+        air_factor = min(1.15, max(0.0, flotation_air / 540.0))
+        reagent_dose_l_t = reagent / max(cyclone_overflow, 1.0)
+        reagent_factor = min(1.12, max(0.65, (reagent_dose_l_t / 0.28) ** 0.30))
+        kinetic_rate_per_min = 0.10 * size_floatability * air_factor * reagent_factor * state["flotation_condition"]
+        kinetic_recovery = 94.0 * (1.0 - math.exp(-kinetic_rate_per_min * state["flotation_residence_time_min"]))
+        water_recovery_penalty = (1.0 - water_factor) * 17.0
+        recovery = min(94.0, max(0.0,
+            kinetic_recovery - water_recovery_penalty - upset * 12.0))
         concentrate = cyclone_overflow * (0.0062 * recovery / 100.0) / 0.25
         tailings = max(0.0, cyclone_overflow - concentrate)
         state["cumulative_concentrate_produced_t"] += concentrate * dt_h
@@ -403,7 +465,7 @@ class CopperConcentrator:
         state["concentrate_grade_pct"] = min(30.0, max(15.0, 25.0 - max(0.0, state["p80_microns"] - 150) * 0.03))
 
         sag_power = min(sag_power_cap, sag_rate * state["ore_hardness_kwh_t"] * 1.04 / 1_000)
-        ball_power = min(ball_power_cap, ball_rate * 8.6 * state["ore_hardness_factor"] / 1_000)
+        ball_power = min(ball_power_cap, ball_rate * 4.0 * state["ore_hardness_factor"] / 1_000)
         state["sag_power_mw"] = self._smooth(state["sag_power_mw"], sag_power, 15)
         state["ball_power_mw"] = self._smooth(state["ball_power_mw"], ball_power, 15)
         state["crusher_power_mw"] = self._smooth(state["crusher_power_mw"], 2.2 * (crushed_rate / 1_200), 10)
@@ -492,6 +554,10 @@ class CopperConcentrator:
                 "copper_recovery_pct": state["copper_recovery_pct"], "p80_microns": state["p80_microns"],
                 "tailings_thickener_inventory_t": state["tailings_thickener_inventory_t"],
                 "tailings_thickener_water_inventory_m3": state["tailings_thickener_water_inventory_m3"],
+                "grind_coarse_fraction": state["grind_coarse_fraction"],
+                "grind_intermediate_fraction": state["grind_intermediate_fraction"],
+                "grind_fine_fraction": state["grind_fine_fraction"],
+                "flotation_residence_time_min": state["flotation_residence_time_min"],
                 "concentrate_thickener_inventory_t": state["concentrate_thickener_inventory_t"],
                 "concentrate_cake_inventory_t": state["concentrate_cake_inventory_t"],
                 "water_makeup_m3h": state["water_makeup_m3h"],
@@ -537,7 +603,11 @@ class CopperConcentrator:
                     "equipment_running": (state.get("ball_motor_running", state["ball_running"]), "bool", 0, 1)},
                 "Cyclone cluster": {"ore_rate": (state["cyclone_overflow_tph"], "t/h", 0, 2_000),
                     "product_p80": (state["p80_microns"], "µm", 50, 400),
-                    "circulating_load": (100 * (state["ball_circuit_feed_tph"] / max(state["sag_feed_tph"], 1) - 1), "%", 0, 300),
+                    "circulating_load": (100 * state["circulating_load_ratio"], "%", 0, 300),
+                    "coarse_size_fraction": (100 * state["grind_coarse_fraction"], "%", 0, 100),
+                    "intermediate_size_fraction": (100 * state["grind_intermediate_fraction"], "%", 0, 100),
+                    "fine_size_fraction": (100 * state["grind_fine_fraction"], "%", 0, 100),
+                    "cyclone_overflow_partition": (100 * state["cyclone_overflow_fraction"], "%", 0, 100),
                     "equipment_running": (float(state["cyclone_overflow_tph"] > 5), "bool", 0, 1)},
                 "Flotation cells": {"ore_rate": (state["plant_feed_tph"], "t/h", 0, 2_000),
                     "copper_recovery": (state["copper_recovery_pct"], "%", 0, 100),
@@ -545,6 +615,7 @@ class CopperConcentrator:
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),
                     "air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),
                     "reagent_rate": (state["reagent_l_h"], "L/h", 0, 1_000),
+                    "residence_time": (state["flotation_residence_time_min"], "min", 0, 90),
                     "equipment_running": (state.get("flotation_motor_running", state["flotation_running"]), "bool", 0, 1)},
             },
             "Concentrate handling": {

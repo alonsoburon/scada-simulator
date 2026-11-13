@@ -903,7 +903,7 @@ def render_dashboard():
         plant = sim["concentrator"]
         control = sim["process_control"]
         st.subheader("Copper concentrator · ore-to-tailings process circuit")
-        st.caption("Crusher and mill power limits, ore hardness, finite buffers, cyclone recirculating load, flotation recovery, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
+        st.caption("Crusher and mill power limits, ore hardness, finite buffers, three grinding size classes, size-dependent cyclone partition, first-order flotation kinetics, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
         metric_cols = st.columns(6)
         metric_values = [
             ("Plant feed", f"{plant['plant_feed_tph']:.0f} t/h"),
@@ -915,6 +915,7 @@ def render_dashboard():
         ]
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
+        st.caption(f"Grinding size fractions · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. It is not a certified safety PLC or safety instrumented system. The factory timeline must be running or single-stepped for sequences to progress.")
             state_col, buttons = st.columns([1.1, 2])
@@ -981,6 +982,18 @@ def render_dashboard():
                 trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
                 trend.update_layout(height=470, uirevision="concentrator-process-trend")
                 st.plotly_chart(trend, width="stretch")
+                size_trend = go.Figure()
+                for key, label, color in (
+                    ("grind_coarse_fraction", "Coarse", "#277da1"),
+                    ("grind_intermediate_fraction", "Intermediate", "#f2a541"),
+                    ("grind_fine_fraction", "Fine", "#43aa8b"),
+                ):
+                    size_trend.add_trace(go.Scatter(x=history.time, y=history[key] * 100,
+                        mode="lines", name=label, line={"color": color}))
+                size_trend.update_layout(height=300, title="Grinding size-class fractions",
+                    xaxis_title="Simulated seconds", yaxis_title="Circuit feed (%)",
+                    yaxis={"range": [0, 100]}, uirevision="grinding-size-class-trend")
+                st.plotly_chart(size_trend, width="stretch")
             with process_right:
                 trend = px.line(history, x="time", y=["rom_stockpile_t", "crushed_stockpile_t", "sag_bin_t",
                                                         "tailings_thickener_inventory_t",
