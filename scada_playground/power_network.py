@@ -18,10 +18,26 @@ class MinePowerNetwork:
         "Mine power network": ["Mine substation A", "Mine substation B", "Pit distribution", "Underground feeders", "Emergency generation"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
+    DISTRIBUTION_FEEDERS = {
+        "north": {"share": 0.38, "cap_share": 0.60, "nominal_kv": 33.0,
+                  "rating_mva": 22.0, "r_pu": 0.018, "x_pu": 0.060, "power_factor": 0.92},
+        "south": {"share": 0.32, "cap_share": 0.40, "nominal_kv": 33.0,
+                  "rating_mva": 18.0, "r_pu": 0.025, "x_pu": 0.070, "power_factor": 0.88},
+        "east": {"share": 0.18, "cap_share": 0.00, "nominal_kv": 11.0,
+                 "rating_mva": 14.0, "r_pu": 0.035, "x_pu": 0.085, "power_factor": 0.95},
+        "west": {"share": 0.12, "cap_share": 0.00, "nominal_kv": 11.0,
+                 "rating_mva": 10.0, "r_pu": 0.050, "x_pu": 0.110, "power_factor": 0.90},
+    }
 
     def initialize(self) -> dict:
         return {
             "sim_seconds": 0, "frequency_hz": 50.0, "voltage_pu": 1.0,
+            "source_voltage_pu": 1.0, "capacitor_bank_stage": 1,
+            "capacitor_bank_mvar": 1.2, "distribution_losses_mw": 0.55,
+            "distribution_feeders": {name: {"active_power_mw": 0.0, "reactive_power_mvar": 0.0,
+                "apparent_power_mva": 0.0, "current_a": 0.0, "voltage_pu": 1.0,
+                "voltage_drop_pu": 0.0, "loss_mw": 0.0, "loading_pct": 0.0}
+                for name in self.DISTRIBUTION_FEEDERS},
             "tie_capacity_mw": 44.0, "mine_transformer_capacity_mw": 39.0,
             "process_feeder_capacity_mw": 32.0, "water_feeder_capacity_mw": 2.5,
             "solar_mw": 2.2, "diesel_mw": 0.0, "diesel_available_mw": 8.0,
@@ -43,6 +59,33 @@ class MinePowerNetwork:
             "unserved_load_mw": 0.0, "power_deficit": False,
             "history": [], "seed": 17,
         }
+
+    @classmethod
+    def _radial_feeder_flows(cls, mine_load_mw: float, source_voltage_pu: float,
+                             capacitor_mvar: float) -> dict[str, dict[str, float]]:
+        """Estimate four radial feeder flows with linearized DistFlow voltage drop and I²R loss."""
+        voltage = max(0.70, source_voltage_pu)
+        flows = {}
+        for name, spec in cls.DISTRIBUTION_FEEDERS.items():
+            active = max(0.0, mine_load_mw) * spec["share"]
+            reactive = active * math.tan(math.acos(spec["power_factor"]))
+            reactive -= capacitor_mvar * spec["cap_share"]
+            apparent = math.hypot(active, reactive)
+            base = spec["rating_mva"]
+            p_pu, q_pu = active / base, reactive / base
+            drop = (spec["r_pu"] * p_pu + spec["x_pu"] * q_pu) / voltage
+            end_voltage = min(1.08, max(0.70, voltage - drop))
+            loss = (apparent / base) ** 2 * spec["r_pu"] * base / (voltage**2)
+            sending_active = active + loss
+            sending_apparent = math.hypot(sending_active, reactive)
+            current = sending_apparent * 1_000.0 / (
+                math.sqrt(3.0) * spec["nominal_kv"] * end_voltage)
+            flows[name] = {"active_power_mw": sending_active,
+                "reactive_power_mvar": reactive, "apparent_power_mva": sending_apparent,
+                "current_a": current, "voltage_pu": end_voltage,
+                "voltage_drop_pu": drop, "loss_mw": loss,
+                "loading_pct": 100.0 * sending_apparent / base}
+        return flows
 
     @staticmethod
     def _advance_transformer(thermal: dict, load_mva: float, rating_mva: float,
@@ -207,9 +250,19 @@ class MinePowerNetwork:
             net = state["total_generation_mw"] - max(0.0, dispatch_request - state["load_shed_mw"]) - charge_power
         state["frequency_hz"] = min(51.0, max(47.0,
             state["frequency_hz"] + 0.035 * net - 0.16 * (state["frequency_hz"] - 50.0)))
-        state["voltage_pu"] = min(1.08, max(0.78,
+        source_voltage = min(1.08, max(0.78,
             1.0 - max(0.0, dispatch_request - state["total_generation_mw"]) * 0.012
             - state["load_shed_mw"] * 0.004))
+        if source_voltage < 0.96:
+            state["capacitor_bank_stage"], state["capacitor_bank_mvar"] = 2, 3.5
+        elif source_voltage > 1.0:
+            state["capacitor_bank_stage"], state["capacitor_bank_mvar"] = 1, 1.2
+        state["source_voltage_pu"] = source_voltage
+        feeder_flows = self._radial_feeder_flows(
+            state["served_load_mw"], source_voltage, state["capacitor_bank_mvar"])
+        state["distribution_feeders"] = feeder_flows
+        state["distribution_losses_mw"] = sum(flow["loss_mw"] for flow in feeder_flows.values())
+        state["voltage_pu"] = min(source_voltage, *(f["voltage_pu"] for f in feeder_flows.values()))
         state["power_deficit"] = state["power_deficit"] or state["frequency_hz"] < 49.5
 
         # Winding temperature responds faster than oil temperature. The thermal
@@ -229,7 +282,7 @@ class MinePowerNetwork:
                 "sim_seconds", "frequency_hz", "voltage_pu", "grid_import_mw", "solar_mw",
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
                 "load_shed_mw", "process_power_fraction", "water_power_fraction")}
-                | {f"{name}_{measurement}": thermal[name][field]
+                | {f"{name}_{measurement}": transformer[name][field]
                    for name in ("mine_a", "mine_b")
                    for measurement, field in (("oil_c", "top_oil_c"),
                                               ("hotspot_c", "hotspot_c"))})
@@ -239,6 +292,7 @@ class MinePowerNetwork:
         """Publish simulated grid and mine electrical measurements as SCADA tags."""
         rng = random.Random(state["seed"] * 1_000_003 + state["sim_seconds"] * 9_176)
         v = state["voltage_pu"]
+        source_v = state.get("source_voltage_pu", v)
         grid = state["grid_import_mw"]
         mine = state["process_load_mw"] + state["water_load_mw"] + state["site_load_mw"]
         diesel = state["diesel_mw"]
@@ -251,18 +305,18 @@ class MinePowerNetwork:
                 "Black start unit": {"active_power": (0.0, "MW", 0, 3), "breaker_state": (0.0, "bool", 0, 1), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "equipment_running": (0.0, "bool", 0, 1)},
             },
             "Grid transmission": {
-                "Transmission line A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "line_current": (grid * .52 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 23), "bool", 0, 1)},
-                "Transmission line B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "line_current": (grid * .48 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
-                "Grid substation A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .18, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_a"]["cooling_stage"], "stage", 0, 2)},
-                "Grid substation B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * v, "kV", 180, 260), "reactive_power": (grid * .16, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_b"]["cooling_stage"], "stage", 0, 2)},
-                "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
+                "Transmission line A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "line_current": (grid * .52 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 23), "bool", 0, 1)},
+                "Transmission line B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "line_current": (grid * .48 * 1000 / (math.sqrt(3) * 220), "A", 0, 3000), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
+                "Grid substation A": {"active_power": (grid * .52, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "reactive_power": (grid * .18, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_a"]["cooling_stage"], "stage", 0, 2)},
+                "Grid substation B": {"active_power": (grid * .48, "MW", 0, 30), "line_voltage": (220 * source_v, "kV", 180, 260), "reactive_power": (grid * .16, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["grid_b"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["grid_b"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["grid_b"]["cooling_stage"], "stage", 0, 2)},
+                "Intertie": {"active_power": (grid, "MW", 0, 60), "line_voltage": (220 * source_v, "kV", 180, 260), "grid_frequency": (state["frequency_hz"], "Hz", 47, 53), "breaker_state": (float(state["tie_capacity_mw"] > 2), "bool", 0, 1)},
             },
             "Grid distribution": {
-                "Feeder north": {"active_power": (mine * .38, "MW", 0, 30), "line_voltage": (33 * v, "kV", 25, 40), "line_current": (mine * .38 * 1000 / (math.sqrt(3) * 33), "A", 0, 3000), "breaker_state": (float(state["process_power_fraction"] > .05), "bool", 0, 1)},
-                "Feeder south": {"active_power": (mine * .32, "MW", 0, 30), "line_voltage": (33 * v, "kV", 25, 40), "line_current": (mine * .32 * 1000 / (math.sqrt(3) * 33), "A", 0, 3000), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
-                "Feeder east": {"active_power": (mine * .18, "MW", 0, 30), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (mine * .18 * 1000 / (math.sqrt(3) * 11), "A", 0, 3000), "breaker_state": (1.0, "bool", 0, 1)},
-                "Feeder west": {"active_power": (mine * .12, "MW", 0, 30), "line_voltage": (11 * v, "kV", 8, 14), "line_current": (mine * .12 * 1000 / (math.sqrt(3) * 11), "A", 0, 3000), "breaker_state": (1.0, "bool", 0, 1)},
-                "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-3.5 if v < .96 else -1.2, "MVAr", -10, 10), "line_voltage": (33 * v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
+                "Feeder north": {"active_power": (state["distribution_feeders"]["north"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["north"]["voltage_pu"], "kV", 25, 40), "line_current": (state["distribution_feeders"]["north"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["north"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["process_power_fraction"] > .05), "bool", 0, 1)},
+                "Feeder south": {"active_power": (state["distribution_feeders"]["south"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["south"]["voltage_pu"], "kV", 25, 40), "line_current": (state["distribution_feeders"]["south"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["south"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["water_power_fraction"] > .05), "bool", 0, 1)},
+                "Feeder east": {"active_power": (state["distribution_feeders"]["east"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["east"]["voltage_pu"], "kV", 8, 14), "line_current": (state["distribution_feeders"]["east"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["east"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (1.0, "bool", 0, 1)},
+                "Feeder west": {"active_power": (state["distribution_feeders"]["west"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["west"]["voltage_pu"], "kV", 8, 14), "line_current": (state["distribution_feeders"]["west"]["current_a"], "A", 0, 3000), "reactive_power": (state["distribution_feeders"]["west"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (1.0, "bool", 0, 1)},
+                "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-state["capacitor_bank_mvar"], "MVAr", -10, 10), "line_voltage": (33 * source_v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
             },
             "Mine power network": {
                 "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_a"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},

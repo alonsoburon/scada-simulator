@@ -1062,12 +1062,12 @@ def render_dashboard():
     with tabs[7]:
         power = sim["power_network"]
         st.subheader("Mine electrical network · dispatch and load response")
-        st.caption("Grid import, solar, diesel reserve, and battery storage supply site auxiliaries, water pumps, and the concentrator. Transmission, transformer, and feeder limits constrain delivery; this is a supervisory balance model, not an AC load-flow study.")
+        st.caption("Grid import, solar, diesel reserve, and battery storage supply site auxiliaries, water pumps, and the concentrator. Four radial feeders estimate voltage drop, reactive flow, current, and I²R loss with a linearized DistFlow approximation; protection and full AC load-flow behavior are outside this model.")
         metrics = st.columns(6)
         for col, label, value in zip(metrics,
-            ["Mine bus frequency", "Bus voltage", "Grid import", "Diesel generation", "Battery reserve", "Process power available"],
+            ["Mine bus frequency", "Lowest feeder voltage", "Grid import", "Diesel generation", "Battery reserve", "Distribution losses"],
             [f"{power['frequency_hz']:.2f} Hz", f"{power['voltage_pu']:.3f} pu", f"{power['grid_import_mw']:.1f} MW",
-             f"{power['diesel_mw']:.1f} MW", f"{power['battery_soc_pct']:.1f}%", f"{power['process_power_fraction']*100:.0f}%"]):
+             f"{power['diesel_mw']:.1f} MW", f"{power['battery_soc_pct']:.1f}%", f"{power['distribution_losses_mw']:.2f} MW"]):
             col.metric(label, value)
         st.caption(f"Solar {power['solar_mw']:.1f} MW · battery {power['battery_power_mw']:+.1f} MW (positive = discharging) · requested/served plant load {power['requested_load_mw']:.1f}/{power['served_load_mw']:.1f} MW · shed {power['load_shed_mw']:.1f} MW · process/water feeder limits {power['process_feeder_capacity_mw']:.1f}/{power['water_feeder_capacity_mw']:.1f} MW")
 
@@ -1109,6 +1109,12 @@ def render_dashboard():
             xaxis={"range": [0, 1], "visible": False}, yaxis={"range": [0, 1], "visible": False},
             plot_bgcolor="white", paper_bgcolor="white", uirevision="electrical-network")
         st.plotly_chart(fig, width="stretch")
+        feeder_rows = [{"Feeder": name.title(), "Voltage (pu)": values["voltage_pu"],
+            "Current (A)": values["current_a"], "Loading (%)": values["loading_pct"],
+            "P (MW)": values["active_power_mw"], "Q (MVAr)": values["reactive_power_mvar"],
+            "Loss (MW)": values["loss_mw"]}
+            for name, values in power["distribution_feeders"].items()]
+        st.dataframe(pd.DataFrame(feeder_rows).round(2), hide_index=True, width="stretch")
         history = pd.DataFrame(power["history"])
         if not history.empty:
             left, right = st.columns(2)
