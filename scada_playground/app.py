@@ -696,12 +696,11 @@ def advance(force: bool = False) -> None:
             if WATER_MODEL.LINKS[key]["pump"]),
             "Estimated pipe transient pressure exceeds line rating", "CRITICAL"),
         "pipe_surge_low_pressure": ("Water supply network", any(
-            water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["running"]
-            and link["surge_pressure_kpa"] < -20.0
-            and (water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
-                 + link["surge_pressure_kpa"]) < 20.0
+            WATER_MODEL.SITE_ATMOSPHERIC_PRESSURE_KPA
+            + water["pumps"][WATER_MODEL.LINKS[key]["pump"]]["pump_head_m"] * 9.80665
+            + link["surge_pressure_kpa"] <= WATER_MODEL.WATER_VAPOR_PRESSURE_KPA
             for key, link in water["links"].items() if WATER_MODEL.LINKS[key]["pump"]),
-            "Estimated transient pressure is near vapor pressure; column separation risk", "HIGH"),
+            "Estimated absolute pressure reached the water vapor-pressure floor; column-separation risk", "HIGH"),
     }
     prior_states = sim.setdefault("water_alarm_states", {})
     for alarm_key, (area, active, message, severity) in conditions.items():

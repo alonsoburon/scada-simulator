@@ -42,16 +42,20 @@ class MineWaterNetwork:
     PUMPS = {
         "Intake pump": {"shutoff_head_m": 175.0, "rated_flow_m3h": 760.0,
                         "motor_efficiency": 0.91, "hydraulic_efficiency": 0.76,
-                        "ramp_pct_per_s": 0.35, "controlled_node": "raw_tank", "setpoint_pct": 55.0},
+                        "ramp_pct_per_s": 0.35, "coastdown_time_constant_s": 9.0,
+                        "controlled_node": "raw_tank", "setpoint_pct": 55.0},
         "Process feed pump": {"shutoff_head_m": 120.0, "rated_flow_m3h": 760.0,
                               "motor_efficiency": 0.92, "hydraulic_efficiency": 0.78,
-                              "ramp_pct_per_s": 0.50, "controlled_node": "process_tank", "setpoint_pct": 60.0},
+                              "ramp_pct_per_s": 0.50, "coastdown_time_constant_s": 6.0,
+                              "controlled_node": "process_tank", "setpoint_pct": 60.0},
         "Reclaim pump": {"shutoff_head_m": 190.0, "rated_flow_m3h": 440.0,
                          "motor_efficiency": 0.90, "hydraulic_efficiency": 0.73,
-                         "ramp_pct_per_s": 0.30, "controlled_node": "treated_tank", "setpoint_pct": 68.0},
+                         "ramp_pct_per_s": 0.30, "coastdown_time_constant_s": 10.0,
+                         "controlled_node": "treated_tank", "setpoint_pct": 68.0},
         "Concentrator reclaim pump": {"shutoff_head_m": 95.0, "rated_flow_m3h": 360.0,
                                       "motor_efficiency": 0.91, "hydraulic_efficiency": 0.74,
-                                      "ramp_pct_per_s": 0.45, "controlled_node": "concentrator_reclaim_sump",
+                                      "ramp_pct_per_s": 0.45, "coastdown_time_constant_s": 5.0,
+                                      "controlled_node": "concentrator_reclaim_sump",
                                       "setpoint_pct": 45.0},
     }
     LINKS = {
@@ -80,6 +84,8 @@ class MineWaterNetwork:
     WATER_DENSITY_KG_M3 = 998.0
     PIPE_WAVE_SPEED_M_S = 1_000.0
     PIPE_RATING_KPA = 2_500.0
+    SITE_ATMOSPHERIC_PRESSURE_KPA = 70.0
+    WATER_VAPOR_PRESSURE_KPA = 2.3
 
     def initialize(self) -> dict:
         nodes = {}
@@ -174,6 +180,8 @@ class MineWaterNetwork:
         for key, value in defaults.items():
             if key not in {"nodes", "pumps", "controllers", "valves", "links", "treatment", "wastewater"}:
                 state.setdefault(key, value)
+        for name, pump in state["pumps"].items():
+            pump.setdefault("coastdown_time_constant_s", self.PUMPS[name]["coastdown_time_constant_s"])
         for key in self.LINKS:
             link = state["links"][key]
             if "previous_velocity_m_s" not in link:
@@ -247,7 +255,8 @@ class MineWaterNetwork:
         if spec["pump"]:
             pump = state["pumps"][spec["pump"]]
             pump["pump_head_m"] = 0.0
-            speed = pump["speed_pct"] / 100.0 if pump["running"] else 0.0
+            # A de-energized rotor keeps turning until its stored inertia is spent.
+            speed = pump["speed_pct"] / 100.0
             pump_spec = self.PUMPS[spec["pump"]]
             shutoff_head = pump_spec["shutoff_head_m"] * pump["condition_factor"]
             pump_head_at_zero = shutoff_head * speed * speed
@@ -364,8 +373,14 @@ class MineWaterNetwork:
             if not pump["enabled"]:
                 pump["speed_command_pct"] = 0.0
             ramp = pump["ramp_pct_per_s"]
-            delta = pump["speed_command_pct"] - pump["speed_pct"]
-            pump["speed_pct"] += min(ramp, max(-ramp, delta))
+            if pump["running"]:
+                delta = pump["speed_command_pct"] - pump["speed_pct"]
+                pump["speed_pct"] += min(ramp, max(-ramp, delta))
+            else:
+                # With the drive de-energized, remove torque and let the rotor coast
+                # down under hydraulic and mechanical drag rather than snapping to 0.
+                tau = max(0.1, pump["coastdown_time_constant_s"])
+                pump["speed_pct"] *= math.exp(-1.0 / tau)
 
         requested = {}
         pressure = {}
@@ -603,11 +618,15 @@ class MineWaterNetwork:
             add(key, "pressure_drop", reading["pressure_kpa"], "kPa", 0, 1200, 0.008)
             steady_discharge = (state["pumps"][link["pump"]]["pump_head_m"] * 9.80665
                                 if link["pump"] else reading["pressure_kpa"])
-            absolute_gauge = max(0.0, steady_discharge + reading["surge_pressure_kpa"])
-            add(key, "transient_gauge_pressure", absolute_gauge, "kPa", 0, 5000, 0.004,
+            gauge_pressure = steady_discharge + reading["surge_pressure_kpa"]
+            absolute_pressure = max(0.0, self.SITE_ATMOSPHERIC_PRESSURE_KPA + gauge_pressure)
+            add(key, "transient_gauge_pressure", gauge_pressure, "kPa", -500, 5000, 0.0005,
                 "Joukowsky pressure transient estimate")
             add(key, "water_hammer_surge", reading["surge_pressure_kpa"], "kPa", -5000, 5000,
-                0.002, "Joukowsky pressure transient estimate")
+                0.0005, "Joukowsky pressure transient estimate")
+            add(key, "transient_absolute_pressure", absolute_pressure, "kPa", 0, 6000, 0.0005,
+                "Estimated line pressure at mine elevation")
+            add(key, "pipe_pressure_rating", reading["pressure_rating_kpa"], "kPa", 0, 5000)
             velocity = reading["inlet_flow_m3h"] / 3600 / area
             add(key, "line_velocity", velocity, "m/s", 0, 5, 0.005)
             add(key, "transport_delay", reading["transport_delay_s"], "s", 0, 21_600)

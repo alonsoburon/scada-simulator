@@ -1,4 +1,5 @@
 import unittest
+import math
 from collections import deque
 
 from scada_playground.water_network import MineWaterNetwork
@@ -121,7 +122,8 @@ class MineWaterNetworkTests(unittest.TestCase):
             self.model.advance(self.state, second, [], concentrator_demand_m3h=260,
                                concentrator_reclaim_m3h=180)
         sump = self.state["nodes"]["concentrator_reclaim_sump"]
-        self.assertAlmostEqual(sump["volume_m3"], 6.0, places=5)
+        # Rotor inertia produces a small return flow while the disabled pump coasts down.
+        self.assertAlmostEqual(sump["volume_m3"], 6.0, delta=0.1)
         self.assertEqual(self.state["links"]["concentrator_reclaim"]["inlet_flow_m3h"], 0)
         pump["enabled"] = True
         start_volume = sump["volume_m3"]
@@ -174,20 +176,28 @@ class MineWaterNetworkTests(unittest.TestCase):
         outage = {"name": "Utility loss", "area": "Water supply network", "severity": "Large"}
         normal_velocity = self.state["links"]["process_feed"]["previous_velocity_m_s"]
         self.assertGreater(normal_velocity, 0.1)
+        initial_flow = self.state["links"]["process_feed"]["inlet_flow_m3h"]
+        initial_speed = self.state["pumps"]["Process feed pump"]["speed_pct"]
 
         self.model.advance(self.state, 1, [outage])
         link = self.state["links"]["process_feed"]
-        self.assertEqual(link["inlet_flow_m3h"], 0.0)
-        self.assertGreater(link["surge_pressure_kpa"], 100.0)
+        pump = self.state["pumps"]["Process feed pump"]
+        self.assertGreater(link["inlet_flow_m3h"], 0.0)
+        self.assertLess(link["inlet_flow_m3h"], initial_flow)
+        self.assertAlmostEqual(pump["speed_pct"], initial_speed * math.exp(-1.0 / 6.0))
+        self.assertGreater(link["surge_pressure_kpa"], 50.0)
         initial_surge = link["surge_pressure_kpa"]
 
         self.model.advance(self.state, 2, [outage])
         self.assertGreater(link["surge_pressure_kpa"], 0.0)
-        self.assertLess(link["surge_pressure_kpa"], initial_surge)
+        self.assertLess(link["inlet_flow_m3h"], initial_flow)
         tags, _ = self.model.telemetry(self.state)
         by_id = {tag["tag"]: tag for tag in tags}
         self.assertIn("water_supply_network.process_feed.water_hammer_surge", by_id)
         self.assertGreater(by_id["water_supply_network.process_feed.transient_gauge_pressure"]["value"], 0)
+        for second in range(3, 31):
+            self.model.advance(self.state, second, [outage])
+        self.assertLess(link["surge_pressure_kpa"], initial_surge)
 
     def test_legacy_pipe_state_migrates_without_a_false_startup_surge(self):
         link = self.state["links"]["process_feed"]
