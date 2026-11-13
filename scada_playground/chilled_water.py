@@ -20,13 +20,22 @@ class ChilledWaterPlant:
     SITE_ATMOSPHERIC_PRESSURE_KPA = 70.0
     CONDENSER_WATER_DESIGN_FLOW_M3H = 270.0
     CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
+    CONDENSER_CIRCUIT_VOLUME_M3 = 35.0
+    CONDENSER_RETURN_TIME_CONSTANT_S = 45.0
+    CHILLER_LOW_CONDENSER_FLOW_TRIP_FRACTION = 0.25
+    CHILLER_LOW_CONDENSER_FLOW_RESET_FRACTION = 0.35
+    CHILLER_LOW_CONDENSER_FLOW_TRIP_DELAY_S = 3.0
     CONDENSER_WATER_DESIGN_DELTA_T_K = 5.0
     COOLING_TOWER_APPROACH_K = 5.0
     COOLING_TOWER_DESIGN_HEAT_REJECTION_KW = 1_650.0
     COOLING_TOWER_MIN_APPROACH_K = 2.0
-    COOLING_TOWER_MAX_APPROACH_K = 20.0
+    COOLING_TOWER_MAX_APPROACH_K = 30.0
     COOLING_TOWER_THERMAL_TIME_CONSTANT_S = 120.0
     CHILLER_CONDENSER_APPROACH_K = 4.0
+    CHILLER_HIGH_HEAD_DERATE_START_C = 42.0
+    CHILLER_HIGH_HEAD_TRIP_C = 55.0
+    CHILLER_HIGH_HEAD_RESET_C = 46.0
+    CHILLER_HIGH_HEAD_TRIP_DELAY_S = 15.0
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
     PRODUCT_CP_KJ_KG_K = 4.186
@@ -65,12 +74,17 @@ class ChilledWaterPlant:
             "condenser_heat_rejection_kw": initial_heat_rejection,
             "condenser_pump_available_fraction": 1.0,
             "condenser_water_flow_m3h": self.CONDENSER_WATER_DESIGN_FLOW_M3H,
+            "condenser_circuit_volume_m3": self.CONDENSER_CIRCUIT_VOLUME_M3,
             "condenser_water_leaving_temperature_c": (
                 condenser_saturation - self.CHILLER_CONDENSER_APPROACH_K),
             "chillers": {name: {"capacity_kw": capacity, "output_kw": 439.0,
                                 "available_fraction": 1.0,
                                 "available_capacity_kw": capacity * initial_hydraulic_derate,
-                                "running": True, "vibration_mm_s": 1.8}
+                                "running": True, "vibration_mm_s": 1.8,
+                                "high_head_trip_timer_s": 0.0,
+                                "high_head_tripped": False,
+                                "low_condenser_flow_trip_timer_s": 0.0,
+                                "low_condenser_flow_tripped": False}
                          for name, capacity in self.CHILLER_CAPACITY_KW.items()},
             "cooling_demand_kw": 878.0,
             "cooling_production_kw": 878.0,
@@ -223,10 +237,24 @@ class ChilledWaterPlant:
         condenser_temp = wet_bulb + tower_approach
         state["condenser_entering_temperature_c"] = condenser_temp
         prior_heat_rejection = state.get("condenser_heat_rejection_kw", 0.0)
-        condenser_water_rise = (prior_heat_rejection /
-            max(condenser_flow * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K, 1e-9)
-            if condenser_flow > 1e-6 else 0.0)
-        condenser_leaving = condenser_temp + condenser_water_rise
+        previous_condenser_leaving = state.get(
+            "condenser_water_leaving_temperature_c", condenser_temp)
+        if condenser_flow > 1e-6:
+            condenser_water_rise = (prior_heat_rejection /
+                (condenser_flow * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K))
+            target_condenser_leaving = condenser_temp + condenser_water_rise
+            return_alpha = 1.0 - math.exp(
+                -elapsed_s / self.CONDENSER_RETURN_TIME_CONSTANT_S)
+            condenser_leaving = previous_condenser_leaving + (
+                target_condenser_leaving - previous_condenser_leaving) * return_alpha
+        else:
+            # With no circulation, residual refrigerant heat warms the trapped
+            # condenser-water inventory instead of vanishing from the balance.
+            circuit_heat_capacity_kj_k = (
+                self.CONDENSER_CIRCUIT_VOLUME_M3
+                * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K * 3_600.0)
+            condenser_leaving = previous_condenser_leaving + (
+                prior_heat_rejection * max(0, elapsed_s) / circuit_heat_capacity_kj_k)
         condensing_temp = condenser_leaving + self.CHILLER_CONDENSER_APPROACH_K
         state["condenser_water_leaving_temperature_c"] = condenser_leaving
         state["condenser_saturation_temperature_c"] = condensing_temp
@@ -237,20 +265,61 @@ class ChilledWaterPlant:
                                  * self.CHILLED_WATER_DESIGN_DELTA_T_K)
         hydraulic_derate = min(1.0, hydraulic_capacity_kw
                                / max(sum(self.CHILLER_CAPACITY_KW.values()), 1e-9))
-        condenser_flow_derate = min(1.0, condenser_flow
-                                    / max(self.CONDENSER_WATER_DESIGN_FLOW_M3H, 1e-9))
+        condenser_flow_fraction = min(1.0, condenser_flow
+                                      / max(self.CONDENSER_WATER_DESIGN_FLOW_M3H, 1e-9))
         capacity_by_unit = {}
         available_capacity = 0.0
         for name, unit in state["chillers"].items():
+            unit.setdefault("high_head_trip_timer_s", 0.0)
+            unit.setdefault("high_head_tripped", False)
+            unit.setdefault("low_condenser_flow_trip_timer_s", 0.0)
+            unit.setdefault("low_condenser_flow_tripped", False)
             unit_loss = self._severity(events, "Utility loss", name)
             unit_degradation = max(global_mechanical,
                 self._severity(events, "Mechanical degradation", name))
             availability = power * (1.0 - local_power_loss) * (1.0 - unit_loss)
             availability *= max(0.0, 1.0 - 0.65 * unit_degradation)
-            ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, condensing_temp - 25.0)) * tower_factor
+            if (availability > 0.01 and previous_output[name] > 5.0
+                    and condenser_flow_fraction
+                    < self.CHILLER_LOW_CONDENSER_FLOW_TRIP_FRACTION):
+                unit["low_condenser_flow_trip_timer_s"] = min(
+                    self.CHILLER_LOW_CONDENSER_FLOW_TRIP_DELAY_S,
+                    unit["low_condenser_flow_trip_timer_s"] + elapsed_s)
+                if unit["low_condenser_flow_trip_timer_s"] >= self.CHILLER_LOW_CONDENSER_FLOW_TRIP_DELAY_S:
+                    unit["low_condenser_flow_tripped"] = True
+            else:
+                unit["low_condenser_flow_trip_timer_s"] = 0.0
+            if condenser_flow_fraction >= self.CHILLER_LOW_CONDENSER_FLOW_RESET_FRACTION:
+                unit["low_condenser_flow_tripped"] = False
+            if unit["low_condenser_flow_tripped"]:
+                availability = 0.0
+            # Pressure rises as condenser water warms: derate first, then trip
+            # only after a sustained high-head condition.
+            if (availability > 0.01 and previous_output[name] > 5.0
+                    and condensing_temp >= self.CHILLER_HIGH_HEAD_TRIP_C):
+                unit["high_head_trip_timer_s"] = min(
+                    self.CHILLER_HIGH_HEAD_TRIP_DELAY_S,
+                    unit["high_head_trip_timer_s"] + elapsed_s)
+                if unit["high_head_trip_timer_s"] >= self.CHILLER_HIGH_HEAD_TRIP_DELAY_S:
+                    unit["high_head_tripped"] = True
+            else:
+                unit["high_head_trip_timer_s"] = 0.0
+            if condensing_temp <= self.CHILLER_HIGH_HEAD_RESET_C:
+                unit["high_head_tripped"] = False
+            if unit["high_head_tripped"]:
+                availability = 0.0
+            head_derate = max(0.0, min(1.0,
+                (self.CHILLER_HIGH_HEAD_TRIP_C - condensing_temp)
+                / (self.CHILLER_HIGH_HEAD_TRIP_C - self.CHILLER_HIGH_HEAD_DERATE_START_C)))
+            # Keep a reduced operating envelope until the delayed protection
+            # operates; reaching the pickup threshold alone is not an instant trip.
+            head_derate = 0.25 + 0.75 * head_derate
+            ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, condensing_temp - 25.0))
             unit["available_fraction"] = availability
             capacity = (unit["capacity_kw"] * availability * ambient_derate
-                        * hydraulic_derate * condenser_flow_derate)
+                        * hydraulic_derate
+                        * max(self.CHILLER_LOW_CONDENSER_FLOW_TRIP_FRACTION,
+                              condenser_flow_fraction) * head_derate)
             unit["available_capacity_kw"] = capacity
             capacity_by_unit[name] = capacity
             available_capacity += capacity
@@ -393,6 +462,12 @@ class ChilledWaterPlant:
                 "motor_current": (unit["output_kw"] / max(state["cop"], 1.0) * 1.45, "A", 0, 250),
                 "vibration_rms": (unit["vibration_mm_s"], "mm/s", 0, 25),
                 "equipment_running": (float(unit["running"]), "bool", 0, 1),
+                "high_head_trip": (float(unit.get("high_head_tripped", False)), "bool", 0, 1),
+                "high_head_trip_timer": (unit.get("high_head_trip_timer_s", 0.0), "s", 0, 30),
+                "low_condenser_flow_trip": (
+                    float(unit.get("low_condenser_flow_tripped", False)), "bool", 0, 1),
+                "low_condenser_flow_trip_timer": (
+                    unit.get("low_condenser_flow_trip_timer_s", 0.0), "s", 0, 10),
             }
         rows = []
         for (area, asset), signals in values.items():
