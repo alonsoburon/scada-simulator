@@ -286,7 +286,8 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
                        target_asset: str = "", fault_location_pct: float = 90.0,
-                       primary_breaker_failure: bool = False) -> dict[str, Any]:
+                       primary_breaker_failure: bool = False,
+                       target_tag: str = "") -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
     or manually reset a locked-out distribution feeder after its fault has cleared.
 
@@ -294,6 +295,7 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     and target_area (an area name or Whole factory). Electrical fault also requires
     target_asset set to Feeder north/south/east/west. Electrical faults also accept a
     0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
+    Signal drift accepts target_tag to bias one analog measurement without changing process state.
     For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
     No physical device can be controlled.
     """
@@ -319,6 +321,14 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                 raise ValueError("Electrical fault requires Grid distribution and a named feeder target_asset")
             if not 0.0 <= fault_location_pct <= 100.0:
                 raise ValueError("fault_location_pct must be between 0 and 100")
+        if target_tag:
+            if incident_name != "Signal drift":
+                raise ValueError("target_tag is only valid for Signal drift")
+            matching = next((tag for tag in data.get("tags", []) if tag.get("tag") == target_tag), None)
+            if matching is None or (target_area != "Whole factory" and matching.get("area") != target_area):
+                raise ValueError("target_tag must identify a tag in the selected target area")
+            if matching.get("units") in {"bool", "enum", "cycles"}:
+                raise ValueError("Signal drift requires an analog measurement tag")
     if action == "reset_feeder_protection":
         if target_area != "Grid distribution" or target_asset not in {
                 "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Distribution incomer"}:
@@ -327,7 +337,8 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds, "target_asset": target_asset or None,
                            "fault_location_pct": fault_location_pct,
-                           "primary_breaker_failure": primary_breaker_failure})
+                           "primary_breaker_failure": primary_breaker_failure,
+                           "target_tag": target_tag or None})
 
 
 @mcp.tool()

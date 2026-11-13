@@ -18,6 +18,9 @@ class ProcessEvent:
     target_asset: str | None = None
     fault_location_pct: float = 90.0
     primary_breaker_failure: bool = False
+    target_tag: str | None = None
+    measurement_baseline: float | None = None
+    measurement_baseline_tick: int | None = None
 
 
 class FactoryProcessModel:
@@ -32,7 +35,8 @@ class FactoryProcessModel:
     def inject(self, sim: dict, name: str, area: str, severity: str,
                duration_seconds: int | None = None,
                target_asset: str | None = None, fault_location_pct: float = 90.0,
-               primary_breaker_failure: bool = False) -> ProcessEvent:
+               primary_breaker_failure: bool = False,
+               target_tag: str | None = None) -> ProcessEvent:
         if name not in self.incidents:
             raise ValueError(f"Unknown incident: {name}")
         if severity not in {"Small", "Medium", "Large"}:
@@ -48,12 +52,29 @@ class FactoryProcessModel:
             raise ValueError("Electrical fault must target one distribution feeder")
         if name == "Electrical fault" and not 0.0 <= float(fault_location_pct) <= 100.0:
             raise ValueError("Fault location must be between 0 and 100 percent of feeder length")
+        if target_tag is not None:
+            if name != "Signal drift":
+                raise ValueError("target_tag is only valid for Signal drift")
+            matching = next((tag for tag in sim["tags"] if tag["tag"] == target_tag), None)
+            if matching is None or (area != "Whole factory" and matching["area"] != area):
+                raise ValueError("target_tag must identify a tag in the selected target area")
+            if matching.get("units") in {"bool", "enum", "cycles"}:
+                raise ValueError("Signal drift requires an analog measurement tag")
+        elif name == "Signal drift":
+            # A real instrument fault affects one transmitter. Select a stable,
+            # reproducible analog point so the operator has healthy peers to compare.
+            candidates = [tag for tag in sim["tags"]
+                          if tag.get("dynamic_model")
+                          and tag.get("units") not in {"bool", "enum", "cycles"}
+                          and (area == "Whole factory" or tag["area"] == area)]
+            if candidates:
+                target_tag = candidates[sim["next_event"] % len(candidates)]["tag"]
         duration = duration_seconds or {"Small": 90, "Medium": 240, "Large": 600}[severity]
         if not 1 <= duration <= 86_400:
             raise ValueError("Incident duration must be between 1 and 86,400 simulated seconds")
         event = ProcessEvent(name, area, severity, sim["tick"], duration,
                              sim["next_event"], target_asset, float(fault_location_pct),
-                             bool(primary_breaker_failure))
+                             bool(primary_breaker_failure), target_tag)
         sim["events"].append(event)
         sim["next_event"] += 1
         description = f"{name} injected in {area}"
@@ -61,9 +82,41 @@ class FactoryProcessModel:
             description += f" on {target_asset} at {fault_location_pct:.0f}% of feeder length"
             if primary_breaker_failure:
                 description += "; feeder breaker failure simulated"
+        if target_tag:
+            description += f" on instrument {target_tag}"
         sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": severity.upper(),
                                 "message": description, "state": "ACTIVE / UNACK"})
         return event
+
+    @staticmethod
+    def apply_instrument_faults(tags: list[dict], events: list[ProcessEvent], tick: int) -> None:
+        """Apply reproducible, time-ramped instrument bias to telemetry only.
+
+        Process state is held by the subsystem models; this deliberately changes
+        the published measurement after those models have refreshed it.
+        """
+        drift_by_tag = {event.target_tag: event for event in events
+                        if event.name == "Signal drift" and event.target_tag}
+        for tag in tags:
+            event = drift_by_tag.get(tag["tag"])
+            if event is None:
+                continue
+            span = max(0.0, float(tag.get("high", 0.0)) - float(tag.get("low", 0.0)))
+            if span <= 0.0:
+                continue
+            magnitude = {"Small": 0.01, "Medium": 0.03, "Large": 0.08}[event.severity]
+            ramp_seconds = max(1.0, event.duration * 0.25)
+            ramp = min(1.0, max(0.0, (tick - event.started) / ramp_seconds))
+            stable_id = sum((index + 1) * ord(char) for index, char in enumerate(tag["tag"]))
+            sign = 1.0 if stable_id % 2 == 0 else -1.0
+            bias = sign * span * magnitude * ramp
+            low, high = float(tag.get("low", 0.0)), float(tag.get("high", 0.0))
+            if event.measurement_baseline_tick != tick:
+                event.measurement_baseline = float(tag["value"])
+                event.measurement_baseline_tick = tick
+            baseline = float(event.measurement_baseline)
+            tag["value"] = round(min(high, max(low, baseline + bias)), 3)
+            tag["last_change"] = f"Signal drift ({bias:+.3f} {tag.get('units', '')})"
 
     def advance(self, sim: dict, *, force: bool = False) -> None:
         """Advance exactly one simulation second; ``force`` supports paused single-step."""
@@ -109,7 +162,8 @@ class FactoryProcessModel:
             for event in issues:
                 intensity = {"Small": 0.12, "Medium": 0.34, "Large": 0.72}[event.severity]
                 kind = self.incidents[event.name]
-                if kind == "measurement" and tag["sensor"] in ("process_temperature", "line_pressure"):
+                if (kind == "measurement" and tag["sensor"] in ("process_temperature", "line_pressure")
+                        and event.target_tag is None):
                     value += span * intensity
                 elif kind == "mechanical" and tag["sensor"] in ("vibration_rms", "motor_current"):
                     value += span * intensity * 0.7

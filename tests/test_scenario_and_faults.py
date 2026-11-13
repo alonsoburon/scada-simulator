@@ -42,6 +42,14 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("quality" in note.lower() and "tank" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_instrument_drift_scenario_targets_level_transmitter_not_process(self):
+        definition = ScenarioRunner().definition("mine-water-level-transmitter-drift")
+        step = definition.steps[0]
+        self.assertEqual(step.parameters["incident_name"], "Signal drift")
+        self.assertEqual(step.parameters["target_tag"], "water_supply_network.raw_tank.tank_level")
+        self.assertTrue(any("stored volume" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_mine_grid_support_scenario_has_reserve_and_recovery_evidence(self):
         runner = ScenarioRunner()
         definition = runner.definition("mine-grid-support-and-recovery")
@@ -175,6 +183,35 @@ class ProcessDeterminismTests(unittest.TestCase):
         self.assertEqual(sim["tags"][0]["quality"], "STALE")
         model.advance(sim)
         self.assertEqual(sim["tags"][0]["quality"], "GOOD")
+
+    def test_signal_drift_biases_one_dynamic_instrument_without_changing_peer_readings(self):
+        model = FactoryProcessModel({"Water treatment": []}, {"Signal drift": "measurement"},
+                                    lambda _unit, _tick: ())
+        sim = simulation_state()
+        sim["tags"] = [
+            {"tag": "water_treatment.filter.dp", "area": "Water treatment", "unit": "Filter",
+             "sensor": "differential_pressure", "units": "kPa", "low": 0.0, "high": 100.0,
+             "value": 40.0, "quality": "GOOD", "dynamic_model": True},
+            {"tag": "water_treatment.filter.flow", "area": "Water treatment", "unit": "Filter",
+             "sensor": "flow", "units": "m³/h", "low": 0.0, "high": 500.0,
+             "value": 200.0, "quality": "GOOD", "dynamic_model": True},
+        ]
+        event = model.inject(sim, "Signal drift", "Water treatment", "Large", duration_seconds=100)
+        self.assertIn(event.target_tag, {tag["tag"] for tag in sim["tags"]})
+        self.assertEqual(event.target_tag, model.inject(
+            {**sim, "tick": 0, "events": [], "alarms": [], "next_event": 1},
+            "Signal drift", "Water treatment", "Large", duration_seconds=100).target_tag)
+        target = next(tag for tag in sim["tags"] if tag["tag"] == event.target_tag)
+        peer = next(tag for tag in sim["tags"] if tag["tag"] != event.target_tag)
+        target_truth, peer_truth = target["value"], peer["value"]
+        model.apply_instrument_faults(sim["tags"], [event], tick=100)
+        first_drifted_value = target["value"]
+        model.apply_instrument_faults(sim["tags"], [event], tick=100)
+        self.assertNotEqual(target["value"], target_truth)
+        self.assertEqual(target["value"], first_drifted_value)
+        self.assertEqual(peer["value"], peer_truth)
+        self.assertIn("Signal drift", target["last_change"])
+        self.assertEqual(target["quality"], "GOOD")
 
 
 if __name__ == "__main__":

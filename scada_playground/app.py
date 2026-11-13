@@ -246,6 +246,8 @@ def initialize(seed: int = 17) -> None:
         water_state["demand_m3h"] = (water_state["base_demand_m3h"]
                                      + water_state["concentrator_demand_m3h"])
         water_tags, _water_diagram = WATER_MODEL.telemetry(water_state)
+        for tag in water_tags:
+            tag["dynamic_model"] = True
         tags.extend(water_tags)
         power_state = POWER_MODEL.initialize()
         initial_process_power_mw = (concentrator_state["sag_power_mw"] + concentrator_state["ball_power_mw"]
@@ -371,6 +373,8 @@ def publish_snapshot() -> dict:
             tag.update(utility_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
+    PROCESS_MODEL.apply_instrument_faults(sim["tags"], sim["events"], sim["tick"])
+    for tag in sim["tags"]:
         comms_fault = next((event for event in sim["events"]
                             if event.name == "Network partition"
                             and event.area in (tag["area"], "Whole factory")), None)
@@ -436,7 +440,8 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
         PROCESS_MODEL.inject(sim, params["incident_name"], params["target_area"], params["severity"],
                              params.get("duration_seconds"), params.get("target_asset"),
                              params.get("fault_location_pct", 90.0),
-                             params.get("primary_breaker_failure", False))
+                             params.get("primary_breaker_failure", False),
+                             params.get("target_tag"))
     elif step.action == "protocol_fault":
         PROTOCOL_FAULTS.add(sim, params["protocol"], params["mode"], params["selector_type"],
                             params["target"], params["duration_seconds"])
@@ -464,9 +469,9 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
 
 def inject(name: str, area: str, severity: str, duration_seconds: int | None = None,
            target_asset: str | None = None, fault_location_pct: float = 90.0,
-           primary_breaker_failure: bool = False) -> None:
+           primary_breaker_failure: bool = False, target_tag: str | None = None) -> None:
     PROCESS_MODEL.inject(st.session_state.sim, name, area, severity, duration_seconds, target_asset,
-                         fault_location_pct, primary_breaker_failure)
+                         fault_location_pct, primary_breaker_failure, target_tag)
 
 
 def reset_feeder_protection(sim: dict, target_asset: str) -> None:
@@ -532,8 +537,9 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 duration = command.get("duration_seconds")
                 inject(name, area, severity, duration, command.get("target_asset"),
                        command.get("fault_location_pct", 90.0),
-                       command.get("primary_breaker_failure", False))
-                target_note = f" on {command.get('target_asset')}" if command.get("target_asset") else ""
+                       command.get("primary_breaker_failure", False), command.get("target_tag"))
+                target_note = (f" on {command.get('target_tag')}" if command.get("target_tag")
+                               else f" on {command.get('target_asset')}" if command.get("target_asset") else "")
                 message = f"{severity} {name} injected in {area}{target_note}. Start the factory to evolve its simulated process effects."
             elif action == "reset_feeder_protection":
                 target_asset = command.get("target_asset", "")
@@ -951,10 +957,22 @@ with st.sidebar:
         target_asset = None
         fault_location_pct = 90.0
         primary_breaker_failure = False
+    target_tag = None
+    if incident_name == "Signal drift":
+        candidates = [tag for tag in sim["tags"]
+                      if tag.get("dynamic_model")
+                      and tag.get("units") not in {"bool", "enum", "cycles"}
+                      and (target == "Whole factory" or tag["area"] == target)]
+        if candidates:
+            labels = {tag["tag"]: f"{tag['unit']} · {tag['sensor']} ({tag['units']})"
+                      for tag in candidates}
+            target_tag = st.selectbox("Drifting instrument", list(labels),
+                                      format_func=lambda tag_name: labels[tag_name],
+                                      key="signal_drift_target")
     if st.button("⚠ Inject incident", width="stretch"):
         inject(incident_name, target, severity, target_asset=target_asset,
                fault_location_pct=fault_location_pct,
-               primary_breaker_failure=primary_breaker_failure)
+               primary_breaker_failure=primary_breaker_failure, target_tag=target_tag)
     st.caption("Incidents change simulated sensor behavior and produce alarm events. They never connect to equipment.")
     with st.expander("Protocol fault injector"):
         fault_protocol = st.selectbox("Protocol", PROTOCOLS, key="fault_protocol")
