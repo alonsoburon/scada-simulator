@@ -18,8 +18,11 @@ class ChilledWaterPlant:
     CHILLED_WATER_DESIGN_DELTA_T_K = 6.0
     WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
     SITE_ATMOSPHERIC_PRESSURE_KPA = 70.0
+    CONDENSER_WATER_DESIGN_FLOW_M3H = 270.0
+    CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K = 1.163
+    CONDENSER_WATER_DESIGN_DELTA_T_K = 5.0
     COOLING_TOWER_APPROACH_K = 5.0
-    CHILLER_CONDENSER_APPROACH_K = 5.0
+    CHILLER_CONDENSER_APPROACH_K = 4.0
     PRODUCT_TARGET_C = 12.0
     PRODUCT_INLET_C = 82.0
     PRODUCT_CP_KJ_KG_K = 4.186
@@ -31,16 +34,28 @@ class ChilledWaterPlant:
         humidity = 26.0
         wet_bulb = self._wet_bulb_temperature_c(ambient, humidity)
         condenser_entering = wet_bulb + self.COOLING_TOWER_APPROACH_K
-        condenser_saturation = condenser_entering + self.CHILLER_CONDENSER_APPROACH_K
         evaporating = 6.0 - 3.0
-        initial_cop = max(2.5, min(7.0,
-            0.52 * (evaporating + 273.15) / max(10.0, condenser_saturation - evaporating)))
+        initial_cop = 6.0
+        for _ in range(4):
+            initial_heat_rejection = 878.0 * (1.0 + 1.0 / initial_cop)
+            condenser_rise = (initial_heat_rejection
+                / (self.CONDENSER_WATER_DESIGN_FLOW_M3H
+                   * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K))
+            condenser_saturation = (condenser_entering + condenser_rise
+                                     + self.CHILLER_CONDENSER_APPROACH_K)
+            initial_cop = self._cop_from_temperatures(evaporating, condenser_saturation)
+        initial_compressor_power_mw = 878.0 / initial_cop / 1_000.0
         return {
             "sim_seconds": 0,
             "ambient_temperature_c": ambient,
             "ambient_relative_humidity_pct": humidity,
             "wet_bulb_temperature_c": wet_bulb,
             "condenser_saturation_temperature_c": condenser_saturation,
+            "condenser_heat_rejection_kw": initial_heat_rejection,
+            "condenser_pump_available_fraction": 1.0,
+            "condenser_water_flow_m3h": self.CONDENSER_WATER_DESIGN_FLOW_M3H,
+            "condenser_water_leaving_temperature_c": (
+                condenser_saturation - self.CHILLER_CONDENSER_APPROACH_K),
             "chillers": {name: {"capacity_kw": capacity, "output_kw": capacity * 0.68,
                                 "available_fraction": 1.0, "available_capacity_kw": capacity,
                                 "running": True, "vibration_mm_s": 1.8}
@@ -129,6 +144,11 @@ class ChilledWaterPlant:
                 high = wet_bulb
         return max(dry_bulb_c - 60.0, min(dry_bulb_c, (low + high) * 0.5))
 
+    @staticmethod
+    def _cop_from_temperatures(evaporating_c: float, condensing_c: float) -> float:
+        lift = max(10.0, condensing_c - evaporating_c)
+        return max(2.5, min(7.0, 0.52 * (evaporating_c + 273.15) / lift))
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 cooling_demand_kw: float, power_available_fraction: float = 1.0,
                 seed: int = 17) -> None:
@@ -153,6 +173,9 @@ class ChilledWaterPlant:
         local_power_loss = self._severity(events, "Utility loss")
         pump_trip = self._severity(events, "Utility loss", "primary_pumps")
         tower_loss = self._severity(events, "Utility loss", "cooling_tower")
+        condenser_pump_trip = self._severity(events, "Utility loss", "condenser_water_pumps")
+        condenser_pump_mechanical = max(global_mechanical,
+            self._severity(events, "Mechanical degradation", "condenser_water_pumps"))
         tower_degradation = max(global_mechanical,
             self._severity(events, "Mechanical degradation", "cooling_tower"))
         tower_factor = max(0.0, 1.0 - tower_loss - 0.55 * tower_degradation)
@@ -160,20 +183,31 @@ class ChilledWaterPlant:
         pump_fraction *= (1.0 - local_power_loss) * (1.0 - pump_trip) * power
         state["pump_available_fraction"] = pump_fraction
         state["pump_flow_m3h"] = 180.0 * pump_fraction
-        condenser_temp = (wet_bulb + self.COOLING_TOWER_APPROACH_K
-                          + 2.0 * (1.0 - pump_fraction))
+        condenser_pump_fraction = max(0.0, 1.0 - 0.70 * condenser_pump_mechanical)
+        condenser_pump_fraction *= (1.0 - local_power_loss) * (1.0 - condenser_pump_trip) * power
+        state["condenser_pump_available_fraction"] = condenser_pump_fraction
+        condenser_flow = self.CONDENSER_WATER_DESIGN_FLOW_M3H * condenser_pump_fraction
+        state["condenser_water_flow_m3h"] = condenser_flow
+        condenser_temp = wet_bulb + self.COOLING_TOWER_APPROACH_K
         condenser_temp += 12.0 * (1.0 - tower_factor)
         state["condenser_entering_temperature_c"] = condenser_temp
-        condensing_temp = condenser_temp + self.CHILLER_CONDENSER_APPROACH_K
+        prior_heat_rejection = state.get("condenser_heat_rejection_kw", 0.0)
+        condenser_water_rise = (prior_heat_rejection /
+            max(condenser_flow * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K, 1e-9)
+            if condenser_flow > 1e-6 else 0.0)
+        condenser_leaving = condenser_temp + condenser_water_rise
+        condensing_temp = condenser_leaving + self.CHILLER_CONDENSER_APPROACH_K
+        state["condenser_water_leaving_temperature_c"] = condenser_leaving
         state["condenser_saturation_temperature_c"] = condensing_temp
         evaporating_temp = state["supply_temperature_c"] - 3.0
-        lift = max(10.0, condensing_temp - evaporating_temp)
-        state["cop"] = max(2.5, min(7.0, 0.52 * (evaporating_temp + 273.15) / lift))
+        state["cop"] = self._cop_from_temperatures(evaporating_temp, condensing_temp)
         hydraulic_capacity_kw = (state["pump_flow_m3h"]
                                  * self.WATER_HEAT_CAPACITY_KWH_PER_M3_K
                                  * self.CHILLED_WATER_DESIGN_DELTA_T_K)
         hydraulic_derate = min(1.0, hydraulic_capacity_kw
                                / max(sum(self.CHILLER_CAPACITY_KW.values()), 1e-9))
+        condenser_flow_derate = min(1.0, condenser_flow
+                                    / max(self.CONDENSER_WATER_DESIGN_FLOW_M3H, 1e-9))
         capacity_by_unit = {}
         available_capacity = 0.0
         for name, unit in state["chillers"].items():
@@ -184,7 +218,8 @@ class ChilledWaterPlant:
             availability *= max(0.0, 1.0 - 0.65 * unit_degradation)
             ambient_derate = max(0.65, 1.0 - 0.012 * max(0.0, condensing_temp - 25.0)) * tower_factor
             unit["available_fraction"] = availability
-            capacity = unit["capacity_kw"] * availability * ambient_derate * hydraulic_derate
+            capacity = (unit["capacity_kw"] * availability * ambient_derate
+                        * hydraulic_derate * condenser_flow_derate)
             unit["available_capacity_kw"] = capacity
             capacity_by_unit[name] = capacity
             available_capacity += capacity
@@ -234,10 +269,26 @@ class ChilledWaterPlant:
         return_rise = min(8.0, demand * state["cooling_service_fraction"]
                           / max(100.0, state["pump_flow_m3h"] * 1.163))
         state["return_temperature_c"] = state["supply_temperature_c"] + return_rise
-        compressor_power_mw = production / max(state["cop"], 1.0) / 1_000.0
+        cop = state["cop"]
+        for _ in range(4):
+            compressor_power_kw = production / max(cop, 1.0)
+            heat_rejection_kw = production + compressor_power_kw
+            condenser_water_rise = (heat_rejection_kw /
+                max(condenser_flow * self.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K,
+                    1e-9) if condenser_flow > 1e-6 else 0.0)
+            condenser_leaving = condenser_temp + condenser_water_rise
+            condensing_temp = condenser_leaving + self.CHILLER_CONDENSER_APPROACH_K
+            cop = self._cop_from_temperatures(evaporating_temp, condensing_temp)
+        state["condenser_heat_rejection_kw"] = heat_rejection_kw
+        state["condenser_water_leaving_temperature_c"] = condenser_leaving
+        state["condenser_saturation_temperature_c"] = condensing_temp
+        state["cop"] = cop
+        compressor_power_mw = production / max(cop, 1.0) / 1_000.0
         pump_power_mw = 0.085 * pump_fraction**3
+        condenser_pump_power_mw = 0.12 * condenser_pump_fraction**3
         tower_power_mw = 0.035 * min(1.0, available_capacity / 1_400.0)
-        state["electric_load_mw"] = compressor_power_mw + pump_power_mw + tower_power_mw
+        state["electric_load_mw"] = (compressor_power_mw + pump_power_mw
+                                      + condenser_pump_power_mw + tower_power_mw)
         state["compressor_starts"] += sum(
             unit["output_kw"] > 5.0 and previous_output[name] <= 5.0
             for name, unit in state["chillers"].items())
@@ -246,11 +297,12 @@ class ChilledWaterPlant:
             state["history"].append({key: state[key] for key in (
                 "sim_seconds", "ambient_temperature_c", "ambient_relative_humidity_pct",
                 "wet_bulb_temperature_c", "condenser_saturation_temperature_c",
+                "condenser_water_leaving_temperature_c", "condenser_heat_rejection_kw",
                 "cooling_demand_kw",
                 "cooling_production_kw", "cooling_served_kw", "cooling_service_fraction",
                 "storage_mwh", "storage_discharge_capacity_kw",
                 "supply_temperature_c", "return_temperature_c", "cop",
-                "pump_flow_m3h", "electric_load_mw")})
+                "pump_flow_m3h", "condenser_water_flow_m3h", "electric_load_mw")})
             state["history"] = state["history"][-1_440:]
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
@@ -271,6 +323,12 @@ class ChilledWaterPlant:
                 "available_discharge_capacity": (
                     state["storage_discharge_capacity_kw"], "kW", 0, 2_000),
             },
+            ("Chilled water", "Primary pumps"): {
+                "water_flow": (state["pump_flow_m3h"], "m³/h", 0, 300),
+                "motor_current": ((30.0 + 130.0 * state["pump_available_fraction"] ** 3)
+                    if state["pump_available_fraction"] > 0.05 else 0.0, "A", 0, 200),
+                "equipment_running": (float(state["pump_available_fraction"] > 0.05), "bool", 0, 1),
+            },
             ("Chilled water", "Cooling tower"): {
                 "ambient_temperature": (state["ambient_temperature_c"], "°C", -20, 60),
                 "ambient_relative_humidity": (
@@ -279,8 +337,19 @@ class ChilledWaterPlant:
                 "condenser_entering_temperature": (state["condenser_entering_temperature_c"], "°C", -10, 80),
                 "condenser_saturation_temperature": (
                     state["condenser_saturation_temperature_c"], "°C", -10, 100),
+                "condenser_water_leaving_temperature": (
+                    state["condenser_water_leaving_temperature_c"], "°C", -10, 100),
+                "heat_rejection": (state["condenser_heat_rejection_kw"], "kW", 0, 3_000),
                 "plant_cop": (state["cop"], "ratio", 0, 10),
                 "electrical_load": (state["electric_load_mw"] * 1_000.0, "kW", 0, 1_000),
+            },
+            ("Chilled water", "Condenser water pumps"): {
+                "water_flow": (state["condenser_water_flow_m3h"], "m³/h", 0, 500),
+                "motor_current": ((25.0 + 190.0 * state["condenser_pump_available_fraction"] ** 3)
+                    if state["condenser_pump_available_fraction"] > 0.05 else 0.0,
+                    "A", 0, 250),
+                "equipment_running": (
+                    float(state["condenser_pump_available_fraction"] > 0.05), "bool", 0, 1),
             },
         }
         for name, unit in state["chillers"].items():

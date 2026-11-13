@@ -53,7 +53,8 @@ AREAS = {
     "Water treatment": ["Filter train A", "Filter train B", "RO skid", "Treated tank", "Dosing skid"],
     "Boiler house": ["Boiler 01", "Boiler 02", "Feedwater system", "Steam header", "Condensate return"],
     "Compressed air": ["Compressor A", "Compressor B", "Dryer A", "Receiver 01", "Ring main"],
-    "Chilled water": ["Chiller A", "Chiller B", "Primary pumps", "Cooling tower", "Supply header"],
+    "Chilled water": ["Chiller A", "Chiller B", "Primary pumps", "Condenser water pumps",
+                      "Cooling tower", "Supply header"],
     "Ingredient dosing": ["Doser 01", "Doser 02", "Doser 03", "Doser 04", "Micro ingredients"],
     "Batch blending": ["Mixer 01", "Mixer 02", "Batch tank A", "Batch tank B", "Transfer manifold"],
     "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02", "CIP return", "Hot water loop", "Cooling section"],
@@ -252,7 +253,8 @@ def initialize(seed: int = 17) -> None:
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
         modeled_assets.update(("Chilled water", asset) for asset in
-                              ("Chiller A", "Chiller B", "Chilled water header", "Cooling tower", "Thermal storage"))
+                              ("Chiller A", "Chiller B", "Primary pumps", "Condenser water pumps",
+                               "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
@@ -357,7 +359,8 @@ def initialize(seed: int = 17) -> None:
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
         modeled_assets.update(("Chilled water", asset) for asset in
-                              ("Chiller A", "Chiller B", "Chilled water header", "Cooling tower", "Thermal storage"))
+                              ("Chiller A", "Chiller B", "Primary pumps", "Condenser water pumps",
+                               "Chilled water header", "Cooling tower", "Thermal storage"))
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
@@ -1127,11 +1130,21 @@ def advance(force: bool = False) -> None:
             utility_alarm_states[key] = False
     chilled = sim["chilled_water"]
     chilled_alarm_states = sim.setdefault("chilled_water_alarm_states", {})
+    design_condenser_flow_m3h = (chilled["cooling_demand_kw"]
+        * (1.0 + 1.0 / max(chilled["cop"], 1.0))
+        / (CHILLED_MODEL.CONDENSER_WATER_HEAT_CAPACITY_KWH_PER_M3_K
+           * CHILLED_MODEL.CONDENSER_WATER_DESIGN_DELTA_T_K)
+        if chilled["cooling_demand_kw"] > 50.0 else 0.0)
     design_cooling_flow_m3h = (chilled["cooling_demand_kw"]
         / (CHILLED_MODEL.WATER_HEAT_CAPACITY_KWH_PER_M3_K
            * CHILLED_MODEL.CHILLED_WATER_DESIGN_DELTA_T_K)
         if chilled["cooling_demand_kw"] > 50.0 else 0.0)
     chilled_conditions = (
+        ("low_condenser_water_flow", design_condenser_flow_m3h > 0.0
+         and chilled["condenser_water_flow_m3h"] < 0.90 * design_condenser_flow_m3h,
+         design_condenser_flow_m3h == 0.0
+         or chilled["condenser_water_flow_m3h"] > design_condenser_flow_m3h,
+         "Condenser-water flow is below the rate needed to reject current chiller heat", "HIGH"),
         ("low_chilled_water_flow", design_cooling_flow_m3h > 0.0
          and chilled["pump_flow_m3h"] < 0.90 * design_cooling_flow_m3h,
          design_cooling_flow_m3h == 0.0
