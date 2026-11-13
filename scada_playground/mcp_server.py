@@ -285,14 +285,17 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                                      "reset_feeder_protection"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
-                       target_asset: str = "") -> dict[str, Any]:
+                       target_asset: str = "", fault_location_pct: float = 90.0,
+                       primary_breaker_failure: bool = False) -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
     or manually reset a locked-out distribution feeder after its fault has cleared.
 
     For incident injection, pass a known incident_name, severity Small/Medium/Large,
     and target_area (an area name or Whole factory). Electrical fault also requires
-    target_asset set to Feeder north/south/east/west. For reset_feeder_protection, pass
-    target_area Grid distribution and the locked-out feeder as target_asset. No physical device can be controlled.
+    target_asset set to Feeder north/south/east/west. Electrical faults also accept a
+    0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
+    For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
+    No physical device can be controlled.
     """
     allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
                "reset_feeder_protection"}
@@ -314,13 +317,17 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
             if target_area != "Grid distribution" or target_asset not in {
                     "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
                 raise ValueError("Electrical fault requires Grid distribution and a named feeder target_asset")
+            if not 0.0 <= fault_location_pct <= 100.0:
+                raise ValueError("fault_location_pct must be between 0 and 100")
     if action == "reset_feeder_protection":
         if target_area != "Grid distribution" or target_asset not in {
-                "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
-            raise ValueError("reset_feeder_protection requires Grid distribution and a named feeder target_asset")
+                "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Distribution incomer"}:
+            raise ValueError("reset_feeder_protection requires Grid distribution and a feeder/incomer target_asset")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
-                           "duration_seconds": duration_seconds, "target_asset": target_asset or None})
+                           "duration_seconds": duration_seconds, "target_asset": target_asset or None,
+                           "fault_location_pct": fault_location_pct,
+                           "primary_breaker_failure": primary_breaker_failure})
 
 
 @mcp.tool()

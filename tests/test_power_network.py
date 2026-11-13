@@ -103,10 +103,13 @@ class MinePowerNetworkTests(unittest.TestCase):
         north = self.state["distribution_feeders"]["north"]
         self.assertTrue(north["breaker_closed"])
         self.assertTrue(north["relay_pickup"])
-        self.assertEqual(north["relay_current_multiple"], 8.0)
-        self.assertGreater(north["current_a"], north["pickup_current_a"] * 7.9)
+        self.assertGreater(north["relay_current_multiple"], 1.0)
+        self.assertGreater(north["current_a"], north["pickup_current_a"] * 5.0)
         self.assertLess(north["voltage_pu"], 0.80)
         self.model.advance(self.state, 2, [fault], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        self.assertTrue(self.state["distribution_feeders"]["north"]["breaker_closed"])
+        self.model.advance(self.state, 3, [fault], process_load_mw=28.0,
                            water_load_mw=0.5, seed=17)
         north = self.state["distribution_feeders"]["north"]
         self.assertFalse(north["breaker_closed"])
@@ -120,7 +123,8 @@ class MinePowerNetworkTests(unittest.TestCase):
                                places=6)
         self.assertLess(self.state["process_power_fraction"], 1.0)
         self.assertTrue(self.state["distribution_feeders"]["south"]["breaker_closed"])
-        for tick in range(3, 17):
+        self.assertEqual(self.state["distribution_incomer"]["trip_count"], 0)
+        for tick in range(4, 17):
             self.model.advance(self.state, tick, [], process_load_mw=28.0,
                                water_load_mw=0.5, seed=17)
         self.assertFalse(north["breaker_closed"])
@@ -149,6 +153,75 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.assertTrue(east["breaker_closed"])
         self.assertFalse(east["lockout"])
         self.assertEqual(east["trip_count"], 2)
+
+    def test_fault_current_depends_on_source_strength_and_fault_location(self):
+        fault = {"name": "Electrical fault", "area": "Grid distribution",
+                 "target_asset": "Feeder north", "severity": "Large",
+                 "fault_location_pct": 0.0}
+        source_end = self.model.initialize()
+        self.model.advance(source_end, 1, [fault], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        source_end_current = source_end["distribution_feeders"]["north"]["fault_current_a"]
+        far_end = self.model.initialize()
+        remote_fault = {**fault, "fault_location_pct": 100.0}
+        self.model.advance(far_end, 1, [remote_fault], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        far_end_current = far_end["distribution_feeders"]["north"]["fault_current_a"]
+        self.assertGreater(source_end_current, far_end_current * 1.5)
+        islanded = self.model.initialize()
+        islanded["tie_capacity_mw"] = 0.0
+        self.model.advance(islanded, 1, [remote_fault], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        island_fault_current = islanded["distribution_feeders"]["north"]["fault_current_a"]
+        self.assertGreater(far_end_current, island_fault_current)
+        resistive_fault = {**remote_fault, "severity": "Small"}
+        high_resistance = self.model.initialize()
+        self.model.advance(high_resistance, 1, [resistive_fault], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        self.assertGreater(far_end_current,
+                           high_resistance["distribution_feeders"]["north"]["fault_current_a"])
+
+    def test_failed_feeder_breaker_trips_coordinated_incomer_backup(self):
+        fault = {"name": "Electrical fault", "area": "Grid distribution",
+                 "target_asset": "Feeder north", "severity": "Large",
+                 "fault_location_pct": 90.0, "primary_breaker_failure": True}
+        primary_operated_at = None
+        incomer_trip_at = None
+        coordinated_primary_time = None
+        coordinated_backup_time = None
+        for tick in range(1, 11):
+            self.model.advance(self.state, tick, [fault], process_load_mw=28.0,
+                               water_load_mw=0.5, seed=17)
+            if self.state["distribution_feeders"]["north"]["relay_operated"] and primary_operated_at is None:
+                primary_operated_at = tick
+                coordinated_primary_time = self.state["distribution_feeders"]["north"]["relay_time_to_trip_s"]
+                coordinated_backup_time = self.state["distribution_incomer"]["relay_time_to_trip_s"]
+            if self.state["distribution_incomer"]["trip_count"] and incomer_trip_at is None:
+                incomer_trip_at = tick
+        self.assertIsNotNone(primary_operated_at)
+        self.assertIsNotNone(incomer_trip_at)
+        self.assertGreater(incomer_trip_at, primary_operated_at)
+        north = self.state["distribution_feeders"]["north"]
+        incomer = self.state["distribution_incomer"]
+        self.assertTrue(north["relay_operated"])
+        self.assertEqual(north["breaker_failure_count"], 1)
+        self.assertTrue(north["breaker_closed"])
+        self.assertFalse(incomer["breaker_closed"])
+        self.assertTrue(incomer["lockout"])
+        self.assertEqual(incomer["trip_count"], 1)
+        self.assertGreater(coordinated_backup_time, coordinated_primary_time)
+        self.assertTrue(all(not feeder["energized"]
+                            for feeder in self.state["distribution_feeders"].values()))
+        self.assertEqual(self.state["voltage_pu"], 0.0)
+        with self.assertRaisesRegex(ValueError, "Clear the feeder fault"):
+            self.model.reset_feeder_protection(self.state, "distribution_incomer", fault_active=True)
+        self.model.reset_feeder_protection(self.state, "distribution_incomer", fault_active=False)
+        self.assertTrue(incomer["breaker_closed"])
+        self.assertFalse(incomer["lockout"])
+        self.model.advance(self.state, 11, [], process_load_mw=28.0,
+                           water_load_mw=0.5, seed=17)
+        self.assertTrue(all(feeder["energized"]
+                            for feeder in self.state["distribution_feeders"].values()))
 
     def test_seeded_measurement_noise_replays(self):
         self.advance(25)

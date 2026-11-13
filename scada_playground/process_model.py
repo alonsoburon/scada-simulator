@@ -16,6 +16,8 @@ class ProcessEvent:
     duration: int
     event_id: int
     target_asset: str | None = None
+    fault_location_pct: float = 90.0
+    primary_breaker_failure: bool = False
 
 
 class FactoryProcessModel:
@@ -29,7 +31,8 @@ class FactoryProcessModel:
 
     def inject(self, sim: dict, name: str, area: str, severity: str,
                duration_seconds: int | None = None,
-               target_asset: str | None = None) -> ProcessEvent:
+               target_asset: str | None = None, fault_location_pct: float = 90.0,
+               primary_breaker_failure: bool = False) -> ProcessEvent:
         if name not in self.incidents:
             raise ValueError(f"Unknown incident: {name}")
         if severity not in {"Small", "Medium", "Large"}:
@@ -43,15 +46,23 @@ class FactoryProcessModel:
         if name == "Electrical fault" and target_asset not in {
                 "Feeder north", "Feeder south", "Feeder east", "Feeder west"}:
             raise ValueError("Electrical fault must target one distribution feeder")
+        if name == "Electrical fault" and not 0.0 <= float(fault_location_pct) <= 100.0:
+            raise ValueError("Fault location must be between 0 and 100 percent of feeder length")
         duration = duration_seconds or {"Small": 90, "Medium": 240, "Large": 600}[severity]
         if not 1 <= duration <= 86_400:
             raise ValueError("Incident duration must be between 1 and 86,400 simulated seconds")
         event = ProcessEvent(name, area, severity, sim["tick"], duration,
-                             sim["next_event"], target_asset)
+                             sim["next_event"], target_asset, float(fault_location_pct),
+                             bool(primary_breaker_failure))
         sim["events"].append(event)
         sim["next_event"] += 1
+        description = f"{name} injected in {area}"
+        if name == "Electrical fault":
+            description += f" on {target_asset} at {fault_location_pct:.0f}% of feeder length"
+            if primary_breaker_failure:
+                description += "; feeder breaker failure simulated"
         sim["alarms"].insert(0, {"time": sim["tick"], "area": area, "severity": severity.upper(),
-                                "message": f"{name} injected in {area}", "state": "ACTIVE / UNACK"})
+                                "message": description, "state": "ACTIVE / UNACK"})
         return event
 
     def advance(self, sim: dict, *, force: bool = False) -> None:
@@ -62,8 +73,11 @@ class FactoryProcessModel:
         rng = random.Random(sim["seed"] + sim["tick"] * 8000)
         expired = [event for event in sim["events"] if sim["tick"] - event.started >= event.duration]
         for event in expired:
+            description = f"{event.name} cleared in {event.area}"
+            if event.target_asset:
+                description += f" on {event.target_asset}"
             sim["alarms"].insert(0, {"time": sim["tick"], "area": event.area, "severity": "INFO",
-                                    "message": f"{event.name} cleared in {event.area}", "state": "CLEARED"})
+                                    "message": description, "state": "CLEARED"})
         live = [event for event in sim["events"] if event not in expired]
         sim["events"] = live
         active_by_area = {area: [event for event in live if event.area in (area, "Whole factory")]

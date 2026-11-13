@@ -26,8 +26,10 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertEqual(step.parameters["incident_name"], "Electrical fault")
         self.assertEqual(step.parameters["target_area"], "Grid distribution")
         self.assertEqual(step.parameters["target_asset"], "Feeder north")
+        self.assertTrue(definition.steps[1].parameters["primary_breaker_failure"])
         self.assertEqual(len(definition.steps), 3)
         self.assertEqual(definition.steps[2].action, "feeder_protection_reset")
+        self.assertEqual(definition.steps[2].parameters["target_asset"], "Distribution incomer")
         self.assertEqual(definition.steps[2].at_seconds, 80)
         self.assertGreater(definition.duration_seconds,
                            step.at_seconds + step.parameters["duration_seconds"] + 15)
