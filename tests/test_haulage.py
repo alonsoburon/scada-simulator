@@ -79,12 +79,74 @@ class HaulTruckFleetTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_trucks_refuel_at_the_shovel_queue_before_running_dry(self):
-        self.run_ticks(self.state, 43_200)
+        self.run_ticks(self.state, 86_400)
         completed = [truck["refuels_completed"] for truck in self.state["trucks"].values()]
         self.assertGreater(sum(completed), 0)
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
         self.assertIn("mobile_fleet.haul_truck_01.refuel_status", tags)
         self.assertIn("mobile_fleet.haul_truck_01.fuel_level", tags)
+
+    def test_shared_shovel_and_tip_queues_serve_one_truck_and_separate_gps_positions(self):
+        for unit in self.model.truck_names:
+            loading = next(segment for segment in self.model.cycles[unit]
+                           if segment["kind"] == "loading")
+            truck = self.state["trucks"][unit]
+            truck["phase_s"] = loading["start"] + 20
+            truck["frame"] = self.model._frame(unit, truck["phase_s"])
+            truck["position_latitude"] = truck["frame"]["latitude"]
+            truck["position_longitude"] = truck["frame"]["longitude"]
+            truck["shovel_arrival_s"] = 0
+            truck["loading_queue_since_s"] = int(unit[-2:])
+
+        before = {unit: truck["phase_s"] for unit, truck in self.state["trucks"].items()}
+        self.model.advance(self.state, 1, [], 18_000)
+        moved = [unit for unit, truck in self.state["trucks"].items()
+                 if truck["phase_s"] != before[unit]]
+        self.assertEqual(moved, [self.model.truck_names[0]])
+        self.assertEqual(self.state["active_shovel_truck"], self.model.truck_names[0])
+        self.assertEqual(self.state["shovel_queue_length"], self.model.TRUCK_COUNT - 1)
+        shovel_tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertEqual(shovel_tags["mobile_fleet.shovel_dispatch.queue_length"]["value"], 11)
+        self.assertTrue(all(truck["frame"]["speed_kmh"] <= self.model.QUEUE_CREEP_SPEED_KMH
+                            for truck in self.state["trucks"].values()))
+        for tick in range(2, 1_502):
+            self.model.advance(self.state, tick, [], 18_000)
+        shovel_positions = [(self.state["trucks"][unit]["frame"]["latitude"],
+                             self.state["trucks"][unit]["frame"]["longitude"])
+                            for unit in self.model.truck_names
+                            if self.state["trucks"][unit]["frame"]["cycle_state"] in ("pit_queue", "loading")]
+        self.assertGreater(len(shovel_positions), 1)
+        self.assertEqual(len(set(shovel_positions)), len(shovel_positions))
+
+        for unit in self.model.truck_names:
+            tip_queue = next(segment for segment in self.model.cycles[unit]
+                             if segment["kind"] == "tip_queue")
+            truck = self.state["trucks"][unit]
+            truck["phase_s"] = tip_queue["end"]
+            truck["frame"] = self.model._frame(unit, truck["phase_s"])
+            truck["position_latitude"] = truck["frame"]["latitude"]
+            truck["position_longitude"] = truck["frame"]["longitude"]
+            self.assertAlmostEqual(truck["frame"]["payload_t"], truck["frame"]["payload_target_t"])
+            truck["tip_arrival_s"] = 0
+            truck["dump_queue_since_s"] = int(unit[-2:])
+
+        before = {unit: truck["phase_s"] for unit, truck in self.state["trucks"].items()}
+        self.model.advance(self.state, 1_502, [], 18_000)
+        moved = [unit for unit, truck in self.state["trucks"].items()
+                 if truck["phase_s"] != before[unit]]
+        self.assertEqual(moved, [self.model.truck_names[0]])
+        self.assertEqual(self.state["active_tip_truck"], self.model.truck_names[0])
+        self.assertEqual(self.state["tip_queue_length"], self.model.TRUCK_COUNT - 1)
+        map_positions = {item["unit"]: item for item in self.model.positions(self.state)}
+        self.assertEqual(sorted(map_positions[unit]["queue_position"]
+                                for unit in self.model.truck_names),
+                         list(range(1, self.model.TRUCK_COUNT + 1)))
+        self.assertTrue(all(self.state["trucks"][unit]["frame"]["speed_kmh"]
+                            <= self.model.QUEUE_CREEP_SPEED_KMH
+                            for unit in self.model.truck_names))
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertEqual(tags["mobile_fleet.shovel_dispatch.queue_length"]["value"], 0)
+        self.assertEqual(tags["mobile_fleet.crusher_tip_dispatch.queue_length"]["value"], 11)
 
     def test_truck_tips_feed_concentrator_rom_with_exact_inventory_balance(self):
         concentrator = CopperConcentrator()
@@ -105,9 +167,10 @@ class HaulTruckFleetTests(unittest.TestCase):
         process = concentrator.initialize()
         initial_rom = process["rom_stockpile_t"]
         rom_high_watermark = initial_rom
+        projected_rom_high_watermark = initial_rom
         dispatch_paused = False
         resumed_after_pause = False
-        for tick in range(1, 46_801):
+        for tick in range(1, 72_001):
             events = []
             if 300 <= tick < 21_900:
                 events.append({"name": "Conveyor jam", "area": "Crushing and screening", "severity": "Large"})
@@ -116,12 +179,15 @@ class HaulTruckFleetTests(unittest.TestCase):
             delivery = self.model.advance(self.state, tick, events, process["rom_stockpile_t"])
             concentrator.advance(process, tick, events, mine_delivery_t=delivery)
             rom_high_watermark = max(rom_high_watermark, process["rom_stockpile_t"])
+            projected_rom_high_watermark = max(
+                projected_rom_high_watermark, self.state["projected_rom_inventory_t"])
             if self.state["rom_dispatch_paused"]:
                 dispatch_paused = True
             if dispatch_paused and not self.state["rom_dispatch_paused"]:
                 resumed_after_pause = True
         expected_rom = initial_rom + process["cumulative_rom_received_t"] - process["cumulative_rom_discharge_t"]
-        self.assertGreaterEqual(rom_high_watermark, HaulTruckFleet.ROM_PAUSE_AT_T)
+        self.assertGreaterEqual(projected_rom_high_watermark, HaulTruckFleet.ROM_PAUSE_AT_T)
+        self.assertLess(rom_high_watermark, HaulTruckFleet.ROM_PAUSE_AT_T)
         self.assertTrue(dispatch_paused)
         self.assertTrue(resumed_after_pause)
         self.assertGreater(process["plant_feed_tph"], 800)

@@ -54,6 +54,13 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("motor start" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_haulage_recovery_scenario_exposes_queue_and_committed_ore_logic(self):
+        definition = ScenarioRunner().definition("haulage-crusher-buffer")
+        self.assertTrue(any("FIFO" in note and "queue" in note.lower()
+                            for note in definition.expected_observations))
+        self.assertTrue(any("committed" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_scenario_actions_are_dispatched_at_their_simulated_offset(self):
         runner = ScenarioRunner()
         sim = simulation_state()

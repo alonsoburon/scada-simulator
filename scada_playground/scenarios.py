@@ -52,7 +52,7 @@ SCENARIOS = {
         scenario_id="haulage-crusher-buffer",
         name="Haul truck cycles and crusher stoppage",
         description="Finite truck payloads feed ROM while a crusher conveyor trip forces inventory buffers and dispatch holds to respond.",
-        duration_seconds=46_800,
+        duration_seconds=72_000,
         steps=(
             ScenarioStep(300, "incident", {"incident_name": "Conveyor jam", "severity": "Large",
                                              "target_area": "Crushing and screening", "duration_seconds": 21_600}),
@@ -61,6 +61,8 @@ SCENARIOS = {
         ),
         expected_observations=(
             "Haul trucks deliver finite payloads after loading and loaded trips; return trips carry no ore.",
+            "A single shovel and crusher tip serve FIFO queues; watch queue length and per-truck wait tags as arrival bunching changes cycle time.",
+            "Dispatch holds against ROM plus payload already committed on loaded trucks, reducing stockpile overshoot while late trucks finish their trips.",
             "The crusher conveyor trip stops ROM discharge, so incoming truckloads raise the ROM stockpile while downstream buffers continue feeding the concentrator.",
             "During the long stoppage, ROM reaches the dispatch hold limit; trucks wait at the shovel while downstream buffers feed the plant.",
             "After crushing restarts, ROM inventory declines through the resume threshold and loading dispatch resumes with hysteresis.",

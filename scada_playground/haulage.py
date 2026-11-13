@@ -18,6 +18,8 @@ class HaulTruckFleet:
     ROM_CAPACITY_T = 45_000.0
     ROM_PAUSE_AT_T = 40_000.0
     ROM_RESUME_AT_T = 34_000.0
+    QUEUE_CREEP_SPEED_KMH = 3.0
+    SERVICE_POSITION_TOLERANCE_KM = 0.004
     STATE_CODE = {"pit_queue": 1, "loading": 2, "travel_loaded": 3,
                   "tip_queue": 4, "dumping": 5, "travel_empty": 6}
 
@@ -116,6 +118,8 @@ class HaulTruckFleet:
             latitude, longitude = point[1], point[2]
             if kind == "loading":
                 payload = payload_limit * elapsed / segment["duration"]
+            elif kind == "tip_queue":
+                payload = payload_limit
             elif kind == "dumping":
                 payload = payload_limit * (1.0 - elapsed / segment["duration"])
         state_label = "Standby · ROM stockpile high" if paused_for_rom and kind in ("pit_queue", "loading") else segment["label"]
@@ -132,15 +136,28 @@ class HaulTruckFleet:
             period = self.cycles[unit][-1]["end"]
             phase = (period * index / self.TRUCK_COUNT) % period
             frame = self._frame(unit, phase)
+            _segment, elapsed = self._segment_at(unit, phase)
+            shovel_arrival = (-elapsed if frame["cycle_state"] in ("pit_queue", "loading")
+                              else None)
+            tip_arrival = (-elapsed if frame["cycle_state"] in ("tip_queue", "dumping")
+                           else None)
             truck_states[unit] = {"phase_s": phase, "frame": frame, "total_delivered_t": 0.0,
                                   "engine_hours": 0.0, "fuel_used_l": 0.0,
                                   "fuel_capacity_l": 4_500.0, "refuel_remaining_s": 0,
                                   "refuels_completed": 0,
+                                  "position_latitude": frame["latitude"],
+                                  "position_longitude": frame["longitude"],
+                                  "shovel_arrival_s": shovel_arrival,
+                                  "loading_queue_since_s": (-elapsed if frame["cycle_state"] == "loading" else None),
+                                  "tip_arrival_s": tip_arrival,
+                                  "dump_queue_since_s": (-elapsed if frame["cycle_state"] == "dumping" else None),
                                   "tire_temperature_c": 60.0 + (index % 4) * 1.5,
                                   "brake_temperature_c": 65.0 + (index % 5) * 2.0}
         return {"sim_seconds": 0, "trucks": truck_states, "last_delivery_t": 0.0,
                 "cumulative_delivery_t": 0.0, "recent_deliveries_t": [], "delivery_rate_tph": 0.0,
-                "rom_dispatch_paused": False, "measured_mobility_factor": 1.0}
+                "rom_dispatch_paused": False, "measured_mobility_factor": 1.0,
+                "shovel_queue_length": 0, "tip_queue_length": 0,
+                "active_shovel_truck": None, "active_tip_truck": None}
 
     @staticmethod
     def _severity(events: list[dict], incident: str, area: str) -> float:
@@ -172,21 +189,75 @@ class HaulTruckFleet:
         paused_rom = state["rom_dispatch_paused"]
         if paused_rom and rom_inventory_t < self.ROM_RESUME_AT_T:
             paused_rom = False
-        elif not paused_rom and rom_inventory_t >= self.ROM_PAUSE_AT_T:
+        committed_rom_t = sum(
+            truck["frame"]["payload_t"] for truck in state["trucks"].values()
+            if truck["frame"]["cycle_state"] in ("travel_loaded", "tip_queue", "dumping"))
+        projected_rom_t = rom_inventory_t + committed_rom_t
+        if not paused_rom and projected_rom_t >= self.ROM_PAUSE_AT_T:
             paused_rom = True
         state["rom_dispatch_paused"] = paused_rom
+        state["projected_rom_inventory_t"] = projected_rom_t
         state["measured_mobility_factor"] = mobility
+
+        # Older open browser sessions predate queue timestamps; seed those
+        # timestamps from their saved cycle phase before forming queue order.
+        for unit, truck in state["trucks"].items():
+            cycle_state = truck["frame"]["cycle_state"]
+            _segment, elapsed = self._segment_at(unit, truck["phase_s"])
+            truck.setdefault("position_latitude", truck["frame"]["latitude"])
+            truck.setdefault("position_longitude", truck["frame"]["longitude"])
+            for key in ("shovel_arrival_s", "loading_queue_since_s", "tip_arrival_s",
+                        "dump_queue_since_s"):
+                truck.setdefault(key, None)
+            if cycle_state in ("pit_queue", "loading") and truck["shovel_arrival_s"] is None:
+                truck["shovel_arrival_s"] = sim_seconds - elapsed
+            if cycle_state == "loading" and truck["loading_queue_since_s"] is None:
+                truck["loading_queue_since_s"] = sim_seconds - elapsed
+            if cycle_state in ("tip_queue", "dumping") and truck["tip_arrival_s"] is None:
+                truck["tip_arrival_s"] = sim_seconds - elapsed
+            if cycle_state == "dumping" and truck["dump_queue_since_s"] is None:
+                truck["dump_queue_since_s"] = sim_seconds - elapsed
+
+        # Each loading face and crusher tip is a single shared service point.
+        # Truck arrival times form FIFO queues; only the head truck can load or dump.
+        shovel_candidates = sorted(
+            (unit for unit, truck in state["trucks"].items()
+             if truck["frame"]["cycle_state"] == "loading"),
+            key=lambda unit: (state["trucks"][unit].get("loading_queue_since_s")
+                              if state["trucks"][unit].get("loading_queue_since_s") is not None
+                              else float("inf"), unit))
+        tip_candidates = sorted(
+            (unit for unit, truck in state["trucks"].items()
+             if truck["frame"]["cycle_state"] == "dumping"),
+            key=lambda unit: (state["trucks"][unit].get("dump_queue_since_s")
+                              if state["trucks"][unit].get("dump_queue_since_s") is not None
+                              else float("inf"), unit))
+        active_shovel = shovel_candidates[0] if shovel_candidates else None
+        active_tip = tip_candidates[0] if tip_candidates else None
 
         deliveries = 0.0
         for unit, truck in state["trucks"].items():
             old_phase = truck["phase_s"]
             old_frame = truck["frame"]
+            for key in ("shovel_arrival_s", "loading_queue_since_s", "tip_arrival_s",
+                        "dump_queue_since_s"):
+                truck.setdefault(key, None)
             at_shovel = old_frame["cycle_state"] in ("pit_queue", "loading")
             refueling = truck["refuel_remaining_s"] > 0
             if not refueling and old_frame["cycle_state"] == "pit_queue" and truck["fuel_used_l"] >= truck["fuel_capacity_l"] * 0.85:
                 truck["refuel_remaining_s"] = 600
                 refueling = True
             progress = 0.0 if refueling or (paused_rom and at_shovel) else shovel_rate if old_frame["cycle_state"] == "loading" else 1.0
+            if old_frame["cycle_state"] == "loading" and unit != active_shovel:
+                progress = 0.0
+            elif old_frame["cycle_state"] == "dumping" and unit != active_tip:
+                progress = 0.0
+            if old_frame["cycle_state"] == "loading" and unit == active_shovel:
+                if self._service_position_distance_km(truck, "shovel") > self.SERVICE_POSITION_TOLERANCE_KM:
+                    progress = 0.0
+            elif old_frame["cycle_state"] == "dumping" and unit == active_tip:
+                if self._service_position_distance_km(truck, "tip") > self.SERVICE_POSITION_TOLERANCE_KM:
+                    progress = 0.0
             if old_frame["cycle_state"] in ("travel_loaded", "travel_empty"):
                 progress *= mobility
             if refueling:
@@ -207,6 +278,28 @@ class HaulTruckFleet:
             deliveries += delta
             truck["phase_s"] = new_phase
             truck["frame"] = self._frame(unit, new_phase, mobility, paused_rom)
+            new_cycle_state = truck["frame"]["cycle_state"]
+            if new_cycle_state == "pit_queue" and old_frame["cycle_state"] != "pit_queue":
+                truck["shovel_arrival_s"] = sim_seconds
+                truck["loading_queue_since_s"] = None
+            elif new_cycle_state == "loading" and old_frame["cycle_state"] != "loading":
+                if truck["shovel_arrival_s"] is None:
+                    truck["shovel_arrival_s"] = sim_seconds
+                truck["loading_queue_since_s"] = sim_seconds
+            elif old_frame["cycle_state"] == "loading" and new_cycle_state != "loading":
+                truck["shovel_arrival_s"] = None
+                truck["loading_queue_since_s"] = None
+
+            if new_cycle_state == "tip_queue" and old_frame["cycle_state"] != "tip_queue":
+                truck["tip_arrival_s"] = sim_seconds
+                truck["dump_queue_since_s"] = None
+            elif new_cycle_state == "dumping" and old_frame["cycle_state"] != "dumping":
+                if truck["tip_arrival_s"] is None:
+                    truck["tip_arrival_s"] = sim_seconds
+                truck["dump_queue_since_s"] = sim_seconds
+            elif old_frame["cycle_state"] == "dumping" and new_cycle_state != "dumping":
+                truck["tip_arrival_s"] = None
+                truck["dump_queue_since_s"] = None
             if refueling:
                 truck["frame"]["state"] = "Refueling at mine fuel bay"
                 truck["frame"]["speed_kmh"] = 0.0
@@ -231,7 +324,83 @@ class HaulTruckFleet:
         state["recent_deliveries_t"] = state["recent_deliveries_t"][-600:]
         sample_count = max(1, len(state["recent_deliveries_t"]))
         state["delivery_rate_tph"] = sum(state["recent_deliveries_t"]) * 3_600.0 / sample_count
+        shovel_line = sorted(
+            (unit for unit, truck in state["trucks"].items()
+             if truck["frame"]["cycle_state"] in ("pit_queue", "loading")),
+            key=lambda unit: (state["trucks"][unit].get("shovel_arrival_s")
+                              if state["trucks"][unit].get("shovel_arrival_s") is not None
+                              else float("inf"), unit))
+        tip_line = sorted(
+            (unit for unit, truck in state["trucks"].items()
+             if truck["frame"]["cycle_state"] in ("tip_queue", "dumping")),
+            key=lambda unit: (state["trucks"][unit].get("tip_arrival_s")
+                              if state["trucks"][unit].get("tip_arrival_s") is not None
+                              else float("inf"), unit))
+        # The truck currently being served occupies slot zero; all others queue
+        # along the approach road rather than teleporting to the same map point.
+        for truck in state["trucks"].values():
+            if truck["frame"]["cycle_state"] not in ("pit_queue", "loading", "tip_queue", "dumping"):
+                truck["position_latitude"] = truck["frame"]["latitude"]
+                truck["position_longitude"] = truck["frame"]["longitude"]
+        self._place_queue(state, shovel_line, active_shovel, "shovel")
+        self._place_queue(state, tip_line, active_tip, "tip")
+        state["active_shovel_truck"] = (active_shovel if active_shovel in shovel_line else None)
+        state["active_tip_truck"] = (active_tip if active_tip in tip_line else None)
+        state["shovel_queue_length"] = max(0, len(shovel_line)
+                                           - int(state["active_shovel_truck"] is not None))
+        state["tip_queue_length"] = max(0, len(tip_line)
+                                        - int(state["active_tip_truck"] is not None))
         return deliveries
+
+    def _place_queue(self, state: dict, line: list[str], active: str | None,
+                     resource: str) -> None:
+        """Give queued vehicles distinct map positions on the approach road."""
+        if resource == "shovel":
+            approach = self._queue_approach("shovel")
+            waiting_label = "Shovel queue"
+        else:
+            approach = self._queue_approach("tip")
+            waiting_label = "Crusher tip queue"
+        first = ([active] if active in line else [])
+        ordered = first + [unit for unit in line if unit != active]
+        queue_spacing_km = 0.04
+        approach_km = max(approach["distance_km"], queue_spacing_km)
+        start, end = approach["from"], approach["to"]
+        queue_heading = math.degrees(math.atan2(end[2] - start[2], end[1] - start[1])) % 360.0
+        for rank, unit in enumerate(ordered):
+            truck = state["trucks"][unit]
+            frame = truck["frame"]
+            fraction = max(0.0, 1.0 - rank * queue_spacing_km / approach_km)
+            target_lat = start[1] + fraction * (end[1] - start[1])
+            target_lon = start[2] + fraction * (end[2] - start[2])
+            current_lat = truck["position_latitude"]
+            current_lon = truck["position_longitude"]
+            distance_km = self.distance_km((current_lat, current_lon), (target_lat, target_lon))
+            moved_km = min(distance_km, self.QUEUE_CREEP_SPEED_KMH / 3_600.0)
+            move_fraction = moved_km / distance_km if distance_km > 1e-12 else 1.0
+            frame["latitude"] = current_lat + move_fraction * (target_lat - current_lat)
+            frame["longitude"] = current_lon + move_fraction * (target_lon - current_lon)
+            truck["position_latitude"] = frame["latitude"]
+            truck["position_longitude"] = frame["longitude"]
+            if distance_km > 1e-12:
+                frame["heading"] = queue_heading
+            frame["speed_kmh"] = moved_km * 3_600.0
+            if rank > 0 and frame["cycle_state"] in ("loading", "dumping"):
+                frame["state"] = f"{waiting_label} · position {rank + 1}"
+            frame["queue_position"] = rank + 1
+
+    def _queue_approach(self, resource: str) -> dict:
+        if resource == "shovel":
+            return self.cycles[self.truck_names[0]][-1]
+        destination = self.routes["Haul truck"][3]
+        return next(segment for segment in self.cycles[self.truck_names[0]]
+                    if segment["kind"] == "travel_loaded" and segment["to"] == destination)
+
+    def _service_position_distance_km(self, truck: dict, resource: str) -> float:
+        approach = self._queue_approach(resource)
+        target = approach["to"]
+        return self.distance_km((truck["position_latitude"], truck["position_longitude"]),
+                                (target[1], target[2]))
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
         rows = []
@@ -239,6 +408,30 @@ class HaulTruckFleet:
             frame = truck["frame"]
             number = int(unit.rsplit(" ", 1)[1])
             fuel_capacity = truck["fuel_capacity_l"]
+            cycle_state = frame["cycle_state"]
+            if cycle_state == "pit_queue":
+                waiting_since = truck.get("shovel_arrival_s")
+                queue_wait = state["sim_seconds"] - waiting_since if waiting_since is not None else 0.0
+            elif cycle_state == "loading":
+                if state.get("active_shovel_truck") == unit:
+                    queue_wait = (self._service_position_distance_km(truck, "shovel")
+                                  * 3_600.0 / self.QUEUE_CREEP_SPEED_KMH)
+                else:
+                    waiting_since = truck.get("loading_queue_since_s")
+                    queue_wait = state["sim_seconds"] - waiting_since if waiting_since is not None else 0.0
+            elif cycle_state == "tip_queue":
+                waiting_since = truck.get("tip_arrival_s")
+                queue_wait = state["sim_seconds"] - waiting_since if waiting_since is not None else 0.0
+            elif cycle_state == "dumping":
+                if state.get("active_tip_truck") == unit:
+                    queue_wait = (self._service_position_distance_km(truck, "tip")
+                                  * 3_600.0 / self.QUEUE_CREEP_SPEED_KMH)
+                else:
+                    waiting_since = truck.get("dump_queue_since_s")
+                    queue_wait = state["sim_seconds"] - waiting_since if waiting_since is not None else 0.0
+            else:
+                queue_wait = 0.0
+            queue_wait = max(0.0, queue_wait)
             readings = {
                 "gps_latitude": (frame["latitude"], "°", -24.4, -24.2),
                 "gps_longitude": (frame["longitude"], "°", -69.2, -68.9),
@@ -257,6 +450,8 @@ class HaulTruckFleet:
                 "brake_temperature": (truck["brake_temperature_c"], "°C", 0, 400),
                 "cycle_state": (float(self.STATE_CODE[frame["cycle_state"]]), "state_code", 1, 6),
                 "loads_completed": (truck["total_delivered_t"] / frame["payload_target_t"], "loads", 0, 1_000_000),
+                "queue_position": (frame.get("queue_position", 0), "position", 0, self.TRUCK_COUNT),
+                "queue_wait": (queue_wait, "s", 0, 86_400),
             }
             for sensor, (truth, units, low, high) in readings.items():
                 tag_id = f"mobile_fleet.{unit.lower().replace(' ', '_')}.{sensor}"
@@ -268,12 +463,37 @@ class HaulTruckFleet:
                     "units": units, "value": round(min(high, max(low, truth)), 3), "quality": "GOOD",
                     "low": low, "high": high, "base": (low + high) / 2, "phase": 0.0,
                     "last_change": frame["state"]})
+        for asset, values in (
+                ("Shovel dispatch", {
+                    "queue_length": (state.get("shovel_queue_length", 0), "trucks", 0, self.TRUCK_COUNT),
+                    "active_truck": (self.truck_names.index(state["active_shovel_truck"]) + 1
+                                     if state.get("active_shovel_truck") in self.truck_names else 0,
+                                     "truck_id", 0, self.TRUCK_COUNT),
+                }),
+                ("Crusher tip dispatch", {
+                    "queue_length": (state.get("tip_queue_length", 0), "trucks", 0, self.TRUCK_COUNT),
+                    "active_truck": (self.truck_names.index(state["active_tip_truck"]) + 1
+                                     if state.get("active_tip_truck") in self.truck_names else 0,
+                                     "truck_id", 0, self.TRUCK_COUNT),
+                })):
+            for sensor, (value, units, low, high) in values.items():
+                rows.append({"tag": f"mobile_fleet.{asset.lower().replace(' ', '_')}.{sensor}",
+                    "area": self.AREA, "unit": asset, "sensor": sensor, "units": units,
+                    "value": value, "quality": "GOOD", "low": low, "high": high,
+                    "base": value, "phase": 0.0,
+                    "last_change": "Shared single-bay FIFO dispatch model"})
+        rows.append({"tag": "mobile_fleet.rom_dispatch.projected_inventory",
+            "area": self.AREA, "unit": "ROM dispatch", "sensor": "projected_inventory",
+            "units": "t", "value": round(state.get("projected_rom_inventory_t", 0.0), 2),
+            "quality": "GOOD", "low": 0, "high": self.ROM_CAPACITY_T,
+            "base": self.ROM_PAUSE_AT_T, "phase": 0.0,
+            "last_change": "ROM stock plus committed truck payloads"})
         return rows
 
     @staticmethod
     def positions(state: dict) -> list[dict]:
         return [{key: value for key, value in truck["frame"].items()
-                 if key in {"unit", "vehicle_type", "latitude", "longitude", "speed_kmh", "heading", "payload_t", "state"}}
+                 if key in {"unit", "vehicle_type", "latitude", "longitude", "speed_kmh", "heading", "payload_t", "queue_position", "state"}}
                 for truck in state["trucks"].values()]
 
     @staticmethod
@@ -283,6 +503,11 @@ class HaulTruckFleet:
                      not state["rom_dispatch_paused"] for truck in trucks)
         return {"sim_seconds": state["sim_seconds"], "truck_count": len(trucks), "active_trucks": active,
                 "rom_dispatch_paused": state["rom_dispatch_paused"],
+                "projected_rom_inventory_t": state.get("projected_rom_inventory_t", 0.0),
+                "shovel_queue_length": state.get("shovel_queue_length", 0),
+                "tip_queue_length": state.get("tip_queue_length", 0),
+                "active_shovel_truck": state.get("active_shovel_truck"),
+                "active_tip_truck": state.get("active_tip_truck"),
                 "delivery_rate_tph": state["delivery_rate_tph"],
                 "last_delivery_t": state["last_delivery_t"],
                 "cumulative_delivery_t": state["cumulative_delivery_t"],

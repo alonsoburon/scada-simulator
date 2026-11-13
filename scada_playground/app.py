@@ -232,6 +232,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
+        modeled_assets.update(("Mobile fleet", asset) for asset in
+                              ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
         for tag in modeled_tags:
@@ -297,6 +299,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
+        modeled_assets.update(("Mobile fleet", asset) for asset in
+                              ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
         for tag in modeled_tags:
@@ -1368,6 +1372,17 @@ def render_dashboard():
             st.info("Start the factory to collect trend history.")
     with tabs[4]:
         fleet = tags_df[tags_df.area == "Mobile fleet"].copy()
+        fleet_summary = HAULAGE_MODEL.summary(sim["haulage"])
+        committed_ore_t = sum(
+            truck["frame"]["payload_t"] for truck in sim["haulage"]["trucks"].values()
+            if truck["frame"]["cycle_state"] in ("travel_loaded", "tip_queue", "dumping"))
+        fleet_metrics = st.columns(5)
+        fleet_metrics[0].metric("Haul delivery", f"{fleet_summary['delivery_rate_tph']:.0f} t/h")
+        fleet_metrics[1].metric("Shovel queue", f"{fleet_summary['shovel_queue_length']} trucks")
+        fleet_metrics[2].metric("Crusher queue", f"{fleet_summary['tip_queue_length']} trucks")
+        fleet_metrics[3].metric("Committed ore", f"{committed_ore_t:.0f} t")
+        fleet_metrics[4].metric("ROM stockpile", f"{sim['concentrator']['rom_stockpile_t']:.0f} t",
+                                "dispatch held" if fleet_summary["rom_dispatch_paused"] else "dispatch ready")
         st.caption("Fleet GPS is streamed on the live map above. This view lists the vehicle process and instrumentation tags.")
         st.subheader("Vehicle telemetry")
         st.dataframe(fleet[~fleet.sensor.str.startswith("gps_")][["tag", "value", "units", "quality", "last_change"]],
