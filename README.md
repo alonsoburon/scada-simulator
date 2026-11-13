@@ -4,6 +4,8 @@ A local synthetic industrial operations world for developers building, testing, 
 
 It models mining, power, water, manufacturing, buildings, and GPS-equipped vehicles: **32 areas, about 200 equipment units, and about 1,800 tags**. The mine electrical network, water network, copper concentrator, haulage fleet, underground ventilation, factory steam/instrument-air/production-line loops, and eight site buildings have explicit dynamic models; the remaining areas still use broad synthetic behavior. Inject incidents, observe alarm and signal-quality changes, and connect your own telemetry readers.
 
+Analog tags in the remaining synthetic areas include small, deterministic three-second correlated transmitter noise keyed by simulation seed and tag. Discrete states remain exact, tag ordering does not change a reading, and noise does not feed back into the modeled equipment.
+
 > Everything here is simulated. It is not a PLC, a process engineering model, a safety system, or a connection to real equipment.
 
 ## Quick start

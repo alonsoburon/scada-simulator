@@ -1,15 +1,13 @@
 """Deterministic synthetic process behavior, independent of the Streamlit UI."""
 from __future__ import annotations
 
-import math
-import random
 from dataclasses import dataclass
 from typing import Callable
 
 try:
-    from .instrumentation import signal_drift_bias
+    from .instrumentation import correlated_sensor_noise, signal_drift_bias
 except ImportError:
-    from instrumentation import signal_drift_bias
+    from instrumentation import correlated_sensor_noise, signal_drift_bias
 
 
 @dataclass
@@ -131,7 +129,6 @@ class FactoryProcessModel:
         if not sim["running"] and not force:
             return
         sim["tick"] += 1
-        rng = random.Random(sim["seed"] + sim["tick"] * 8000)
         expired = [event for event in sim["events"] if sim["tick"] - event.started >= event.duration]
         for event in expired:
             description = f"{event.name} cleared in {event.area}"
@@ -164,8 +161,7 @@ class FactoryProcessModel:
 
             base = tag["base"]
             span = tag["high"] - tag["low"]
-            value = base + span * (0.012 * (rng.random() - 0.5) +
-                                   0.018 * math.sin(sim["tick"] / 67 + tag["phase"]))
+            value = base
             issues = active_by_area[tag["area"]]
             for event in issues:
                 intensity = {"Small": 0.12, "Medium": 0.34, "Large": 0.72}[event.severity]
@@ -186,4 +182,8 @@ class FactoryProcessModel:
             if not issues:
                 tag["quality"] = "GOOD"
                 tag["last_change"] = "Normal"
+            if tag.get("units") not in {"bool", "enum", "cycles"}:
+                value += correlated_sensor_noise(
+                    sim, tag["tag"], sim["seed"], sim["tick"],
+                    max(0.0, span) * 0.002)
             tag["value"] = round(min(tag["high"] * 1.15, max(tag["low"] - span * 0.1, value)), 2)
