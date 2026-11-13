@@ -1634,6 +1634,21 @@ def render_dashboard():
                 trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
                 trend.update_layout(height=470, uirevision="concentrator-process-trend")
                 st.plotly_chart(trend, width="stretch")
+                flotation_balance = make_subplots(specs=[[{"secondary_y": True}]])
+                flotation_balance.add_trace(go.Scatter(
+                    x=history.time, y=history.flotation_copper_inventory_t,
+                    name="Copper held in cells", line={"color": "#277da1"}),
+                    secondary_y=False)
+                flotation_balance.add_trace(go.Scatter(
+                    x=history.time, y=history.copper_feed_grade_pct,
+                    name="Feed grade", line={"color": "#9b5de5", "dash": "dot"}),
+                    secondary_y=True)
+                flotation_balance.update_yaxes(title_text="Copper inventory (t Cu)", secondary_y=False)
+                flotation_balance.update_yaxes(title_text="Feed grade (% Cu)", secondary_y=True)
+                flotation_balance.update_layout(height=300, title="Flotation metal holdup and feed grade",
+                                                xaxis_title="Simulated seconds",
+                                                uirevision="concentrator-flotation-metal-balance")
+                st.plotly_chart(flotation_balance, width="stretch")
                 size_trend = go.Figure()
                 for key, label, color in (
                     ("grind_coarse_fraction", "Coarse", "#277da1"),

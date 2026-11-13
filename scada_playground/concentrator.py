@@ -13,6 +13,8 @@ import random
 class CopperConcentrator:
     GRINDING_CIRCUIT_RESIDENCE_S = 900.0
     BALL_SPECIFIC_ENERGY_KWH_T = 5.15
+    FLOTATION_CELL_COUNT = 6
+    FLOTATION_BANK_VOLUME_M3 = 540.0
     AREA_ASSETS = {
         "Open-pit mining": ["Pit sector A"],
         "Crushing and screening": ["Primary crusher", "Ore conveyors"],
@@ -29,6 +31,16 @@ class CopperConcentrator:
     )
 
     def initialize(self) -> dict:
+        flotation_solids_per_cell_t = (
+            self.FLOTATION_BANK_VOLUME_M3 / (1.0 / 2.7 + 0.90) / self.FLOTATION_CELL_COUNT)
+        per_cell_recovery = 1.0 - (1.0 - 0.88) ** (1.0 / self.FLOTATION_CELL_COUNT)
+        copper_input_tph = 870.0 * 0.0062
+        flotation_cell_copper_inventory_t = []
+        for _ in range(self.FLOTATION_CELL_COUNT):
+            # Seed the six perfectly mixed cells at a nominal 88% bank recovery.
+            flotation_cell_copper_inventory_t.append(
+                copper_input_tph * flotation_solids_per_cell_t / 870.0 * (1.0 - per_cell_recovery))
+            copper_input_tph *= 1.0 - per_cell_recovery
         return {
             "sim_seconds": 0, "rom_stockpile_t": 18_000.0, "rom_feed_curtailed_t": 0.0,
             "initial_rom_stockpile_t": 18_000.0, "cumulative_rom_received_t": 0.0,
@@ -38,7 +50,7 @@ class CopperConcentrator:
             "rom_copper_inventory_t": 18_000.0 * 0.0062,
             "crushed_copper_inventory_t": 3_200.0 * 0.0062,
             "sag_bin_copper_inventory_t": 410.0 * 0.0062,
-            "mine_block_grade_pct": 0.62,
+            "mine_block_grade_pct": 0.62, "cumulative_mine_copper_received_t": 0.0,
             "cumulative_rom_discharge_t": 0.0, "initial_crushed_stockpile_t": 3_200.0,
             "cumulative_crushed_ore_t": 0.0, "cumulative_sag_feeder_t": 0.0,
             "initial_sag_bin_t": 410.0, "cumulative_sag_processed_t": 0.0,
@@ -59,18 +71,32 @@ class CopperConcentrator:
             "cumulative_tailings_water_spill_m3": 0.0,
             "concentrate_thickener_inventory_t": 28.0,
             "concentrate_thickener_capacity_t": 120.0,
+            "concentrate_thickener_copper_inventory_t": 28.0 * 0.25,
             "filter_press_phase": "FILLING", "filter_press_cycle_s": 0,
             "filter_press_batch_t": 0.0, "filter_press_batch_capacity_t": 3.2,
+            "filter_press_batch_copper_inventory_t": 0.0,
             "filter_press_cycle_count": 0,
             "concentrate_cake_inventory_t": 90.0, "concentrate_cake_capacity_t": 500.0,
+            "concentrate_cake_copper_inventory_t": 90.0 * 0.25,
             "cumulative_concentrate_produced_t": 0.0,
             "cumulative_concentrate_shipped_t": 0.0,
+            "cumulative_concentrate_copper_produced_t": 0.0,
+            "cumulative_concentrate_copper_shipped_t": 0.0,
             "cumulative_tailings_received_t": 0.0,
             "cumulative_tailings_pumped_t": 0.0,
+            "tailings_thickener_copper_inventory_t": 1_100.0 * 0.00075,
+            "cumulative_tailings_copper_received_t": 0.0,
+            "cumulative_tailings_copper_pumped_t": 0.0,
             "rom_feed_tph": 1_180.0, "crusher_feed_tph": 1_080.0, "crushed_ore_tph": 1_030.0,
             "plant_feed_tph": 870.0, "sag_feed_tph": 870.0, "ball_circuit_feed_tph": 1_689.0,
             "cyclone_overflow_tph": 870.0, "tailings_tph": 849.0, "concentrate_tph": 21.0,
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
+            "flotation_cell_copper_inventory_t": flotation_cell_copper_inventory_t,
+            "flotation_copper_inventory_t": sum(flotation_cell_copper_inventory_t),
+            "flotation_copper_product_tph": 870.0 * 0.0062 * 0.88,
+            "cumulative_flotation_copper_feed_t": 0.0,
+            "cumulative_flotation_copper_product_t": 0.0,
+            "cumulative_flotation_copper_tailings_t": 0.0,
             "concentrate_grade_pct": 25.0, "p80_microns": 150.0,
             "grind_coarse_fraction": 0.6327, "grind_intermediate_fraction": 0.3561,
             "grind_fine_fraction": 0.0112, "cyclone_overflow_fraction": 0.5152,
@@ -111,6 +137,14 @@ class CopperConcentrator:
         keys = ("tailings_thickener_capacity_t", "concentrate_thickener_inventory_t",
                     "rom_copper_inventory_t", "crushed_copper_inventory_t",
                     "sag_bin_copper_inventory_t", "mine_block_grade_pct",
+                    "cumulative_mine_copper_received_t",
+                    "flotation_cell_copper_inventory_t", "flotation_copper_inventory_t",
+                    "flotation_copper_product_tph", "cumulative_flotation_copper_feed_t",
+                    "cumulative_flotation_copper_product_t", "cumulative_flotation_copper_tailings_t",
+                    "concentrate_thickener_copper_inventory_t", "filter_press_batch_copper_inventory_t",
+                    "concentrate_cake_copper_inventory_t", "cumulative_concentrate_copper_produced_t",
+                    "cumulative_concentrate_copper_shipped_t", "tailings_thickener_copper_inventory_t",
+                    "cumulative_tailings_copper_received_t", "cumulative_tailings_copper_pumped_t",
                     "concentrate_thickener_capacity_t", "filter_press_phase",
                     "filter_press_cycle_s", "filter_press_batch_t",
                     "filter_press_batch_capacity_t", "filter_press_cycle_count",
@@ -138,8 +172,13 @@ class CopperConcentrator:
                     "cyclone_overflow_fraction", "circulating_load_ratio",
                     "flotation_residence_time_min", "coarse_breakage_per_pass",
                     "intermediate_breakage_per_pass", "grind_model_revision")
+        previous_grind_revision = state.get("grind_model_revision", 0)
+        if (all(key in state for key in keys) and state.get("water_model_revision", 0) >= 3
+                and previous_grind_revision >= 2):
+            return
         history_defaults = {"tailings_thickener_water_inventory_m3": 0.0,
             "copper_feed_grade_pct": 0.62, "mine_block_grade_pct": 0.62,
+            "flotation_copper_inventory_t": 0.9,
             "grind_coarse_fraction": 0.6327, "grind_intermediate_fraction": 0.3561,
             "grind_fine_fraction": 0.0112, "cyclone_overflow_fraction": 0.5152,
             "circulating_load_ratio": 0.9411, "flotation_residence_time_min": 28.3,
@@ -148,18 +187,28 @@ class CopperConcentrator:
             sample.setdefault("tailings_thickener_water_inventory_m3", 0.0)
             sample.setdefault("copper_feed_grade_pct", 0.62)
             sample.setdefault("mine_block_grade_pct", 0.62)
+            sample.setdefault("flotation_copper_inventory_t", 0.9)
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
                         "cyclone_overflow_fraction", "circulating_load_ratio", "flotation_residence_time_min",
                         "coarse_breakage_per_pass", "intermediate_breakage_per_pass"):
                 sample.setdefault(key, history_defaults[key])
-        previous_grind_revision = state.get("grind_model_revision", 0)
-        if (all(key in state for key in keys) and state.get("water_model_revision", 0) >= 3
-                and previous_grind_revision >= 2):
-            return
         previous_water_revision = state.get("water_model_revision", 0)
         defaults = self.initialize()
+        missing = {key for key in keys if key not in state}
         for key in keys:
             state.setdefault(key, defaults[key])
+        legacy_grade_inventory = {
+            "rom_copper_inventory_t": ("rom_stockpile_t", 0.0062),
+            "crushed_copper_inventory_t": ("crushed_stockpile_t", 0.0062),
+            "sag_bin_copper_inventory_t": ("sag_bin_t", 0.0062),
+            "concentrate_thickener_copper_inventory_t": ("concentrate_thickener_inventory_t", 0.25),
+            "filter_press_batch_copper_inventory_t": ("filter_press_batch_t", 0.25),
+            "concentrate_cake_copper_inventory_t": ("concentrate_cake_inventory_t", 0.25),
+            "tailings_thickener_copper_inventory_t": ("tailings_thickener_inventory_t", 0.00075),
+        }
+        for copper_key, (solids_key, grade_fraction) in legacy_grade_inventory.items():
+            if copper_key in missing:
+                state[copper_key] = max(0.0, state.get(solids_key, 0.0)) * grade_fraction
         if previous_grind_revision < 2:
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
                         "cyclone_overflow_fraction", "circulating_load_ratio", "coarse_breakage_per_pass",
@@ -246,6 +295,45 @@ class CopperConcentrator:
         next_feed_fractions = (overflow_fraction + rejects[0], rejects[1], rejects[2])
         return (overflow_fraction, product_fractions, next_feed_fractions,
                 coarse_breakage, intermediate_breakage)
+
+    def _advance_flotation_bank(self, state: dict, feed_solids_tph: float,
+                                feed_grade_fraction: float, kinetic_rate_per_min: float,
+                                dt_h: float) -> tuple[float, float]:
+        """Advance a six-cell copper balance; return concentrate Cu, tail Cu and recovery."""
+        cell_solids_inventory_t = (
+            self.FLOTATION_BANK_VOLUME_M3
+            / (1.0 / 2.7 + state["water_specific_m3_t"])
+            / self.FLOTATION_CELL_COUNT)
+        copper_inventory = state["flotation_cell_copper_inventory_t"]
+        feed_copper_tph = feed_solids_tph * feed_grade_fraction
+        cell_k_per_h = max(0.0, kinetic_rate_per_min) * 60.0
+        downstream_copper_tph = feed_copper_tph
+        product_copper_tph = 0.0
+        next_inventory = []
+        for inventory_t in copper_inventory:
+            tailings_tph = (max(0.0, feed_solids_tph) * inventory_t
+                            / max(cell_solids_inventory_t, 1e-9))
+            froth_tph = cell_k_per_h * inventory_t
+            available_copper_t = inventory_t + downstream_copper_tph * dt_h
+            requested_out_t = (tailings_tph + froth_tph) * dt_h
+            if requested_out_t > available_copper_t and requested_out_t > 0:
+                scale = available_copper_t / requested_out_t
+                tailings_tph *= scale
+                froth_tph *= scale
+                requested_out_t = available_copper_t
+            next_inventory.append(max(0.0, available_copper_t - requested_out_t))
+            product_copper_tph += froth_tph
+            downstream_copper_tph = tailings_tph
+        state["flotation_cell_copper_inventory_t"] = next_inventory
+        state["flotation_copper_inventory_t"] = sum(next_inventory)
+        state["flotation_copper_product_tph"] = product_copper_tph
+        state["cumulative_flotation_copper_feed_t"] += feed_copper_tph * dt_h
+        state["cumulative_flotation_copper_product_t"] += product_copper_tph * dt_h
+        state["cumulative_flotation_copper_tailings_t"] += downstream_copper_tph * dt_h
+        apparent_recovery = (100.0 * product_copper_tph / feed_copper_tph
+                             if feed_copper_tph > 1e-9 else state["copper_recovery_pct"])
+        return (product_copper_tph, downstream_copper_tph,
+                min(100.0, max(0.0, apparent_recovery)))
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
@@ -356,11 +444,6 @@ class CopperConcentrator:
                               if equipment_available.get("flotation", True) else 0.0)
         requested_feed = min(plant_target, sag_capacity, ball_capacity, flotation_capacity)
 
-        # ROM is a surge stockpile, not a reclaim stream that empties on its
-        # own. A severe jam closes the feeder and holds the ore in the pile.
-        rom_discharge = (min(state["rom_stockpile_t"] * 3600.0, crusher_capacity, 1_250.0)
-                         if jam < 0.95 else 0.0)
-        crushed_rate = rom_discharge
         rom_space_t = max(0.0, 45_000.0 - state["rom_stockpile_t"])
         if mine_delivery_t is None:
             rom_feed = scheduled_rom_feed
@@ -380,11 +463,23 @@ class CopperConcentrator:
             state["rom_feed_tph"] = self._smooth(state["rom_feed_tph"], rom_feed, 30)
             state["rom_feed_curtailed_tph"] = (sum(state["rom_curtailed_window_t"])
                                                 * 3_600.0 / max(1, len(state["rom_curtailed_window_t"])))
+        state["cumulative_mine_copper_received_t"] += rom_received * mine_grade_pct / 100.0
         sag_feeder_enabled = (equipment_available.get("sag_mill", True)
                               and equipment_available.get("ball_mill", True))
         sag_feeder_rate = (min(900.0, state["crushed_stockpile_t"] * 3600.0,
                                max(0.0, 900.0 - state["sag_bin_t"]) * 3600.0)
                            if sag_feeder_enabled else 0.0)
+        # The crusher feeds a finite crushed-ore stockpile. When that pile is
+        # full, reclaim into the SAG bin is the only room available for more
+        # crusher product; upstream ROM reclaim must stop at that limit.
+        planned_crushed_rate = min(state["rom_stockpile_t"] * 3600.0,
+                                   crusher_capacity, 1_250.0)
+        crushed_space_t = max(0.0, 8_000.0 - state["crushed_stockpile_t"])
+        crushed_rate = min(planned_crushed_rate,
+                           (crushed_space_t + sag_feeder_rate * dt_h) / dt_h)
+        # ROM is a surge stockpile; a jam or a full crushed-ore pile closes its
+        # feeder so stored ore remains available for orderly restart.
+        rom_discharge = crushed_rate
         sag_available_t = state["sag_bin_t"] + sag_feeder_rate / 3600.0
         sag_rate = min(requested_feed, sag_available_t * 3600.0)
         ball_rate = min(sag_rate / cyclone_overflow_fraction, ball_circuit_capacity)
@@ -448,21 +543,40 @@ class CopperConcentrator:
         reagent_dose_l_t = reagent / max(cyclone_overflow, 1.0)
         reagent_factor = min(1.12, max(0.65, (reagent_dose_l_t / 0.28) ** 0.30))
         kinetic_rate_per_min = 0.10 * size_floatability * air_factor * reagent_factor * state["flotation_condition"]
-        kinetic_recovery = 94.0 * (1.0 - math.exp(-kinetic_rate_per_min * state["flotation_residence_time_min"]))
+        cell_residence_min = state["flotation_residence_time_min"] / self.FLOTATION_CELL_COUNT
+        kinetic_recovery = 100.0 * (1.0 - (1.0 + kinetic_rate_per_min * cell_residence_min) **
+                                    -self.FLOTATION_CELL_COUNT)
+        kinetic_recovery = min(94.0, max(0.0, kinetic_recovery))
         water_recovery_penalty = (1.0 - water_factor) * 17.0
-        recovery = min(94.0, max(0.0,
+        target_recovery = min(94.0, max(0.0,
             kinetic_recovery - water_recovery_penalty - upset * 12.0))
-        concentrate = cyclone_overflow * (state["copper_feed_grade_pct"] / 100.0
-                                           * recovery / 100.0) / 0.25
+        # Reduced air/reagent or upset conditions reduce the first-order
+        # flotation rate; derive that rate from the six-cell bank's target yield.
+        target_cell_recovery = 1.0 - (1.0 - target_recovery / 100.0) ** (
+            1.0 / self.FLOTATION_CELL_COUNT)
+        cell_residence_h = max(state["flotation_residence_time_min"]
+                               / self.FLOTATION_CELL_COUNT / 60.0, 1e-9)
+        adjusted_kinetic_rate_per_min = (
+            target_cell_recovery / max(1.0 - target_cell_recovery, 1e-9)
+            / cell_residence_h / 60.0)
+        recovered_copper_tph, tailings_copper_tph, recovery = self._advance_flotation_bank(
+            state, cyclone_overflow, state["copper_feed_grade_pct"] / 100.0,
+            adjusted_kinetic_rate_per_min, dt_h)
+        state["concentrate_grade_pct"] = min(30.0, max(15.0,
+            25.0 - max(0.0, state["p80_microns"] - 150) * 0.03))
+        concentrate = recovered_copper_tph / max(state["concentrate_grade_pct"] / 100.0, 1e-9)
         tailings = max(0.0, cyclone_overflow - concentrate)
         state["cumulative_concentrate_produced_t"] += concentrate * dt_h
+        state["cumulative_concentrate_copper_produced_t"] += recovered_copper_tph * dt_h
         state["cumulative_tailings_received_t"] += tailings * dt_h
+        state["cumulative_tailings_copper_received_t"] += tailings_copper_tph * dt_h
 
         # Concentrate thickening buffers feed to a cyclic filter press. Filling
         # adds cake, squeezing pauses feed, and cake discharge is a short pulse.
         state["filter_press_feed_tph"] = 0.0
         state["filter_press_cake_tph"] = 0.0
         state["filter_press_filtrate_m3h"] = 0.0
+        press_cake_copper_tph = 0.0
         press_ready = (equipment_available.get("filter_press", True)
                        and equipment_available.get("concentrate_thickener", True))
         if press_ready:
@@ -495,6 +609,14 @@ class CopperConcentrator:
                 cake_rate = min(650.0, state["filter_press_batch_t"] / dt_h,
                                 (cake_room_t / dt_h) + 26.0)
                 state["filter_press_cake_tph"] = cake_rate
+                batch_grade_fraction = (state["filter_press_batch_copper_inventory_t"]
+                                        / max(state["filter_press_batch_t"], 1e-9))
+                press_cake_copper_tph = min(
+                    cake_rate * batch_grade_fraction,
+                    state["filter_press_batch_copper_inventory_t"] / dt_h)
+                state["filter_press_batch_copper_inventory_t"] = max(
+                    0.0, state["filter_press_batch_copper_inventory_t"]
+                    - press_cake_copper_tph * dt_h)
                 state["filter_press_batch_t"] = max(0.0,
                     state["filter_press_batch_t"] - cake_rate * dt_h)
                 if state["filter_press_batch_t"] <= 1e-9:
@@ -510,15 +632,37 @@ class CopperConcentrator:
         cake_retained_water_m3h = press_feed * (1.0 / 0.85 - 1.0)
         state["filter_press_batch_filtrate_inventory_m3"] += max(
             0.0, press_feed_water_m3h - cake_retained_water_m3h) * dt_h
+        concentrate_tank_solids_before = state["concentrate_thickener_inventory_t"]
+        concentrate_tank_copper_before = state["concentrate_thickener_copper_inventory_t"]
+        concentrate_tank_grade = (
+            (concentrate_tank_copper_before + recovered_copper_tph * dt_h)
+            / max(concentrate_tank_solids_before + concentrate * dt_h, 1e-9))
+        press_feed_copper_tph = press_feed * concentrate_tank_grade
+        state["concentrate_thickener_copper_inventory_t"] = max(
+            0.0, concentrate_tank_copper_before
+            + recovered_copper_tph * dt_h - press_feed_copper_tph * dt_h)
+        state["filter_press_batch_copper_inventory_t"] = max(
+            0.0, state["filter_press_batch_copper_inventory_t"]
+            + press_feed_copper_tph * dt_h)
         state["concentrate_thickener_inventory_t"] = min(concentrate_capacity_t, max(0.0,
             state["concentrate_thickener_inventory_t"] + (concentrate - press_feed) * dt_h))
         concentrate_shipped = min(26.0,
             (state["concentrate_cake_inventory_t"] + state["filter_press_cake_tph"] * dt_h) / dt_h)
         state["concentrate_shipped_tph"] = concentrate_shipped
+        cake_solids_before_shipping = (state["concentrate_cake_inventory_t"]
+                                       + state["filter_press_cake_tph"] * dt_h)
+        cake_copper_before_shipping = (state["concentrate_cake_copper_inventory_t"]
+                                       + press_cake_copper_tph * dt_h)
+        shipped_copper_t = min(cake_copper_before_shipping,
+                               concentrate_shipped * dt_h * cake_copper_before_shipping
+                               / max(cake_solids_before_shipping, 1e-9))
+        state["concentrate_cake_copper_inventory_t"] = max(
+            0.0, cake_copper_before_shipping - shipped_copper_t)
         state["concentrate_cake_inventory_t"] = min(state["concentrate_cake_capacity_t"], max(0.0,
             state["concentrate_cake_inventory_t"]
             + (state["filter_press_cake_tph"] - concentrate_shipped) * dt_h))
         state["cumulative_concentrate_shipped_t"] += concentrate_shipped * dt_h
+        state["cumulative_concentrate_copper_shipped_t"] += shipped_copper_t
 
         # Tailings are a separate solids stream. A stopped thickener/pump train
         # fills its finite inventory, which eventually backpressures flotation.
@@ -530,6 +674,17 @@ class CopperConcentrator:
         tailings_pumped = min(tailings_pump_capacity, tailings_pump_request,
                               pumpable_tailings_t / dt_h)
         state["tailings_thickener_feed_tph"] = tailings
+        tailings_solids_before = state["tailings_thickener_inventory_t"]
+        tailings_copper_before = state["tailings_thickener_copper_inventory_t"]
+        tailings_solids_available = tailings_solids_before + tailings * dt_h
+        tailings_copper_available = tailings_copper_before + tailings_copper_tph * dt_h
+        tailings_grade_fraction = (tailings_copper_available
+                                   / max(tailings_solids_available, 1e-9))
+        pumped_copper_t = min(tailings_copper_available,
+                              tailings_pumped * dt_h * tailings_grade_fraction)
+        state["tailings_thickener_copper_inventory_t"] = max(
+            0.0, tailings_copper_available - pumped_copper_t)
+        state["cumulative_tailings_copper_pumped_t"] += pumped_copper_t
         state["tailings_thickener_inventory_t"] = min(tailings_capacity_t, max(0.0,
             state["tailings_thickener_inventory_t"] + (tailings - tailings_pumped) * dt_h))
         state["cumulative_tailings_pumped_t"] += tailings_pumped * dt_h
@@ -543,8 +698,6 @@ class CopperConcentrator:
         state["tailings_tph"] = self._smooth(state["tailings_tph"], tailings_pumped, 60)
         state["concentrate_tph"] = self._smooth(state["concentrate_tph"], concentrate, 120)
         state["copper_recovery_pct"] = self._smooth(state["copper_recovery_pct"], recovery, 180)
-        state["concentrate_grade_pct"] = min(30.0, max(15.0, 25.0 - max(0.0, state["p80_microns"] - 150) * 0.03))
-
         sag_power = min(sag_power_cap, sag_rate * state["ore_hardness_kwh_t"] * 1.04 / 1_000)
         ball_power = min(ball_power_cap, ball_rate * self.BALL_SPECIFIC_ENERGY_KWH_T
                          * state["ore_hardness_factor"] / 1_000)
@@ -636,6 +789,7 @@ class CopperConcentrator:
                 "copper_feed_grade_pct": state["copper_feed_grade_pct"],
                 "mine_block_grade_pct": state["mine_block_grade_pct"],
                 "copper_recovery_pct": state["copper_recovery_pct"], "p80_microns": state["p80_microns"],
+                "flotation_copper_inventory_t": state["flotation_copper_inventory_t"],
                 "tailings_thickener_inventory_t": state["tailings_thickener_inventory_t"],
                 "tailings_thickener_water_inventory_m3": state["tailings_thickener_water_inventory_m3"],
                 "grind_coarse_fraction": state["grind_coarse_fraction"],
@@ -701,6 +855,8 @@ class CopperConcentrator:
                 "Flotation cells": {"ore_rate": (state["plant_feed_tph"], "t/h", 0, 2_000),
                     "feed_grade": (state["copper_feed_grade_pct"], "% Cu", 0.2, 1.2),
                     "copper_recovery": (state["copper_recovery_pct"], "%", 0, 100),
+                    "copper_inventory": (state["flotation_copper_inventory_t"], "t Cu", 0, 10),
+                    "copper_product_rate": (state["flotation_copper_product_tph"], "t Cu/h", 0, 25),
                     "concentrate_grade": (state["concentrate_grade_pct"], "%", 0, 40),
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),
                     "air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),
@@ -711,6 +867,7 @@ class CopperConcentrator:
             "Concentrate handling": {
                 "Concentrate thickener": {
                     "feed_rate": (state["concentrate_tph"], "t/h", 0, 100),
+                    "copper_inventory": (state["concentrate_thickener_copper_inventory_t"], "t Cu", 0, 40),
                     "tank_level": (8 + state["concentrate_thickener_inventory_t"]
                                    / state["concentrate_thickener_capacity_t"] * 84, "%", 0, 100),
                     "underflow_rate": (state["filter_press_feed_tph"], "t/h", 0, 60),
@@ -721,12 +878,16 @@ class CopperConcentrator:
                     "feed_rate": (state["filter_press_feed_tph"], "t/h", 0, 60),
                     "cake_rate": (state["filter_press_cake_tph"], "t/h", 0, 700),
                     "cake_stockpile": (state["concentrate_cake_inventory_t"], "t", 0, 500),
+                    "cake_copper_inventory": (state["concentrate_cake_copper_inventory_t"], "t Cu", 0, 125),
                     "cake_moisture": (9.0 + (1 - state["concentrate_condition"]) * 12, "%", 0, 40),
                     "cycle_count": (float(state["filter_press_cycle_count"]), "cycles", 0, 100_000),
                     "equipment_running": (state["filter_press_motor_running"], "bool", 0, 1)},
             },
             "Tailings and reclaim": {
                 "Tailings thickener": {"feed_rate": (state["tailings_thickener_feed_tph"], "t/h", 0, 2_000),
+                    "copper_inventory": (state["tailings_thickener_copper_inventory_t"], "t Cu", 0, 25),
+                    "copper_grade": (100.0 * state["tailings_thickener_copper_inventory_t"]
+                                     / max(state["tailings_thickener_inventory_t"], 1e-9), "% Cu", 0, 2),
                     "tank_level": (state["tailings_thickener_inventory_t"]
                                    / state["tailings_thickener_capacity_t"] * 100, "%", 0, 100),
                     "water_inventory": (state["tailings_thickener_water_inventory_m3"], "m³", 0,
