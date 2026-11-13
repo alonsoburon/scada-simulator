@@ -136,6 +136,21 @@ SCENARIOS = {
             "The biased reading remains GOOD; after the fault expires, normal source flow returns first and the tank inventory recovers only after the transport delay.",
         ),
     ),
+    "site-buildings-hvac-outage-and-recovery": ScenarioDefinition(
+        scenario_id="site-buildings-hvac-outage-and-recovery",
+        name="Site-building HVAC outage and recovery",
+        description="A building-feeder outage stops local HVAC and ventilation; different thermal masses, occupancy schedules, and room uses produce distinct temperature, humidity, and CO₂ responses before staggered recovery.",
+        duration_seconds=21_600,
+        steps=(ScenarioStep(600, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                                "target_area": "Site buildings",
+                                                "duration_seconds": 3_600}),),
+        expected_observations=(
+            "HVAC compressors and ventilation fans lose building power; room temperature responds according to envelope loss, thermal mass, solar gain, and door openings.",
+            "Occupancy schedules and reduced outdoor-air flow cause CO₂ and humidity to evolve differently in the control room, workshop, laboratory, and offices.",
+            "The building power submeter drops during the outage and contributes less demand to the mine site auxiliary load.",
+            "When power returns, compressors wait through a restart delay and spaces recover at different rates; filter loading and differential pressure persist.",
+        ),
+    ),
     "boiler-header-pressure-and-recovery": ScenarioDefinition(
         scenario_id="boiler-header-pressure-and-recovery",
         name="Boiler trip, steam header depletion, and recovery",

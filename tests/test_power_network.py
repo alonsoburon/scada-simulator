@@ -41,6 +41,19 @@ class MinePowerNetworkTests(unittest.TestCase):
                                self.state["served_load_mw"] + self.state["distribution_losses_mw"],
                                places=6)
 
+    def test_building_hvac_load_is_submetered_into_site_demand(self):
+        baseline = self.model.initialize()
+        with_buildings = self.model.initialize()
+        for state, building_load in ((baseline, 0.0), (with_buildings, 0.4)):
+            self.model.advance(state, 1, [], process_load_mw=28.0, water_load_mw=0.5,
+                               site_building_load_mw=building_load,
+                               site_nonbuilding_request_mw=5.6, seed=17)
+
+        self.assertAlmostEqual(baseline["requested_load_mw"], 34.1, places=6)
+        self.assertAlmostEqual(with_buildings["requested_load_mw"], 34.5, places=6)
+        self.assertAlmostEqual(with_buildings["site_building_load_mw"], 0.4)
+        self.assertAlmostEqual(with_buildings["site_load_mw"], 6.0, places=6)
+
     def test_initial_dispatch_can_supply_a_stopped_dashboard_snapshot(self):
         for key in ("factory_utilities_requested_mw", "factory_utilities_load_mw",
                     "factory_utilities_power_fraction"):

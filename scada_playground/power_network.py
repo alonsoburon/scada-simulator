@@ -93,6 +93,8 @@ class MinePowerNetwork:
             "battery_discharge_limit_mw": 6.0, "battery_charge_limit_mw": 3.0,
             "grid_import_mw": 0.0, "total_generation_mw": 0.0,
             "site_load_mw": 6.0, "water_load_mw": 0.5,
+            "site_building_load_mw": 0.0, "site_nonbuilding_request_mw": 6.0,
+            "site_flexible_power_fraction": 1.0,
             "process_load_mw": 28.0, "requested_load_mw": 34.5,
             "served_load_mw": 34.5, "load_shed_mw": 0.0,
             "process_power_fraction": 1.0, "water_power_fraction": 1.0,
@@ -199,6 +201,8 @@ class MinePowerNetwork:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float,
                 utility_load_mw: float = 0.0, motor_starting_load_mw: float = 0.0,
+                site_building_load_mw: float = 0.0,
+                site_nonbuilding_request_mw: float = 6.0,
                 seed: int = 17) -> None:
         """Dispatch sources and allocate power to site, water, and process loads."""
         initial_state = self.initialize()
@@ -216,9 +220,14 @@ class MinePowerNetwork:
         state.setdefault("factory_utilities_power_fraction", 1.0)
         state.setdefault("factory_utilities_requested_mw", 0.0)
         state.setdefault("factory_utilities_load_mw", 0.0)
+        state.setdefault("site_flexible_power_fraction", 1.0)
         for name, initial in initial_state["transformers"].items():
             state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
+        site_building_load_mw = max(0.0, site_building_load_mw)
+        site_request = max(0.0, site_nonbuilding_request_mw) + site_building_load_mw
+        state["site_building_load_mw"] = site_building_load_mw
+        state["site_nonbuilding_request_mw"] = max(0.0, site_nonbuilding_request_mw)
         state.setdefault("ufls_stage", 0)
         state.setdefault("ufls_restore_timer_s", 0)
         state.setdefault("ufls_pickup_timer_s", 0.0)
@@ -294,7 +303,6 @@ class MinePowerNetwork:
         process_request = max(0.0, process_load_mw) + motor_starting_load_mw
         water_request = max(0.0, water_load_mw)
         utility_request = max(0.0, utility_load_mw)
-        site_request = 6.0
         available_site_request = site_request * site_factor
         available_water_request = water_request * water_factor
         available_utility_request = utility_request * utility_factor
@@ -363,7 +371,8 @@ class MinePowerNetwork:
         available = max(0.0, available - served_utility)
         served_process = min(process_dispatch_request * process_factor, feeder_headroom, available)
         available = max(0.0, available - served_process)
-        served_flexible_site = min(3.0 * site_factor, available)
+        site_flexible_request = max(0.0, available_site_request - 3.0 * site_factor)
+        served_flexible_site = min(site_flexible_request, available)
         served_site = served_critical_site + served_flexible_site
         state["process_requested_mw"] = process_request
         state["water_requested_mw"] = water_request
@@ -372,6 +381,9 @@ class MinePowerNetwork:
         state["process_load_mw"] = served_process
         state["water_load_mw"] = served_water
         state["site_load_mw"] = served_site
+        state["site_flexible_power_fraction"] = (
+            min(1.0, served_flexible_site / site_flexible_request)
+            if site_flexible_request > 1e-9 else 1.0)
         state["requested_load_mw"] = total_load_request
         state["source_requested_mw"] = source_request
         state["served_load_mw"] = served_site + served_water + served_utility + served_process
@@ -493,11 +505,15 @@ class MinePowerNetwork:
         served_process = min(state["process_after_ufls_mw"] * process_factor,
                              feeder_headroom, available)
         available = max(0.0, available - served_process)
-        served_flexible_site = min(3.0 * site_factor, available)
+        site_flexible_request = max(0.0, available_site_request - 3.0 * site_factor)
+        served_flexible_site = min(site_flexible_request, available)
         served_site = served_critical_site + served_flexible_site
         state["factory_utilities_load_mw"] = served_utility
         state["water_load_mw"] = served_water
         state["site_load_mw"] = served_site
+        state["site_flexible_power_fraction"] = (
+            min(1.0, served_flexible_site / site_flexible_request)
+            if site_flexible_request > 1e-9 else 1.0)
         state["load_shed_mw"] = max(0.0, site_request - served_site)
         state["process_load_mw"] = served_process
         state["served_load_mw"] = served_site + served_water + served_utility + served_process

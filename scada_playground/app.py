@@ -26,6 +26,7 @@ from haulage import HaulTruckFleet
 from power_network import MinePowerNetwork
 from plant_controller import PlantController
 from plant_utilities import FactoryUtilities
+from site_buildings import SiteBuildings
 
 
 AREAS = {
@@ -183,6 +184,7 @@ HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 POWER_MODEL = MinePowerNetwork()
 UTILITY_MODEL = FactoryUtilities()
 PLANT_CONTROLLER = PlantController()
+BUILDING_MODEL = SiteBuildings()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -229,11 +231,14 @@ def initialize(seed: int = 17) -> None:
         haulage_state = HAULAGE_MODEL.initialize()
         utility_state = UTILITY_MODEL.initialize()
         UTILITY_MODEL.advance(utility_state, 0, [], seed=seed)
+        buildings_state = BUILDING_MODEL.initialize()
+        BUILDING_MODEL.advance(buildings_state, 0, [], seed=seed)
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
+        modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
         for tag in modeled_tags:
@@ -255,7 +260,9 @@ def initialize(seed: int = 17) -> None:
         initial_water_power_mw = water_state["electrical_load_kw"] / 1000.0
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
-                            utility_load_mw=utility_state["electric_load_mw"], seed=seed)
+                            utility_load_mw=utility_state["electric_load_mw"],
+                            site_building_load_mw=buildings_state["electric_load_mw"],
+                            site_nonbuilding_request_mw=5.6, seed=seed)
         power_tags = POWER_MODEL.telemetry(power_state)
         power_assets = {(area, asset) for area, assets in POWER_MODEL.AREA_ASSETS.items() for asset in assets}
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in power_assets]
@@ -266,15 +273,18 @@ def initialize(seed: int = 17) -> None:
                           for asset in assets}
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in utility_assets]
         tags.extend(UTILITY_MODEL.telemetry(utility_state, seed))
+        tags.extend(BUILDING_MODEL.telemetry(buildings_state, seed))
         st.session_state.sim = {"tags": tags, "running": False, "tick": 0, "seed": seed,
                                 "water_network": water_state,
                                 "power_network": power_state,
                                 "plant_utilities": utility_state,
+                                "site_buildings": buildings_state,
                                 "concentrator": concentrator_state,
                                 "process_control": process_control_state,
                                 "haulage": haulage_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
+                                "building_alarm_states": {},
                                 "concentrator_alarm_states": {},
                                 "haulage_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
@@ -298,11 +308,16 @@ def initialize(seed: int = 17) -> None:
         if "plant_utilities" not in sim:
             sim["plant_utilities"] = UTILITY_MODEL.initialize()
         UTILITY_MODEL.migrate(sim["plant_utilities"])
+        if "site_buildings" not in sim:
+            sim["site_buildings"] = BUILDING_MODEL.initialize()
+            BUILDING_MODEL.advance(sim["site_buildings"], sim.get("tick", 0), [], seed=sim["seed"])
+        BUILDING_MODEL.migrate(sim["site_buildings"])
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
                               ("Shovel dispatch", "Crusher tip dispatch", "ROM dispatch"))
+        modeled_assets.update(("Site buildings", asset) for asset in BUILDING_MODEL.ASSETS)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
         for tag in modeled_tags:
@@ -333,6 +348,8 @@ def initialize(seed: int = 17) -> None:
             POWER_MODEL.advance(sim["power_network"], sim["tick"], [], process_load_mw=process_load_mw,
                                 water_load_mw=water_load_mw,
                                 utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                                site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
+                                site_nonbuilding_request_mw=5.6,
                                 seed=sim["seed"])
         utility_power_demand = sim["plant_utilities"]["electric_load_mw"]
         sim["power_network"].setdefault("factory_utilities_requested_mw", utility_power_demand)
@@ -348,6 +365,8 @@ def initialize(seed: int = 17) -> None:
         sim["tags"] = [tag for tag in sim["tags"]
                        if (tag["area"], tag["unit"]) not in utility_assets]
         sim["tags"].extend(UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"]))
+        building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
+        sim["tags"].extend(building_tags)
 
 
 def publish_snapshot() -> dict:
@@ -358,12 +377,14 @@ def publish_snapshot() -> dict:
     concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
+    building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
     haulage_tags = HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
     haulage_frames = {frame["unit"]: frame for frame in HAULAGE_MODEL.positions(sim["haulage"])}
     concentrator_by_tag = {tag["tag"]: tag for tag in concentrator_tags + haulage_tags}
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
+    building_by_tag = {tag["tag"]: tag for tag in building_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
@@ -371,6 +392,8 @@ def publish_snapshot() -> dict:
             tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in utility_by_tag:
             tag.update(utility_by_tag[tag["tag"]])
+        elif tag["tag"] in building_by_tag:
+            tag.update(building_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     PROCESS_MODEL.apply_instrument_faults(sim["tags"], sim["events"], sim["tick"])
@@ -395,6 +418,7 @@ def publish_snapshot() -> dict:
         "water_network": water_diagram[0],
         "power_network": {key: value for key, value in sim["power_network"].items() if key != "history"},
         "plant_utilities": {key: value for key, value in sim["plant_utilities"].items() if key != "history"},
+        "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
         "haulage": HAULAGE_MODEL.summary(sim["haulage"]),
@@ -627,8 +651,35 @@ def advance(force: bool = False) -> None:
                         process_load_mw=process_power_load_mw,
                         water_load_mw=water_power_load_mw,
                         utility_load_mw=sim["plant_utilities"]["electric_load_mw"],
+                        site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
+                        site_nonbuilding_request_mw=5.6,
                         motor_starting_load_mw=sim["process_control"]["motor_starting_load_mw"],
                         seed=sim["seed"])
+    BUILDING_MODEL.advance(
+        sim["site_buildings"], sim["tick"], utility_events, seed=sim["seed"],
+        power_available_fraction=sim["power_network"]["site_flexible_power_fraction"])
+    building_alarm_states = sim.setdefault("building_alarm_states", {})
+    for name, zone in sim["site_buildings"]["zones"].items():
+        slug = name.lower().replace(" ", "_")
+        conditions = (
+            ("temperature", zone["temperature_c"] > 32.0 or zone["temperature_c"] < 8.0,
+             28.0 >= zone["temperature_c"] >= 12.0,
+             f"{name} room temperature outside the operating band"),
+            ("co2", zone["co2_ppm"] > 1_500.0, zone["co2_ppm"] < 1_200.0,
+             f"{name} indoor CO₂ is high; inspect occupancy and ventilation"),
+            ("filter_dp", zone["filter_dp_pa"] > 500.0, zone["filter_dp_pa"] < 420.0,
+             f"{name} HVAC filter differential pressure is high"),
+        )
+        for condition, active, cleared, message in conditions:
+            key = f"{slug}_{condition}"
+            if active and not building_alarm_states.get(key, False):
+                sim["alarms"].insert(0, {"time": sim["tick"], "area": "Site buildings",
+                    "severity": "HIGH", "message": message, "state": "ACTIVE / UNACK"})
+                building_alarm_states[key] = True
+            elif building_alarm_states.get(key, False) and cleared:
+                sim["alarms"].insert(0, {"time": sim["tick"], "area": "Site buildings",
+                    "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+                building_alarm_states[key] = False
     # The concentrator PLC sees the last scanned tank transmitter value, not
     # the water model's hidden process truth. This lets instrument drift affect
     # ordinary startup permissives just as it affects the tank-level PI loop.
@@ -885,9 +936,11 @@ def advance(force: bool = False) -> None:
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
+    building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
+    building_by_tag = {tag["tag"]: tag for tag in building_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
                            + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
@@ -898,6 +951,8 @@ def advance(force: bool = False) -> None:
             tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in utility_by_tag:
             tag.update(utility_by_tag[tag["tag"]])
+        elif tag["tag"] in building_by_tag:
+            tag.update(building_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     if sim["tick"] % 15 == 0:
@@ -1411,8 +1466,20 @@ def render_dashboard():
         st.dataframe(fleet[~fleet.sensor.str.startswith("gps_")][["tag", "value", "units", "quality", "last_change"]],
                      hide_index=True, width="stretch")
         st.subheader("Building and site telemetry")
-        buildings = tags_df[tags_df.area == "Site buildings"]
-        st.dataframe(buildings[["tag", "value", "units", "quality", "last_change"]], hide_index=True, width="stretch")
+        building_state = sim["site_buildings"]
+        zones = building_state["zones"]
+        building_cols = st.columns(4)
+        building_cols[0].metric("Outdoor", f"{building_state['ambient_temperature_c']:.1f} °C")
+        building_cols[1].metric("Mean indoor", f"{sum(z['temperature_c'] for z in zones.values()) / len(zones):.1f} °C")
+        building_cols[2].metric("Peak CO₂", f"{max(z['co2_ppm'] for z in zones.values()):.0f} ppm")
+        building_cols[3].metric("HVAC load", f"{building_state['electric_load_mw'] * 1_000:.0f} kW")
+        building_rows = [{"Building": name, "Temperature (°C)": round(zone["temperature_c"], 1),
+                          "Humidity (%RH)": round(zone["humidity_pct"], 1),
+                          "CO₂ (ppm)": round(zone["co2_ppm"]), "People": round(zone["occupancy_count"]),
+                          "HVAC": zone["hvac_state"], "Filter ΔP (Pa)": round(zone["filter_dp_pa"]),
+                          "Power (kW)": round(zone["electric_power_kw"], 1)}
+                         for name, zone in zones.items()]
+        st.dataframe(pd.DataFrame(building_rows), hide_index=True, width="stretch")
     with tabs[5]:
         q1, q2, q3 = st.columns(3)
         area_filter = q1.selectbox("Area filter", ["All", *AREAS.keys()])

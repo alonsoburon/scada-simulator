@@ -241,6 +241,17 @@ def get_power_network_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_site_buildings_state() -> dict[str, Any]:
+    """Read building temperatures, humidity, CO₂, HVAC modes, filter loading, and power."""
+    data = snapshot()
+    buildings = data.get("site_buildings")
+    if not buildings:
+        raise RuntimeError("Site building model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **buildings}
+
+
+@mcp.tool()
 def get_plant_utilities_state() -> dict[str, Any]:
     """Read steam generation/header pressure and compressed-air storage state."""
     data = snapshot()

@@ -53,6 +53,12 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("stored volume" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_building_hvac_scenario_includes_thermal_and_air_quality_recovery(self):
+        definition = ScenarioRunner().definition("site-buildings-hvac-outage-and-recovery")
+        self.assertEqual(definition.steps[0].parameters["target_area"], "Site buildings")
+        self.assertEqual(definition.steps[0].parameters["incident_name"], "Utility loss")
+        self.assertTrue(any("CO₂" in note for note in definition.expected_observations))
+
     def test_mine_grid_support_scenario_has_reserve_and_recovery_evidence(self):
         runner = ScenarioRunner()
         definition = runner.definition("mine-grid-support-and-recovery")
