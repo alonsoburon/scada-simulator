@@ -307,7 +307,8 @@ def initialize(seed: int = 17) -> None:
         sim["water_network"]["concentrator_reclaim_m3h"] = sim["concentrator"]["concentrator_reclaim_m3h"]
         sim["water_network"]["concentrator_recovery_pct"] = sim["concentrator"]["water_recovery_pct"]
         sim["water_network"]["demand_m3h"] = (sim["water_network"]["base_demand_m3h"]
-                                                + sim["water_network"]["concentrator_demand_m3h"])
+                                                + sim["water_network"]["concentrator_demand_m3h"]
+                                                + sim["water_network"].get("factory_cip_demand_m3h", 0.0))
         sim["tags"] = [tag for tag in sim["tags"]
                        if not tag["tag"].startswith("water_supply_network.")]
         water_tags, _water_diagram = WATER_MODEL.telemetry(sim["water_network"])
@@ -437,6 +438,11 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
                 voltage_pu=power["voltage_pu"], frequency_hz=power["frequency_hz"])
         else:
             PLANT_CONTROLLER.request(control, process_action)
+    elif step.action == "cip_start":
+        started = UTILITY_MODEL.CIP_MODEL.start(
+            sim["plant_utilities"]["cip"], params.get("target_unit", "pasteurizer_01"), sim["tick"])
+        if not started:
+            raise RuntimeError(sim["plant_utilities"]["cip"]["start_block_reason"])
     else:
         raise ValueError(f"Scenario action is not supported: {step.action}")
 
@@ -513,6 +519,12 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                     message = f"Reset {len(cleared)} latched process trip(s); inspect and request START manually."
                 else:
                     raise ValueError("process_action must be START, STOP, or RESET_TRIPS")
+            elif action == "start_cip":
+                cip = sim["plant_utilities"]["cip"]
+                target_unit = command.get("target_unit", "pasteurizer_01")
+                if not UTILITY_MODEL.CIP_MODEL.start(cip, target_unit, sim["tick"]):
+                    raise ValueError(cip["start_block_reason"])
+                message = f"CIP cleaning started for {target_unit}."
             elif action == "inject_protocol_fault":
                 fault = PROTOCOL_FAULTS.add(
                     sim, command.get("protocol", ""), command.get("mode", ""),
@@ -555,9 +567,11 @@ def advance(force: bool = False) -> None:
     SCENARIO_RUNNER.before_tick(sim, apply_scenario_action)
     PROCESS_MODEL.advance(sim, force=force)
     utility_events = [event.__dict__ for event in sim["events"]]
+    prior_factory_water_availability = sim["water_network"].get("factory_water_available_fraction", 1.0)
     UTILITY_MODEL.advance(
         sim["plant_utilities"], sim["tick"], utility_events,
         power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
+        water_available_fraction=prior_factory_water_availability,
         seed=sim["seed"],
     )
     water_events = [event.__dict__ for event in sim["events"]
@@ -587,16 +601,18 @@ def advance(force: bool = False) -> None:
     equipment_available = PLANT_CONTROLLER.availability(sim["process_control"])
     mine_delivery_t = HAULAGE_MODEL.advance(sim["haulage"], sim["tick"], concentrator_events,
                                              sim["concentrator"]["rom_stockpile_t"])
-    prior_water_shortage = sim["water_network"].get("unmet_demand_m3h", 0.0)
-    concentrator_share = sim["concentrator"].get("gross_process_water_m3h", 0.0) / max(sim["water_network"].get("demand_m3h", 1), 1)
+    prior_water_shortage = sim["water_network"].get("concentrator_unmet_m3h",
+                                                      sim["water_network"].get("unmet_demand_m3h", 0.0))
     CONCENTRATOR_MODEL.advance(sim["concentrator"], sim["tick"], concentrator_events,
-                               water_shortage_m3h=prior_water_shortage * min(1.0, concentrator_share),
+                               water_shortage_m3h=prior_water_shortage,
                                seed=sim["seed"], mine_delivery_t=mine_delivery_t,
                                power_available_fraction=sim["power_network"]["process_power_fraction"],
                                equipment_available=equipment_available)
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
                         concentrator_demand_m3h=sim["concentrator"]["gross_process_water_m3h"],
                         concentrator_reclaim_m3h=sim["concentrator"]["concentrator_reclaim_m3h"],
+                        factory_cip_demand_m3h=sim["plant_utilities"]["cip_water_demand_m3h"],
+                        factory_cip_effluent_m3h=sim["plant_utilities"]["cip_effluent_m3h"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
     water = sim["water_network"]
     conditions = {
@@ -735,6 +751,14 @@ def advance(force: bool = False) -> None:
             utilities["product_tank_inventory_units"] > UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS * 0.9,
             utilities["product_tank_inventory_units"] < UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS * 0.7,
             "Pasteurized-product tank nearing capacity", "MEDIUM"),
+        "cip_water_starved": ("CIP", utilities["cip"]["active"]
+            and utilities["cip"]["water_starved_seconds"] >= 30,
+            not utilities["cip"]["active"] or utilities["cip"]["water_starved_seconds"] < 5,
+            "CIP phase paused because process water supply is insufficient", "HIGH"),
+        "cip_chemical_low": ("CIP",
+            utilities["cip"]["caustic_inventory_l"] < 80 or utilities["cip"]["sanitizer_inventory_l"] < 50,
+            utilities["cip"]["caustic_inventory_l"] > 100 and utilities["cip"]["sanitizer_inventory_l"] > 70,
+            "CIP chemical inventory low; a complete cleaning cycle may be unavailable", "MEDIUM"),
     }
     for key, (area, active, cleared, message, severity) in utility_conditions.items():
         was_active = utility_alarm_states.get(key, False)
@@ -1266,7 +1290,7 @@ def render_dashboard():
     with tabs[9]:
         utilities = sim["plant_utilities"]
         st.subheader("Factory utilities · steam and instrument air")
-        st.caption("Boilers feed a finite steam header and delayed condensate return; compressors feed a finite receiver and ring main. Pressure changes propagate into pasteurizer temperature and packaging rates with separate process lag.")
+        st.caption("Boilers feed a finite steam header and delayed condensate return; compressors feed a finite receiver and ring main. Pressure changes propagate into pasteurizer temperature and packaging rates with separate process lag. CIP sequences water, caustic, heated sanitation and release steps; water and steam scarcity hold cleaning phases and temporarily remove the selected pasteurizer from production.")
         utility_metrics = st.columns(6)
         for col, label, value in zip(utility_metrics,
             ["Steam header", "Steam service", "Boiler output", "Instrument air", "Air service", "Compressor power"],
@@ -1279,6 +1303,19 @@ def render_dashboard():
             col.metric(label, value)
         st.caption(f"Air supply/demand {utilities['air_supply_nm3_min']:.1f}/{utilities['air_demand_nm3_min']:.1f} Nm³/min · dryer dew point {utilities['dryer_dew_point_c']:.1f} °C · condensate return {utilities['condensate_return_tph']:.1f} t/h · feedwater makeup {utilities['feedwater_makeup_tph']:.1f} t/h")
         st.caption(f"Product balance tank {utilities['product_tank_inventory_units']:.0f}/{UTILITY_MODEL.PRODUCT_TANK_CAPACITY_UNITS:.0f} units · filling accumulation {utilities['filling_buffer_inventory_units']:.0f}/{UTILITY_MODEL.PACKAGE_BUFFER_CAPACITY_UNITS:.0f} units · approved line rate {utilities['packer_rate_cases_min']:.1f} cases/min · finished cases {utilities['finished_cases_total']:.0f}")
+        cip = utilities["cip"]
+        cip_status = (f"CLEANING {cip['target_unit'].replace('_', ' ').title()} · {cip['phase']} · {cip['phase_progress_pct']:.0f}%"
+                      if cip["active"] else "IDLE · available")
+        st.caption(f"CIP status: {cip_status} · return {cip['return_ph']:.1f} pH / {cip['return_conductivity_us_cm']:.0f} µS/cm · cycle count {cip['cycles_completed']} · CIP water {utilities['cip_water_demand_m3h']:.1f} m³/h · wastewater {utilities['cip_effluent_m3h']:.1f} m³/h")
+        cip_columns = st.columns(3)
+        cip_target = cip_columns[0].selectbox("Pasteurizer to clean", ["pasteurizer_01", "pasteurizer_02"],
+                                               format_func=lambda unit: unit.replace("_", " ").title(), key="cip_target_unit")
+        if cip_columns[1].button("Start CIP cycle", disabled=cip["active"], key="start_cip_cycle"):
+            if UTILITY_MODEL.CIP_MODEL.start(cip, cip_target, sim["tick"]):
+                st.rerun(scope="fragment")
+            else:
+                st.warning(cip["start_block_reason"])
+        cip_columns[2].metric("CIP heat", f"{cip['temperature_c']:.1f} °C")
         equipment_rows = [
             {"Equipment": "Boiler 01", "Output": f"{utilities['boilers']['boiler_01']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_01']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_01']['vibration_mm_s']:.1f} mm/s"},
             {"Equipment": "Boiler 02", "Output": f"{utilities['boilers']['boiler_02']['output_tph']:.1f} t/h", "Availability": f"{utilities['boilers']['boiler_02']['availability']*100:.0f}%", "Condition": f"{utilities['boilers']['boiler_02']['vibration_mm_s']:.1f} mm/s"},

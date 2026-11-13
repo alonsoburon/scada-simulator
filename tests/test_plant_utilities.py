@@ -22,6 +22,13 @@ class FactoryUtilitiesTests(unittest.TestCase):
         self.assertAlmostEqual(self.state["filler_rate_units_min"], 180.0)
         self.assertAlmostEqual(self.state["packer_rate_cases_min"], 60.0)
 
+    def test_initial_snapshot_has_complete_utility_and_cip_telemetry(self):
+        rows = self.model.telemetry(self.state, seed=17)
+        identifiers = {row["tag"] for row in rows}
+        self.assertIn("cip.cip_tank_a.temperature", identifiers)
+        self.assertIn("cip.cip_supply.water_flow", identifiers)
+        self.assertIn("wastewater.effluent_monitor.effluent_flow", identifiers)
+
     def test_steam_header_buffers_a_boiler_loss_and_temperature_recovers_later(self):
         outage = [{"name": "Utility loss", "area": "Boiler house", "severity": "Large"}]
         self.advance(1, 600)

@@ -149,6 +149,22 @@ SCENARIOS = {
             "After the jam clears, the packer ramps up and drains buffers before the line returns to steady output.",
         ),
     ),
+    "cip-water-steam-and-production-recovery": ScenarioDefinition(
+        scenario_id="cip-water-steam-and-production-recovery",
+        name="CIP water and steam demand with production recovery",
+        description="A pasteurizer enters a seven-stage clean-in-place cycle that consumes plant water and boiler steam, diverts wastewater, and lets the rest of the product line buffer the outage before it recovers.",
+        duration_seconds=2_400,
+        steps=(
+            ScenarioStep(300, "cip_start", {"target_unit": "pasteurizer_01"}),
+        ),
+        expected_observations=(
+            "The selected pasteurizer stops production while the parallel line keeps running.",
+            "Pre-rinse, heated caustic, hot sanitation, and final-rinse phases produce different water, steam, temperature, pH, and conductivity signals.",
+            "The CIP water request enters the shared process-water network; lower water availability pauses rinse and wash phase timers.",
+            "Steam demand during heated phases consumes header inventory, and cleaner temperature rises at a thermal rate instead of instantly.",
+            "CIP wastewater appears as a separate effluent flow; the product buffer delays filler slowdown, and normal output returns after release.",
+        ),
+    ),
     "grid-comms-recovery": ScenarioDefinition(
         scenario_id="grid-comms-recovery",
         name="Grid communications loss and recovery",

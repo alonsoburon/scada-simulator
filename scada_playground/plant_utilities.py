@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import random
 
+try:  # Support both package imports in tests and direct app imports.
+    from .cip_system import CleaningInPlaceSystem
+except ImportError:
+    from cip_system import CleaningInPlaceSystem
+
 
 class FactoryUtilities:
     AREA_ASSETS = {
@@ -11,6 +16,8 @@ class FactoryUtilities:
         "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02", "Product balance tank"],
         "Filling": ["Filler 01"],
         "Packaging": ["Case packer A", "Accumulation conveyor"],
+        "CIP": ["CIP tank A", "CIP tank B", "CIP supply", "CIP return", "Chemical dosing"],
+        "Wastewater": ["Effluent monitor"],
     }
     SEVERITY = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
     HEADER_CAPACITY_T = 1.5
@@ -20,6 +27,7 @@ class FactoryUtilities:
     PACKAGE_BUFFER_CAPACITY_UNITS = 180.0
     UNITS_PER_CASE = 3.0
     PASTEURIZATION_LIMIT_C = 72.0
+    CIP_MODEL = CleaningInPlaceSystem()
 
     def initialize(self) -> dict:
         return {
@@ -42,10 +50,10 @@ class FactoryUtilities:
             "pasteurizers": {
                 "pasteurizer_01": {"temperature_c": 82.0, "setpoint_c": 82.0,
                                    "process_rate": 90.0, "production_rate": 90.0,
-                                   "diverted_rate": 0.0},
+                                   "diverted_rate": 0.0, "steam_service_fraction": 1.0},
                 "pasteurizer_02": {"temperature_c": 82.0, "setpoint_c": 82.0,
                                    "process_rate": 90.0, "production_rate": 90.0,
-                                   "diverted_rate": 0.0},
+                                   "diverted_rate": 0.0, "steam_service_fraction": 1.0},
             },
             "product_tank_inventory_units": 180.0,
             "product_tank_inlet_units_min": 180.0,
@@ -55,6 +63,10 @@ class FactoryUtilities:
             "packer_rate_units_min": 180.0,
             "finished_cases_total": 0.0,
             "last_advance_seconds": 0,
+            "cip": self.CIP_MODEL.initialize(),
+            "cip_water_demand_m3h": 0.0,
+            "cip_effluent_m3h": 0.0,
+            "cip_steam_demand_tph": 0.0,
             "compressors": {
                 "compressor_a": {"capacity_nm3_min": 50.0, "output_nm3_min": 41.0, "availability": 1.0, "vibration_mm_s": 2.2},
                 "compressor_b": {"capacity_nm3_min": 50.0, "output_nm3_min": 37.0, "availability": 1.0, "vibration_mm_s": 2.0},
@@ -94,9 +106,12 @@ class FactoryUtilities:
             state["compressors"].setdefault(name, equipment.copy())
         for name, unit in defaults["pasteurizers"].items():
             state["pasteurizers"].setdefault(name, unit.copy())
+            for key, value in unit.items():
+                state["pasteurizers"][name].setdefault(key, value)
 
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
-                power_available_fraction: float = 1.0, seed: int = 17) -> None:
+                power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
+                seed: int = 17) -> None:
         """Advance boiler/header, condensate, compressed-air, and consumer states."""
         had_scan_time = "last_advance_seconds" in state
         self.migrate(state)
@@ -106,13 +121,25 @@ class FactoryUtilities:
             state["last_advance_seconds"] = max(0, sim_seconds - 1)
         state["sim_seconds"] = sim_seconds
         power_factor = max(0.0, min(1.0, power_available_fraction))
+        cip_mechanical = self._event_severity(events, "Mechanical degradation", ("CIP",))
+        self.CIP_MODEL.advance(
+            state["cip"], sim_seconds,
+            steam_available_fraction=state["steam_service_fraction"],
+            water_available_fraction=water_available_fraction,
+            power_available_fraction=power_factor,
+            mechanical_degradation=cip_mechanical,
+        )
+        cip_demands = self.CIP_MODEL.demands(state["cip"])
+        state["cip_water_demand_m3h"] = cip_demands["water_m3h"]
+        state["cip_effluent_m3h"] = cip_demands["effluent_m3h"]
+        state["cip_steam_demand_tph"] = cip_demands["steam_tph"]
 
         boiler_fault = self._event_severity(events, "Utility loss", ("Boiler house",))
         boiler_mechanical = self._event_severity(events, "Mechanical degradation", ("Boiler house",))
         steam_demand_fault = self._event_severity(events, "Process upset", ("Thermal processing",))
         boiler_capacity_factor = max(0.0, 1.0 - boiler_fault)
         boiler_capacity_factor *= max(0.0, 1.0 - 0.48 * boiler_mechanical)
-        steam_demand = 32.0 * (1.0 + 0.38 * steam_demand_fault)
+        steam_demand = 32.0 * (1.0 + 0.38 * steam_demand_fault) + state["cip_steam_demand_tph"]
         pressure = 5.0 + 4.5 * state["steam_header_inventory_t"] / self.HEADER_CAPACITY_T
         steam_service = max(0.0, min(1.0, (pressure - 5.5) / 1.8))
         actual_steam_demand = steam_demand * steam_service
@@ -191,7 +218,8 @@ class FactoryUtilities:
         if state["dryer_available"]:
             state["dryer_dew_point_c"] += (-25.0 - state["dryer_dew_point_c"]) * 0.01
         state["filling_air_service"] = state["air_service_fraction"]
-        state["electric_load_mw"] = (air_supply * 60.0 * 0.11 / 1000.0 + 0.08)
+        state["electric_load_mw"] = (air_supply * 60.0 * 0.11 / 1000.0 + 0.08
+                                     + (0.08 if state["cip"]["active"] else 0.0))
 
         dt_s = max(0, sim_seconds - state.get("last_advance_seconds", sim_seconds - 1))
         dt_min = dt_s / 60.0
@@ -205,8 +233,10 @@ class FactoryUtilities:
                 events, "Utility loss", ("Thermal processing",))
             target_temperature = 24.0 + 60.0 * local_steam_service
             pasteurizer["temperature_c"] += (target_temperature - pasteurizer["temperature_c"]) / 360.0
-            pasteurizer["process_rate"] = (90.0 * local_steam_service
-                * product_tank_headroom_control)
+            cip_is_cleaning_line = (state["cip"]["active"]
+                                    and state["cip"]["target_unit"] == name)
+            pasteurizer["process_rate"] = (0.0 if cip_is_cleaning_line else
+                90.0 * local_steam_service * product_tank_headroom_control)
             pasteurizer["steam_service_fraction"] = local_steam_service
             pasteurizer["production_rate"] = (pasteurizer["process_rate"]
                 if pasteurizer["temperature_c"] >= self.PASTEURIZATION_LIMIT_C else 0.0)
@@ -266,7 +296,12 @@ class FactoryUtilities:
                 | {"pasteurizer_01_temperature_c": state["pasteurizers"]["pasteurizer_01"]["temperature_c"],
                    "pasteurizer_02_temperature_c": state["pasteurizers"]["pasteurizer_02"]["temperature_c"],
                    "pasteurizer_01_rate": state["pasteurizers"]["pasteurizer_01"]["production_rate"],
-                   "pasteurizer_02_rate": state["pasteurizers"]["pasteurizer_02"]["production_rate"]})
+                   "pasteurizer_02_rate": state["pasteurizers"]["pasteurizer_02"]["production_rate"],
+                   "cip_phase_index": state["cip"]["phase_index"],
+                   "cip_temperature_c": state["cip"]["temperature_c"],
+                   "cip_water_demand_m3h": state["cip_water_demand_m3h"],
+                   "cip_effluent_m3h": state["cip_effluent_m3h"],
+                   "cip_return_ph": state["cip"]["return_ph"]})
             state["history"] = state["history"][-1_440:]
 
     def telemetry(self, state: dict, seed: int = 17) -> list[dict]:
@@ -367,6 +402,42 @@ class FactoryUtilities:
                 "infeed_rate": (state["filler_rate_units_min"], "units/min", 0, 240),
                 "outfeed_rate": (state["packer_rate_units_min"], "units/min", 0, 240),
                 "blocked": (float(state["filling_buffer_inventory_units"] >= self.PACKAGE_BUFFER_CAPACITY_UNITS - 1e-6), "bool", 0, 1),
+            },
+            ("CIP", "CIP tank A"): {
+                "tank_level": (100.0 if state["cip"]["active"] else 0.0, "%", 0, 100),
+                "temperature": (state["cip"]["temperature_c"], "°C", 0, 100),
+                "phase_progress": (state["cip"]["phase_progress_pct"], "%", 0, 100),
+                "phase_code": (state["cip"]["phase_index"], "phase", 0, len(self.CIP_MODEL.PHASES)),
+            },
+            ("CIP", "CIP tank B"): {
+                "caustic_inventory": (state["cip"]["caustic_inventory_l"], "L", 0, 1_000),
+                "sanitizer_inventory": (state["cip"]["sanitizer_inventory_l"], "L", 0, 500),
+                "return_ph": (state["cip"]["return_ph"], "pH", 0, 14),
+                "return_conductivity": (state["cip"]["return_conductivity_us_cm"], "µS/cm", 0, 50_000),
+            },
+            ("CIP", "CIP supply"): {
+                "water_flow": (state["cip_water_demand_m3h"], "m³/h", 0, 40),
+                "steam_flow": (state["cip_steam_demand_tph"], "t/h", 0, 20),
+                "recirculation_flow": (state["cip"]["recirculation_flow_m3h"], "m³/h", 0, 60),
+                "pump_available": (100.0 * state["cip"]["power_available_fraction"], "%", 0, 100),
+            },
+            ("CIP", "CIP return"): {
+                "effluent_flow": (state["cip_effluent_m3h"], "m³/h", 0, 40),
+                "return_ph": (state["cip"]["return_ph"], "pH", 0, 14),
+                "return_conductivity": (state["cip"]["return_conductivity_us_cm"], "µS/cm", 0, 50_000),
+                "water_availability": (100.0 * state["cip"]["water_available_fraction"], "%", 0, 100),
+            },
+            ("CIP", "Chemical dosing"): {
+                "caustic_dosing": (state["cip"]["caustic_dosing_l_min"], "L/min", 0, 10),
+                "sanitizer_dosing": (state["cip"]["sanitizer_dosing_l_min"], "L/min", 0, 10),
+                "caustic_tank_level": (100.0 * state["cip"]["caustic_inventory_l"] / 500.0, "%", 0, 100),
+                "sanitizer_tank_level": (100.0 * state["cip"]["sanitizer_inventory_l"] / 250.0, "%", 0, 100),
+            },
+            ("Wastewater", "Effluent monitor"): {
+                "effluent_flow": (state["cip_effluent_m3h"], "m³/h", 0, 40),
+                "effluent_ph": (state["cip"]["return_ph"], "pH", 0, 14),
+                "conductivity": (state["cip"]["return_conductivity_us_cm"], "µS/cm", 0, 50_000),
+                "discharge_compliant": (float(6.0 <= state["cip"]["return_ph"] <= 9.0), "bool", 0, 1),
             },
         }
         rows = []

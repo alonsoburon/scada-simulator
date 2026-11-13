@@ -98,6 +98,9 @@ class MineWaterNetwork:
                 "links": {key: {"flow_m3h": 0.0, "pressure_kpa": 0.0, "available": True}
                           for key in self.LINKS},
                 "base_demand_m3h": 240.0, "demand_m3h": 240.0, "concentrator_demand_m3h": 0.0,
+                "factory_cip_demand_m3h": 0.0, "factory_cip_effluent_m3h": 0.0,
+                "factory_cip_served_m3h": 0.0, "factory_water_available_fraction": 1.0,
+                "cumulative_factory_cip_effluent_m3": 0.0,
                 "concentrator_reclaim_m3h": 0.0,
                 "treated_demand_m3h": 96.0,
                 "unmet_demand_m3h": 0.0, "unmet_treated_demand_m3h": 0.0,
@@ -224,6 +227,7 @@ class MineWaterNetwork:
 
     def advance(self, state: dict, sim_seconds: int, active_events: list[dict], seed: int = 17,
                 concentrator_demand_m3h: float = 0.0, concentrator_reclaim_m3h: float = 0.0,
+                factory_cip_demand_m3h: float = 0.0, factory_cip_effluent_m3h: float = 0.0,
                 power_available_fraction: float | None = None) -> None:
         """Advance one second with PI level controls, hydraulic links and delayed transport."""
         self.migrate(state)
@@ -233,11 +237,14 @@ class MineWaterNetwork:
                       for e in active_events if e["name"] == "Process upset"), default=1.0)
         state["concentrator_demand_m3h"] = max(0.0, concentrator_demand_m3h)
         state["concentrator_reclaim_m3h"] = max(0.0, concentrator_reclaim_m3h)
+        state["factory_cip_demand_m3h"] = max(0.0, factory_cip_demand_m3h)
+        state["factory_cip_effluent_m3h"] = max(0.0, factory_cip_effluent_m3h)
         state["concentrator_recovery_pct"] = (100.0 * state["concentrator_reclaim_m3h"] /
                                                 state["concentrator_demand_m3h"]
                                                 if state["concentrator_demand_m3h"] > 1e-9 else 0.0)
         state["base_demand_m3h"] = 240.0 * stress * (1 + 0.08 * math.sin(sim_seconds / 95.0))
-        state["demand_m3h"] = state["base_demand_m3h"] + state["concentrator_demand_m3h"]
+        state["demand_m3h"] = (state["base_demand_m3h"] + state["concentrator_demand_m3h"]
+                               + state["factory_cip_demand_m3h"])
         state["treated_demand_m3h"] = 96.0 * (1 + 0.12 * math.sin(sim_seconds / 137.0 + 1.2))
         state["water_recovery_pct"] = 68.0 if stress == 1.0 else max(35.0, 68.0 - (stress - 1.0) * 18)
         degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
@@ -301,6 +308,21 @@ class MineWaterNetwork:
         process_available_m3 = volumes["process_tank"] + outlet["process_feed"] / 3600.0
         served = min(state["demand_m3h"], process_available_m3 * 3600.0)
         state["unmet_demand_m3h"] = state["demand_m3h"] - served
+        # Preserve normal site and concentrator water before low-priority CIP cleaning.
+        base_served = min(state["base_demand_m3h"], served)
+        concentrator_served = min(state["concentrator_demand_m3h"], max(0.0, served - base_served))
+        cip_served = min(state["factory_cip_demand_m3h"],
+                         max(0.0, served - base_served - concentrator_served))
+        state["base_unmet_m3h"] = state["base_demand_m3h"] - base_served
+        state["concentrator_served_m3h"] = concentrator_served
+        state["concentrator_unmet_m3h"] = state["concentrator_demand_m3h"] - concentrator_served
+        state["factory_cip_served_m3h"] = cip_served
+        state["factory_water_available_fraction"] = (cip_served / state["factory_cip_demand_m3h"]
+            if state["factory_cip_demand_m3h"] > 1e-9 else 1.0)
+        actual_cip_effluent = (state["factory_cip_effluent_m3h"]
+            * state["factory_water_available_fraction"])
+        state["factory_cip_effluent_m3h"] = actual_cip_effluent
+        state["cumulative_factory_cip_effluent_m3"] += actual_cip_effluent / 3600.0
         # Reclaim applies to the baseline circulating process stream. Concentrator
         # makeup is consumed fresh water and is not falsely counted as return flow.
         circulating_served = min(served, state["base_demand_m3h"])
@@ -372,6 +394,9 @@ class MineWaterNetwork:
                                      "process_feed_m3h": outlet["process_feed"],
                                      "process_demand_m3h": state["demand_m3h"],
                                      "concentrator_gross_demand_m3h": state["concentrator_demand_m3h"],
+                                     "factory_cip_demand_m3h": state["factory_cip_demand_m3h"],
+                                     "factory_water_available_fraction": state["factory_water_available_fraction"],
+                                     "factory_cip_effluent_m3h": actual_cip_effluent,
                                      "concentrator_reclaim_m3h": state["concentrator_reclaim_m3h"],
                                      "concentrator_makeup_m3h": max(
                                          0.0, state["concentrator_demand_m3h"]
@@ -434,6 +459,11 @@ class MineWaterNetwork:
         add("process_demand", "water_recovery", state["water_recovery_pct"], "%", 0, 100, 0.002)
         add("process_demand", "concentrator_recovery", state["concentrator_recovery_pct"], "%", 0, 100, 0.002)
         add("process_demand", "concentrator_return", state["concentrator_reclaim_m3h"], "m³/h", 0, 700, 0.005)
+        add("process_demand", "factory_cip_demand", state["factory_cip_demand_m3h"], "m³/h", 0, 40, 0.005)
+        add("process_demand", "factory_cip_served", state["factory_cip_served_m3h"], "m³/h", 0, 40, 0.005)
+        add("process_demand", "concentrator_unmet_demand", state.get("concentrator_unmet_m3h", 0.0), "m³/h", 0, 800, 0.005)
+        add("process_demand", "factory_cip_water_availability", state["factory_water_available_fraction"] * 100, "%", 0, 100)
+        add("process_demand", "factory_cip_effluent", state["factory_cip_effluent_m3h"], "m³/h", 0, 40, 0.005)
         add("process_demand", "treated_water_demand", state["treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         add("process_demand", "unmet_treated_water_demand", state["unmet_treated_demand_m3h"], "m³/h", 0, 300, 0.005)
         nodes = [{"id": key, "label": spec["label"], "level_pct": state["nodes"][key]["level_pct"],

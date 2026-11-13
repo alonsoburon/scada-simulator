@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 
 from scada_playground.water_network import MineWaterNetwork
 
@@ -142,6 +143,27 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertGreater(self.state["pumps"]["Process feed pump"]["speed_pct"], 0)
         self.assertLess(self.state["pumps"]["Process feed pump"]["speed_pct"], 100)
         self.assertLess(self.state["unmet_demand_m3h"], 1)
+
+    def test_factory_cip_uses_shared_water_and_is_shed_after_site_and_mine_process(self):
+        state = self.model.initialize()
+        process_tank = state["nodes"]["process_tank"]
+        process_tank["volume_m3"] = 0.1
+        process_tank["level_pct"] = 100 * 0.1 / process_tank["capacity_m3"]
+        process_tank["level_m"] = 0.1 / process_tank["area_m2"]
+        for pump in state["pumps"].values():
+            pump.update(enabled=False, speed_pct=0.0, speed_command_pct=0.0)
+        for link in state["links"].values():
+            link["transport_queue"] = deque([0.0] * len(link["transport_queue"]))
+
+        self.model.advance(state, 1, [], concentrator_demand_m3h=200.0,
+                           factory_cip_demand_m3h=100.0,
+                           factory_cip_effluent_m3h=80.0, power_available_fraction=0.0)
+        self.assertAlmostEqual(state["demand_m3h"],
+            state["base_demand_m3h"] + 200.0 + 100.0)
+        self.assertGreater(state["concentrator_served_m3h"], 0.0)
+        self.assertEqual(state["factory_cip_served_m3h"], 0.0)
+        self.assertEqual(state["factory_water_available_fraction"], 0.0)
+        self.assertEqual(state["cumulative_factory_cip_effluent_m3"], 0.0)
 
 
 if __name__ == "__main__":

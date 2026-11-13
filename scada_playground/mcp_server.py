@@ -311,6 +311,14 @@ def control_process(process_action: Literal["START", "STOP", "RESET_TRIPS"]) -> 
 
 
 @mcp.tool()
+def start_cip_cycle(target_unit: Literal["pasteurizer_01", "pasteurizer_02"] = "pasteurizer_01") -> dict[str, Any]:
+    """Start a simulated seven-phase CIP clean on one pasteurizer; this never controls real equipment."""
+    if target_unit not in {"pasteurizer_01", "pasteurizer_02"}:
+        raise ValueError("target_unit must be pasteurizer_01 or pasteurizer_02")
+    return submit_command({"action": "start_cip", "target_unit": target_unit})
+
+
+@mcp.tool()
 def run_scenario(scenario_id: str, seed: int = 17) -> dict[str, Any]:
     """Reset and run a named deterministic scenario from its start; same seed replays the same timeline."""
     if scenario_id not in SCENARIOS:
