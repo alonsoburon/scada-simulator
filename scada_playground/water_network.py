@@ -313,14 +313,16 @@ class MineWaterNetwork:
         # Joukowsky head step at the source boundary: ΔH = -a ΔV/g.
         injected_head_m = -self.PIPE_WAVE_SPEED_M_S * (velocity_m_s - previous_velocity) / 9.80665
         diameter = spec["diameter_m"]
-        reference_velocity = max(abs(velocity_m_s), 0.25)
-        reynolds = reference_velocity * diameter / 1.004e-6
+        reference_velocity = abs(velocity_m_s)
+        kinematic_viscosity = 1.004e-6
+        reynolds = reference_velocity * diameter / kinematic_viscosity
         if reynolds < 2_300:
-            friction = 64.0 / max(reynolds, 1.0)
+            # f·V has a finite laminar limit as mean flow tends to zero.
+            damping_rate = 32.0 * kinematic_viscosity / diameter**2
         else:
             relative_roughness = spec["roughness_m"] / (3.7 * diameter)
             friction = 0.25 / math.log10(relative_roughness + 5.74 / reynolds**0.9) ** 2
-        damping_rate = friction * reference_velocity / (2.0 * diameter)
+            damping_rate = friction * reference_velocity / (2.0 * diameter)
         attenuation = math.exp(-damping_rate * dt)
 
         if valve_opening_pct <= 0:

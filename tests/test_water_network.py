@@ -272,6 +272,34 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertLess(link["transient_differential_head_m"], 0.0)
         self.assertLess(receiver_pressurized_flow, baseline_flow)
 
+    def test_wave_launch_matches_joukowsky_pressure_step(self):
+        link = self.state["links"]["raw_transfer"]
+        spec = self.model.LINKS["raw_transfer"]
+        initial_velocity = link["previous_velocity_m_s"]
+        changed_velocity = initial_velocity - 1.0
+
+        self.model._propagate_line_waves(link, spec, changed_velocity, 92.0, substeps=1)
+
+        measured_kpa = (link["wave_right"][0] * self.model.WATER_DENSITY_KG_M3
+                        * 9.80665 / 1000.0)
+        expected_kpa = (-self.model.WATER_DENSITY_KG_M3
+                        * self.model.PIPE_WAVE_SPEED_M_S
+                        * (changed_velocity - initial_velocity) / 1000.0)
+        self.assertAlmostEqual(measured_kpa, expected_kpa, delta=2.0)
+
+    def test_zero_flow_wave_uses_finite_laminar_friction_limit(self):
+        key = "raw_transfer"
+        link = self.state["links"][key]
+        spec = self.model.LINKS[key]
+        link["previous_velocity_m_s"] = 0.0
+        link["wave_right"][0] = 1.0
+
+        self.model._propagate_line_waves(link, spec, 0.0, 92.0, substeps=1)
+
+        expected_attenuation = math.exp(
+            -32.0 * 1.004e-6 / spec["diameter_m"]**2 * self.model.WAVE_TIME_STEP_S)
+        self.assertAlmostEqual(link["wave_right"][1], expected_attenuation, places=9)
+
     def test_legacy_pipe_state_migrates_without_a_false_startup_surge(self):
         link = self.state["links"]["process_feed"]
         del link["previous_velocity_m_s"]
