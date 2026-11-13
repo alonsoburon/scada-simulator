@@ -56,6 +56,34 @@ class MinePowerNetworkTests(unittest.TestCase):
             self.state["served_load_mw"] + max(0.0, -self.state["battery_power_mw"])
             + self.state["distribution_losses_mw"], delta=0.02)
 
+    def test_source_voltage_falls_with_higher_active_and_reactive_load(self):
+        light_load = self.model.initialize()
+        heavy_load = self.model.initialize()
+        self.model.advance(light_load, 1, [], process_load_mw=8.0,
+                           water_load_mw=0.5, seed=17)
+        self.model.advance(heavy_load, 1, [], process_load_mw=36.0,
+                           water_load_mw=0.5, seed=17)
+
+        self.assertLess(heavy_load["source_voltage_pu"], light_load["source_voltage_pu"])
+        self.assertGreater(heavy_load["distribution_losses_mw"],
+                           light_load["distribution_losses_mw"])
+
+    def test_capacitor_bank_waits_for_persistent_low_voltage(self):
+        outage = {"name": "Utility loss", "area": "Grid transmission", "severity": "Large"}
+        for tick in range(1, self.model.CAPACITOR_SWITCH_DELAY_S):
+            self.model.advance(self.state, tick, [outage], process_load_mw=28.0,
+                               water_load_mw=0.5, seed=17)
+        self.assertEqual(self.state["capacitor_bank_stage"], 1)
+        self.assertEqual(self.state["capacitor_control_timer_s"],
+                         self.model.CAPACITOR_SWITCH_DELAY_S - 1)
+
+        self.model.advance(self.state, self.model.CAPACITOR_SWITCH_DELAY_S, [outage],
+                           process_load_mw=28.0, water_load_mw=0.5, seed=17)
+        self.assertEqual(self.state["capacitor_bank_stage"], 2)
+        self.assertEqual(self.state["capacitor_bank_mvar"], 3.5)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertEqual(tags["grid_distribution.capacitor_bank.stage"]["value"], 2.0)
+
     def test_old_power_snapshot_migrates_to_feeder_protection_state(self):
         for feeder in self.state["distribution_feeders"].values():
             for key in ("breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",

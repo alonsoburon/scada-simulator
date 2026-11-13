@@ -22,6 +22,10 @@ class MinePowerNetwork:
     PRIMARY_RELAY_TMS = 0.60
     BACKUP_RELAY_TMS = 0.50
     BACKUP_COORDINATION_MARGIN_S = 1.0
+    SOURCE_BASE_MVA = 50.0
+    SOURCE_R_PU = 0.004
+    SOURCE_X_PU = 0.035
+    CAPACITOR_SWITCH_DELAY_S = 10
     DISTRIBUTION_FEEDERS = {
         "north": {"share": 0.38, "cap_share": 0.60, "nominal_kv": 33.0,
                   "rating_mva": 22.0, "r_pu": 0.018, "x_pu": 0.060, "power_factor": 0.92},
@@ -39,6 +43,7 @@ class MinePowerNetwork:
             "frequency_nadir_hz": 50.0, "frequency_window_nadir_hz": 50.0,
             "voltage_pu": 1.0,
             "source_voltage_pu": 1.0, "capacitor_bank_stage": 1,
+            "capacitor_control_timer_s": 0,
             "capacitor_bank_mvar": 1.2, "distribution_losses_mw": 0.575,
             "distribution_feeders": {name: {"active_power_mw": 0.0, "reactive_power_mvar": 0.0,
                 "apparent_power_mva": 0.0, "current_a": 0.0, "voltage_pu": 1.0,
@@ -143,6 +148,7 @@ class MinePowerNetwork:
         initial_state = self.initialize()
         for key in ("frequency_rocof_hz_s", "distribution_losses_mw",
                     "source_voltage_pu", "capacitor_bank_stage", "capacitor_bank_mvar",
+                    "capacitor_control_timer_s",
                     "distribution_feeders", "battery_discharge_ramp_mw_s",
                     "battery_charge_ramp_mw_s"):
             state.setdefault(key, initial_state[key])
@@ -347,13 +353,33 @@ class MinePowerNetwork:
         state["frequency_nadir_hz"] = min(state.get("frequency_nadir_hz", 50.0), state["frequency_hz"])
         state["frequency_window_nadir_hz"] = min(
             state.get("frequency_window_nadir_hz", 50.0), state["frequency_hz"])
+        reactive_load_mvar = (
+            served_process * math.tan(math.acos(0.88))
+            + served_water * math.tan(math.acos(0.95))
+            + served_utility * math.tan(math.acos(0.90))
+            + served_site * math.tan(math.acos(0.95)))
+        net_reactive_mvar = reactive_load_mvar - state["capacitor_bank_mvar"]
+        source_impedance_drop_pu = (
+            self.SOURCE_R_PU * dispatch_request
+            + self.SOURCE_X_PU * net_reactive_mvar) / self.SOURCE_BASE_MVA
         source_voltage = min(1.08, max(0.78,
-            1.0 - max(0.0, dispatch_request - state["total_generation_mw"]) * 0.012
+            1.0 - source_impedance_drop_pu
+            - max(0.0, dispatch_request - state["total_generation_mw"]) * 0.012
             - state["load_shed_mw"] * 0.004))
-        if source_voltage < 0.96:
-            state["capacitor_bank_stage"], state["capacitor_bank_mvar"] = 2, 3.5
-        elif source_voltage > 1.0:
-            state["capacitor_bank_stage"], state["capacitor_bank_mvar"] = 1, 1.2
+        capacitor_stage = state["capacitor_bank_stage"]
+        requested_capacitor_stage = capacitor_stage
+        if source_voltage < 0.96 and capacitor_stage < 2:
+            requested_capacitor_stage = 2
+        elif source_voltage > 1.03 and capacitor_stage > 1:
+            requested_capacitor_stage = 1
+        if requested_capacitor_stage != capacitor_stage:
+            state["capacitor_control_timer_s"] += 1
+            if state["capacitor_control_timer_s"] >= self.CAPACITOR_SWITCH_DELAY_S:
+                state["capacitor_bank_stage"] = requested_capacitor_stage
+                state["capacitor_bank_mvar"] = {1: 1.2, 2: 3.5}[requested_capacitor_stage]
+                state["capacitor_control_timer_s"] = 0
+        else:
+            state["capacitor_control_timer_s"] = 0
         state["source_voltage_pu"] = source_voltage
         closed = {name: bool(distribution_online and protection[name]["breaker_closed"])
                   for name in self.DISTRIBUTION_FEEDERS}
@@ -476,7 +502,7 @@ class MinePowerNetwork:
                 "Feeder south": {"active_power": (state["distribution_feeders"]["south"]["active_power_mw"], "MW", 0, 30), "line_voltage": (33 * state["distribution_feeders"]["south"]["voltage_pu"], "kV", 0, 40), "line_current": (state["distribution_feeders"]["south"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["south"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["south"]["breaker_closed"]), "bool", 0, 1)},
                 "Feeder east": {"active_power": (state["distribution_feeders"]["east"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["east"]["voltage_pu"], "kV", 0, 14), "line_current": (state["distribution_feeders"]["east"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["east"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["east"]["breaker_closed"]), "bool", 0, 1)},
                 "Feeder west": {"active_power": (state["distribution_feeders"]["west"]["active_power_mw"], "MW", 0, 30), "line_voltage": (11 * state["distribution_feeders"]["west"]["voltage_pu"], "kV", 0, 14), "line_current": (state["distribution_feeders"]["west"]["current_a"], "A", 0, 10000), "reactive_power": (state["distribution_feeders"]["west"]["reactive_power_mvar"], "MVAr", -10, 20), "breaker_state": (float(state["distribution_feeders"]["west"]["breaker_closed"]), "bool", 0, 1)},
-                "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-state["capacitor_bank_mvar"], "MVAr", -10, 10), "line_voltage": (33 * source_v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1)},
+                "Capacitor bank": {"active_power": (0.0, "MW", 0, 1), "reactive_power": (-state["capacitor_bank_mvar"], "MVAr", -10, 10), "line_voltage": (33 * source_v, "kV", 25, 40), "breaker_state": (1.0, "bool", 0, 1), "stage": (state["capacitor_bank_stage"], "stage", 1, 2), "control_timer": (state["capacitor_control_timer_s"], "s", 0, self.CAPACITOR_SWITCH_DELAY_S)},
             },
             "Mine power network": {
                 "Mine substation A": {"active_power": (mine * .54, "MW", 0, 40), "line_voltage": (33 * source_v, "kV", 25, 40), "reactive_power": (mine * .2, "MVAr", -200, 200), "transformer_oil_temp": (state["transformers"]["mine_a"]["top_oil_c"], "°C", 0, 150), "winding_hotspot_temp": (state["transformers"]["mine_a"]["hotspot_c"], "°C", 0, 180), "cooling_stage": (state["transformers"]["mine_a"]["cooling_stage"], "stage", 0, 2), "breaker_state": (float(state["mine_transformer_capacity_mw"] > 10), "bool", 0, 1)},
