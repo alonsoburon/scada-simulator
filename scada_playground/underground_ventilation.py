@@ -140,8 +140,12 @@ class UndergroundVentilation:
         state["total_airflow_m3s"] = total_flow
         state["network_pressure_pa"] = pressure
         total_kw = 0.0
+        air_moving_fans = [fan for fan in state["fans"].values() if fan["speed_pct"] > 0.5]
         for name, fan in state["fans"].items():
-            fan["flow_m3s"] = total_flow / max(1, sum(f["running"] for f in state["fans"].values())) if fan["running"] else 0.0
+            # A de-energized fan still moves air while its rotor coasts down.
+            # Keep aerodynamic flow separate from the motor's energized state.
+            fan["flow_m3s"] = (total_flow / len(air_moving_fans)
+                               if fan["speed_pct"] > 0.5 else 0.0)
             # Fan shaft input is Q*DeltaP/efficiency; scale by condition/VFD.
             fan["power_kw"] = (fan["flow_m3s"] * pressure / 1000.0 / 0.76
                                if fan["running"] else 0.0)
