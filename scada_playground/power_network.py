@@ -29,6 +29,9 @@ class MinePowerNetwork:
     NOMINAL_FREQUENCY_HZ = 50.0
     DIESEL_DROOP_MW_PER_HZ = 2.67
     BATTERY_DROOP_MW_PER_HZ = 2.4
+    UFLS_STAGES = ((49.2, 0.10), (48.8, 0.10), (48.4, 0.15))
+    UFLS_RESTORE_FREQUENCY_HZ = 49.7
+    UFLS_RESTORE_DELAY_S = 30
     DISTRIBUTION_FEEDERS = {
         "north": {"share": 0.38, "cap_share": 0.60, "nominal_kv": 33.0,
                   "rating_mva": 22.0, "r_pu": 0.018, "x_pu": 0.060, "power_factor": 0.92},
@@ -88,6 +91,8 @@ class MinePowerNetwork:
             "process_power_fraction": 1.0, "water_power_fraction": 1.0,
             "factory_utilities_power_fraction": 1.0,
             "factory_utilities_requested_mw": 0.0, "factory_utilities_load_mw": 0.0,
+            "ufls_stage": 0, "ufls_restore_timer_s": 0,
+            "ufls_shed_mw": 0.0, "process_after_ufls_mw": 28.0,
             "unserved_load_mw": 0.0, "power_deficit": False,
             "history": [], "seed": 17,
         }
@@ -146,6 +151,28 @@ class MinePowerNetwork:
         target_hotspot = thermal["top_oil_c"] + winding_rise
         thermal["hotspot_c"] += (target_hotspot - thermal["hotspot_c"]) * (1.0 - math.exp(-seconds / 300.0))
 
+    @classmethod
+    def _advance_underfrequency_shedding(cls, state: dict, process_request_mw: float) -> None:
+        """Trip process load in frequency stages; restore one block after stable recovery."""
+        stage = max(0, min(len(cls.UFLS_STAGES), int(state.get("ufls_stage", 0))))
+        frequency = state["frequency_hz"]
+        if stage < len(cls.UFLS_STAGES) and frequency <= cls.UFLS_STAGES[stage][0]:
+            stage += 1
+            state["ufls_restore_timer_s"] = 0
+        elif stage > 0 and frequency >= cls.UFLS_RESTORE_FREQUENCY_HZ:
+            state["ufls_restore_timer_s"] += 1
+            if state["ufls_restore_timer_s"] >= cls.UFLS_RESTORE_DELAY_S:
+                stage -= 1
+                state["ufls_restore_timer_s"] = 0
+        else:
+            state["ufls_restore_timer_s"] = 0
+
+        shed_fraction = sum(block_mw_fraction for _, block_mw_fraction
+                            in cls.UFLS_STAGES[:stage])
+        state["ufls_stage"] = stage
+        state["ufls_shed_mw"] = max(0.0, process_request_mw) * shed_fraction
+        state["process_after_ufls_mw"] = max(0.0, process_request_mw - state["ufls_shed_mw"])
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 process_load_mw: float, water_load_mw: float,
                 utility_load_mw: float = 0.0, seed: int = 17) -> None:
@@ -166,6 +193,11 @@ class MinePowerNetwork:
         for name, initial in initial_state["transformers"].items():
             state.setdefault("transformers", {}).setdefault(name, initial.copy())
         state["sim_seconds"], state["seed"] = sim_seconds, seed
+        state.setdefault("ufls_stage", 0)
+        state.setdefault("ufls_restore_timer_s", 0)
+        state.setdefault("ufls_shed_mw", 0.0)
+        state.setdefault("process_after_ufls_mw", max(0.0, process_load_mw))
+        self._advance_underfrequency_shedding(state, process_load_mw)
         self._advance_feeder_protection(state, sim_seconds, events)
         connected_load_at_tick_start = state.get("served_load_mw", 34.5)
         faults = [event for event in events if event["name"] == "Utility loss"]
@@ -234,7 +266,8 @@ class MinePowerNetwork:
         available_site_request = site_request * site_factor
         available_water_request = water_request * water_factor
         available_utility_request = utility_request * utility_factor
-        process_feeder_request = min(process_request * process_factor + available_utility_request,
+        process_dispatch_request = state["process_after_ufls_mw"]
+        process_feeder_request = min(process_dispatch_request * process_factor + available_utility_request,
                                      state["process_feeder_capacity_mw"])
         dispatch_request = (available_site_request + min(available_water_request, state["water_feeder_capacity_mw"])
                             + process_feeder_request)
@@ -321,7 +354,7 @@ class MinePowerNetwork:
         served_utility = min(available_utility_request, feeder_headroom, available)
         feeder_headroom -= served_utility
         available = max(0.0, available - served_utility)
-        served_process = min(process_request * process_factor, feeder_headroom, available)
+        served_process = min(process_dispatch_request * process_factor, feeder_headroom, available)
         available = max(0.0, available - served_process)
         served_flexible_site = min(3.0 * site_factor, available)
         served_site = served_critical_site + served_flexible_site
@@ -470,6 +503,7 @@ class MinePowerNetwork:
                 "sim_seconds", "frequency_hz", "voltage_pu", "grid_import_mw", "solar_mw",
                 "diesel_mw", "battery_soc_pct", "process_load_mw", "served_load_mw",
                 "factory_utilities_load_mw", "factory_utilities_power_fraction",
+                "ufls_stage", "ufls_restore_timer_s", "ufls_shed_mw",
                 "load_shed_mw", "process_power_fraction", "water_power_fraction",
                 "frequency_rocof_hz_s", "frequency_nadir_hz",
                 "frequency_window_nadir_hz", "distribution_losses_mw")}
@@ -509,6 +543,10 @@ class MinePowerNetwork:
                                      * float(state["distribution_incomer"]["breaker_closed"]), "MW", 0, 60),
                     "line_voltage": (33 * source_v * float(state["distribution_incomer"]["breaker_closed"]), "kV", 0, 40),
                     "line_current": (state["distribution_incomer"]["current_a"], "A", 0, 10000),
+                    "underfrequency_stage": (state["ufls_stage"], "stage", 0, len(self.UFLS_STAGES)),
+                    "underfrequency_shed_power": (state["ufls_shed_mw"], "MW", 0, 20),
+                    "underfrequency_restore_timer": (state["ufls_restore_timer_s"], "s", 0,
+                                                       self.UFLS_RESTORE_DELAY_S),
                     "breaker_state": (float(state["distribution_incomer"]["breaker_closed"]), "bool", 0, 1),
                     "relay_pickup": (float(state["distribution_incomer"]["relay_pickup"]), "bool", 0, 1),
                     "relay_current_multiple": (state["distribution_incomer"]["relay_current_multiple"], "x pickup", 0, 20),

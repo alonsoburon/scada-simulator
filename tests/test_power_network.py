@@ -117,6 +117,33 @@ class MinePowerNetworkTests(unittest.TestCase):
             tags["grid_generation.turbine_generator_01.governor_bias"]["value"],
             1.602, delta=0.02)
 
+    def test_underfrequency_sheds_load_in_stages_and_restores_after_stability_delay(self):
+        for tick, frequency in ((1, 49.1), (2, 48.7), (3, 48.3)):
+            self.state["frequency_hz"] = frequency
+            self.model.advance(self.state, tick, [], process_load_mw=28.0,
+                               water_load_mw=0.5, seed=17)
+            self.assertEqual(self.state["ufls_stage"], tick)
+
+        self.assertAlmostEqual(self.state["ufls_shed_mw"], 9.8)
+        self.assertAlmostEqual(self.state["process_after_ufls_mw"], 18.2)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertAlmostEqual(
+            tags["grid_distribution.distribution_incomer.underfrequency_stage"]["value"],
+            3.0, delta=0.02)
+
+        for tick in range(4, 3 + self.model.UFLS_RESTORE_DELAY_S):
+            self.state["frequency_hz"] = 49.8
+            self.model.advance(self.state, tick, [], process_load_mw=28.0,
+                               water_load_mw=0.5, seed=17)
+        self.assertEqual(self.state["ufls_stage"], 3)
+        self.assertEqual(self.state["ufls_restore_timer_s"], self.model.UFLS_RESTORE_DELAY_S - 1)
+
+        self.state["frequency_hz"] = 49.8
+        self.model.advance(self.state, 3 + self.model.UFLS_RESTORE_DELAY_S, [],
+                           process_load_mw=28.0, water_load_mw=0.5, seed=17)
+        self.assertEqual(self.state["ufls_stage"], 2)
+        self.assertEqual(self.state["ufls_restore_timer_s"], 0)
+
     def test_old_power_snapshot_migrates_to_feeder_protection_state(self):
         for feeder in self.state["distribution_feeders"].values():
             for key in ("breaker_closed", "relay_pickup", "relay_current_multiple", "relay_time_to_trip_s",
