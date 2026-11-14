@@ -214,7 +214,8 @@ class MineWaterNetwork:
             link_key = next(key for key, spec in self.LINKS.items() if spec["pump"] == name)
             flow_m3s = state["links"][link_key]["inlet_flow_m3h"] / 3600.0
             hydraulic_kw = 1000.0 * 9.80665 * flow_m3s * pump["pump_head_m"] / 1000.0
-            electrical_kw = hydraulic_kw / max(self.PUMPS[name]["hydraulic_efficiency"], 0.1)
+            electrical_kw = hydraulic_kw / max(
+                self.PUMPS[name]["hydraulic_efficiency"] * pump["motor_efficiency"], 0.1)
             pump["power_kw"] = electrical_kw
             pump["current_a"] = electrical_kw * 1000.0 / (math.sqrt(3) * 690.0 * 0.86)
         state["electrical_load_kw"] = (sum(pump["power_kw"] for pump in pumps.values())
@@ -268,6 +269,7 @@ class MineWaterNetwork:
             if key not in {"nodes", "pumps", "controllers", "valves", "links", "treatment", "wastewater", "distribution"}:
                 state.setdefault(key, value)
         for name, pump in state["pumps"].items():
+            pump.setdefault("motor_efficiency", self.PUMPS[name]["motor_efficiency"])
             pump.setdefault("health_factor", 1.0)
             pump.setdefault("mechanical_trip_timer_s", 0)
             pump.setdefault("mechanical_trip_latched", False)
@@ -969,7 +971,9 @@ class MineWaterNetwork:
             link_key = next(key for key, spec in self.LINKS.items() if spec["pump"] == name)
             flow_m3s = inlet[link_key] / 3600.0
             hydraulic_kw = 1000.0 * 9.80665 * flow_m3s * pump["pump_head_m"] / 1000.0
-            electrical_kw = hydraulic_kw / max(self.PUMPS[name]["hydraulic_efficiency"] * pump["efficiency"], 0.1)
+            electrical_kw = hydraulic_kw / max(
+                self.PUMPS[name]["hydraulic_efficiency"]
+                * pump["motor_efficiency"] * pump["efficiency"], 0.1)
             pump["power_kw"] = electrical_kw if pump["running"] else 0.0
             pump["current_a"] = (electrical_kw * 1000.0 / (math.sqrt(3) * 690.0 * 0.86)
                                   if pump["running"] else 0.0)

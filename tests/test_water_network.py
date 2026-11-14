@@ -14,6 +14,33 @@ class MineWaterNetworkTests(unittest.TestCase):
         for second in range(1, count + 1):
             self.model.advance(self.state, second, events or [])
 
+    def test_pump_electrical_load_includes_motor_and_hydraulic_losses(self):
+        def expected_electrical_kw(pump, flow_m3h):
+            flow_m3s = flow_m3h / 3_600.0
+            hydraulic_kw = 9.80665 * flow_m3s * pump["pump_head_m"]
+            total_efficiency = (pump["hydraulic_efficiency"] * pump["motor_efficiency"]
+                                * pump["efficiency"])
+            return hydraulic_kw / total_efficiency
+
+        pump = self.state["pumps"]["Intake pump"]
+        flow = self.state["links"]["raw_transfer"]["inlet_flow_m3h"]
+        self.assertAlmostEqual(pump["power_kw"], expected_electrical_kw(pump, flow), places=6)
+
+        fault = {"name": "Mechanical degradation", "area": "Water supply network",
+                 "severity": "Medium", "target_asset": "Intake pump"}
+        self.model.advance(self.state, 1, [fault])
+        pump = self.state["pumps"]["Intake pump"]
+        flow = self.state["links"]["raw_transfer"]["inlet_flow_m3h"]
+        self.assertAlmostEqual(pump["power_kw"], expected_electrical_kw(pump, flow), places=6)
+
+        legacy = self.model.initialize()
+        legacy["schema_revision"] = 6
+        for old_pump in legacy["pumps"].values():
+            old_pump.pop("motor_efficiency")
+        self.model.migrate(legacy)
+        self.assertTrue(all(p["motor_efficiency"] == self.model.PUMPS[name]["motor_efficiency"]
+                            for name, p in legacy["pumps"].items()))
+
     def test_default_run_respects_storage_bounds_and_mass_balance(self):
         initial_storage = self.model.total_inventory_m3(self.state)
         self.step(900)
