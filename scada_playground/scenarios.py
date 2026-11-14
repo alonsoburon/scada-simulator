@@ -183,6 +183,25 @@ SCENARIOS = {
             "The biased reading remains GOOD; after the fault expires, normal source flow returns first and the tank inventory recovers only after the transport delay.",
         ),
     ),
+    "frozen-water-level-transmitter": ScenarioDefinition(
+        scenario_id="frozen-water-level-transmitter",
+        name="Frozen tank-level transmitter",
+        description="A demand upset changes the real raw-water tank level while its transmitter freezes; the PI controller acts on the held reading until the instrument fault clears.",
+        duration_seconds=2_700,
+        steps=(
+            ScenarioStep(300, "incident", {"incident_name": "Process upset", "severity": "Medium",
+                                             "target_area": "Water supply network", "duration_seconds": 1_800}),
+            ScenarioStep(300, "incident", {"incident_name": "Signal freeze", "severity": "Large",
+                                             "target_area": "Water supply network",
+                                             "target_tag": "water_supply_network.raw_tank.tank_level",
+                                             "duration_seconds": 1_200}),
+        ),
+        expected_observations=(
+            "The raw-water tank's physical level moves during the demand upset while the frozen transmitter holds its pre-fault value and reports BAD quality.",
+            "The level controller continues to use the frozen measurement, so pump output and true tank level diverge until the instrument fault clears.",
+            "After recovery, the live measurement returns and the PI loop responds to actual level error rather than the stale held value.",
+        ),
+    ),
     "site-buildings-hvac-outage-and-recovery": ScenarioDefinition(
         scenario_id="site-buildings-hvac-outage-and-recovery",
         name="Site-building HVAC outage and recovery",

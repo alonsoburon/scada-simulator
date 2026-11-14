@@ -680,6 +680,11 @@ class MineWaterNetwork:
                 measured_level += signal_drift_bias(
                     tag_name, drift["severity"], drift["duration"],
                     sim_seconds - drift["started"], tag_span)
+            frozen = next((event for event in active_events
+                           if event.get("name") == "Signal freeze"
+                           and event.get("target_tag") == tag_name), None)
+            if frozen:
+                measured_level = float(frozen.get("measurement_baseline", measured_level))
             measured_level = round(min(100.0, max(0.0, measured_level)), 3)
             controller["process_value_pct"] = measured_level
             if controller["mode"] == "AUTO":

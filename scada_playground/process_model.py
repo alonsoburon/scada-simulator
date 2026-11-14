@@ -61,28 +61,32 @@ class FactoryProcessModel:
         if name == "Electrical fault" and not 0.0 <= float(fault_location_pct) <= 100.0:
             raise ValueError("Fault location must be between 0 and 100 percent of feeder length")
         if target_tag is not None:
-            if name != "Signal drift":
-                raise ValueError("target_tag is only valid for Signal drift")
+            if name not in {"Signal drift", "Signal freeze"}:
+                raise ValueError("target_tag is only valid for Signal drift or Signal freeze")
             matching = next((tag for tag in sim["tags"] if tag["tag"] == target_tag), None)
             if matching is None or (area != "Whole factory" and matching["area"] != area):
                 raise ValueError("target_tag must identify a tag in the selected target area")
             if matching.get("units") in {"bool", "enum", "cycles"}:
-                raise ValueError("Signal drift requires an analog measurement tag")
-        elif name == "Signal drift":
+                raise ValueError("Instrument faults require an analog measurement tag")
+        elif name in {"Signal drift", "Signal freeze"}:
             # A real instrument fault affects one transmitter. Select a stable,
             # reproducible analog point so the operator has healthy peers to compare.
             candidates = [tag for tag in sim["tags"]
                           if tag.get("dynamic_model")
                           and tag.get("units") not in {"bool", "enum", "cycles"}
                           and (area == "Whole factory" or tag["area"] == area)]
-            if candidates:
-                target_tag = candidates[sim["next_event"] % len(candidates)]["tag"]
+            if not candidates:
+                raise ValueError(f"No analog measurement tags are available in {area}")
+            target_tag = candidates[sim["next_event"] % len(candidates)]["tag"]
         duration = duration_seconds or {"Small": 90, "Medium": 240, "Large": 600}[severity]
         if not 1 <= duration <= 86_400:
             raise ValueError("Incident duration must be between 1 and 86,400 simulated seconds")
         event = ProcessEvent(name, area, severity, sim["tick"], duration,
                              sim["next_event"], target_asset, float(fault_location_pct),
                              bool(primary_breaker_failure), target_tag)
+        if name == "Signal freeze" and target_tag:
+            matching = next(tag for tag in sim["tags"] if tag["tag"] == target_tag)
+            event.measurement_baseline = float(matching["value"])
         sim["events"].append(event)
         sim["next_event"] += 1
         description = f"{name} injected in {area}"
@@ -100,16 +104,22 @@ class FactoryProcessModel:
 
     @staticmethod
     def apply_instrument_faults(tags: list[dict], events: list[ProcessEvent], tick: int) -> None:
-        """Apply reproducible, time-ramped instrument bias to telemetry only.
+        """Apply reproducible instrument faults after process models refresh tags.
 
-        Process state is held by the subsystem models; this deliberately changes
-        the published measurement after those models have refreshed it.
+        A frozen level is also supplied to its process controller by the water
+        network model; other targets are telemetry-only instrument faults.
         """
-        drift_by_tag = {event.target_tag: event for event in events
-                        if event.name == "Signal drift" and event.target_tag}
+        instrument_fault_by_tag = {event.target_tag: event for event in events
+                                   if event.name in {"Signal drift", "Signal freeze"}
+                                   and event.target_tag}
         for tag in tags:
-            event = drift_by_tag.get(tag["tag"])
+            event = instrument_fault_by_tag.get(tag["tag"])
             if event is None:
+                continue
+            if event.name == "Signal freeze":
+                tag["value"] = round(float(event.measurement_baseline), 3)
+                tag["quality"] = "BAD"
+                tag["last_change"] = "Signal frozen at last value"
                 continue
             span = max(0.0, float(tag.get("high", 0.0)) - float(tag.get("low", 0.0)))
             if span <= 0.0:

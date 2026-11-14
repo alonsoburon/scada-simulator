@@ -108,6 +108,7 @@ BUILDING_SENSORS = [
 ]
 INCIDENTS = {
     "Signal drift": "measurement",
+    "Signal freeze": "measurement",
     "Network partition": "comms",
     "Utility loss": "utility",
     "Mechanical degradation": "mechanical",
@@ -1493,7 +1494,7 @@ with st.sidebar:
         fault_location_pct = 90.0
         primary_breaker_failure = False
     target_tag = None
-    if incident_name == "Signal drift":
+    if incident_name in {"Signal drift", "Signal freeze"}:
         candidates = [tag for tag in sim["tags"]
                       if tag.get("dynamic_model")
                       and tag.get("units") not in {"bool", "enum", "cycles"}
@@ -1501,7 +1502,8 @@ with st.sidebar:
         if candidates:
             labels = {tag["tag"]: f"{tag['unit']} · {tag['sensor']} ({tag['units']})"
                       for tag in candidates}
-            target_tag = st.selectbox("Drifting instrument", list(labels),
+            instrument_label = "Drifting instrument" if incident_name == "Signal drift" else "Frozen instrument"
+            target_tag = st.selectbox(instrument_label, list(labels),
                                       format_func=lambda tag_name: labels[tag_name],
                                       key="signal_drift_target")
     if st.button("⚠ Inject incident", width="stretch"):
@@ -2082,7 +2084,7 @@ def render_dashboard():
     with tabs[5]:
         q1, q2, q3 = st.columns(3)
         area_filter = q1.selectbox("Area filter", ["All", *AREAS.keys()])
-        quality_filter = q2.selectbox("Quality", ["All", "GOOD", "STALE"])
+        quality_filter = q2.selectbox("Quality", ["All", "GOOD", "STALE", "BAD"])
         search = q3.text_input("Find tag", placeholder="e.g. boiler_01")
         filtered = tags_df.copy()
         if area_filter != "All": filtered = filtered[filtered.area == area_filter]
@@ -2225,7 +2227,7 @@ def render_dashboard():
         st.subheader("Investigation missions")
         st.markdown("Use these as exercises: form hypotheses, locate evidence across areas, identify first-out signals, and propose what a unified monitoring layer should show.")
         missions = [
-            ("Small · Instrument fault", "Inject Signal drift in one area. Find which tags moved together, separate process change from measurement fault, and propose a quality rule."),
+            ("Small · Instrument fault", "Inject Signal drift or Signal freeze. Compare transmitter quality, the independent physical level, pump output, and tank response; explain how bad feedback changes the process."),
             ("Medium · Utility disturbance", "Inject Utility loss in Boiler house or Compressed air. Trace which downstream areas lose pressure, flow, or production. Identify leading and lagging signals."),
             ("Large · Plant-wide incident", "Inject a Large incident into Whole factory. Rank affected areas by urgency, draft an alarm grouping strategy, and decide what evidence a shift handover needs."),
             ("Cold chain · Dispatch and refrigeration", "Run `warehouse-cold-store-outage-and-recovery`. Determine whether dispatch congestion or refrigeration failed first; compare cases in each buffer, room temperature, accumulated exposure, and the case-packer response."),

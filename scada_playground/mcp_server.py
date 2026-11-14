@@ -365,7 +365,9 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
     Water main leak requires target_area='Water distribution' and target_asset set to
     District zone A, District zone B, or District zone C; severity sets the simulated break size.
-    Signal drift accepts target_tag to bias one analog measurement without changing process state.
+    Signal drift biases one analog measurement; Signal freeze holds its last value and
+    marks its quality BAD. Both accept target_tag, and freeze affects the water-level
+    controller when targeting one of its level transmitters.
     For reset_feeder_protection, target_asset may be a locked feeder or Distribution incomer.
     For maintain_equipment, target_asset must be one of the named concentrator assets; the asset
     must be STOPPED and its mechanical fault cleared before maintenance is allowed.
@@ -399,13 +401,13 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                 or target_asset not in {"District zone A", "District zone B", "District zone C"}):
             raise ValueError("Water main leak requires Water distribution and a named district zone target_asset")
         if target_tag:
-            if incident_name != "Signal drift":
-                raise ValueError("target_tag is only valid for Signal drift")
+            if incident_name not in {"Signal drift", "Signal freeze"}:
+                raise ValueError("target_tag is only valid for Signal drift or Signal freeze")
             matching = next((tag for tag in data.get("tags", []) if tag.get("tag") == target_tag), None)
             if matching is None or (target_area != "Whole factory" and matching.get("area") != target_area):
                 raise ValueError("target_tag must identify a tag in the selected target area")
             if matching.get("units") in {"bool", "enum", "cycles"}:
-                raise ValueError("Signal drift requires an analog measurement tag")
+                raise ValueError("Instrument faults require an analog measurement tag")
     if action == "reset_feeder_protection":
         if target_area != "Grid distribution" or target_asset not in {
                 "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Distribution incomer"}:
