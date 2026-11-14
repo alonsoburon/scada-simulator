@@ -108,7 +108,9 @@ class HaulTruckFleetTests(unittest.TestCase):
         self.assertIn("mobile_fleet.haul_truck_01.road_grade", tags)
 
     def test_trucks_refuel_at_the_shovel_queue_before_running_dry(self):
-        self.run_ticks(self.state, 86_400)
+        # At the modeled duty cycle a 4,500 L tank reaches the 85% service
+        # threshold after about 27 h, then needs ten minutes at the pit bay.
+        self.run_ticks(self.state, 108_000)
         completed = [truck["refuels_completed"] for truck in self.state["trucks"].values()]
         self.assertGreater(sum(completed), 0)
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}

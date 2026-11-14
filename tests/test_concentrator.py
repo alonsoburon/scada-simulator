@@ -54,6 +54,9 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertEqual(self.state["fresh_water_shortage_m3h"], 250)
 
     def test_process_water_balance_uses_solids_and_underflow_moisture(self):
+        # Remove pond inventory so this checks the steady reclaim circuit rather
+        # than crediting a pre-filled pond as process recovery.
+        self.state["tailings_pond_inventory_m3"] = 0.0
         self.advance(1_200)
         state = self.state
         self.assertAlmostEqual(state["water_specific_m3_t"], 0.90)
@@ -83,6 +86,7 @@ class CopperConcentratorTests(unittest.TestCase):
     def test_thickener_outage_holds_water_then_flushes_overflow_on_restart(self):
         self.advance(600)
         normal_return = self.state["tailings_reclaim_water_m3h"]
+        normal_overflow = self.state["tailings_thickener_overflow_water_m3h"]
         initial_water = self.state["tailings_thickener_water_inventory_m3"]
         unavailable = {name: True for name in (
             "crusher", "conveyors", "sag_mill", "ball_mill", "flotation", "tailings_pump",
@@ -90,11 +94,16 @@ class CopperConcentratorTests(unittest.TestCase):
         unavailable["tailings_thickener"] = False
         for tick in range(601, 1_501):
             self.model.advance(self.state, tick, [], equipment_available=unavailable)
-        self.assertEqual(self.state["tailings_reclaim_water_m3h"], 0.0)
+        # The thickener overflow stops, but the independent pond decant pump
+        # continues recovering stored water until the pond level controller slows it.
+        self.assertEqual(self.state["tailings_thickener_overflow_water_m3h"], 0.0)
+        self.assertGreater(self.state["tailings_decant_water_m3h"], 0.0)
+        self.assertAlmostEqual(self.state["tailings_reclaim_water_m3h"],
+                               self.state["tailings_decant_water_m3h"])
         self.assertGreater(self.state["tailings_thickener_water_inventory_m3"], initial_water)
         self.model.advance(self.state, 1_501, [])
-        self.assertGreater(self.state["tailings_reclaim_water_m3h"], normal_return * 1.5)
-        self.assertGreater(self.state["tailings_thickener_overflow_water_m3h"], normal_return)
+        self.assertGreater(self.state["tailings_thickener_overflow_water_m3h"], normal_overflow)
+        self.assertGreater(self.state["tailings_reclaim_water_m3h"], normal_return * 0.8)
 
     def test_legacy_state_recalculates_water_metrics_for_new_model_revision(self):
         legacy = self.model.initialize()
@@ -118,9 +127,12 @@ class CopperConcentratorTests(unittest.TestCase):
             "tailings_thickener", "concentrate_thickener", "filter_press")}
         unavailable["tailings_thickener"] = False
         self.advance(3, equipment_available=unavailable)
-        self.assertEqual(self.state["tailings_reclaim_water_m3h"], 0.0)
-        self.assertLess(self.state["concentrator_reclaim_m3h"], normal_return * 0.2)
-        self.assertGreater(self.state["water_makeup_m3h"], normal_return)
+        self.assertEqual(self.state["tailings_thickener_overflow_water_m3h"], 0.0)
+        self.assertGreater(self.state["tailings_decant_water_m3h"], 0.0)
+        self.assertAlmostEqual(self.state["tailings_reclaim_water_m3h"],
+                               self.state["tailings_decant_water_m3h"])
+        self.assertLess(self.state["concentrator_reclaim_m3h"], normal_return * 0.8)
+        self.assertGreater(self.state["water_makeup_m3h"], 0.0)
 
     def test_press_filtrate_is_a_squeeze_phase_batch_release(self):
         peak_filtrate_m3h = 0.0

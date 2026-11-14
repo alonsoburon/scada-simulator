@@ -20,7 +20,13 @@ class MinePowerNetworkTests(unittest.TestCase):
         for tick in range(1, 301):
             self.model.advance(self.state, tick, [], process_load_mw=28.0,
                                water_load_mw=0.5, seed=17)
-            battery_energy_delta_mwh -= self.state["battery_scan_average_power_mw"] / 3600.0
+            scan_power = self.state["battery_scan_average_power_mw"]
+            if scan_power >= 0.0:
+                battery_energy_delta_mwh -= (scan_power / self.model.BATTERY_DISCHARGE_EFFICIENCY
+                                              / 3600.0)
+            else:
+                battery_energy_delta_mwh -= (scan_power * self.model.BATTERY_CHARGE_EFFICIENCY
+                                              / 3600.0)
         self.assertAlmostEqual(self.state["process_power_fraction"], 1.0)
         self.assertAlmostEqual(self.state["water_power_fraction"], 1.0)
         self.assertGreater(self.state["grid_import_mw"], 20)
@@ -339,7 +345,10 @@ class MinePowerNetworkTests(unittest.TestCase):
         self.assertGreater(incomer_trip_at, primary_operated_at)
         north = self.state["distribution_feeders"]["north"]
         incomer = self.state["distribution_incomer"]
-        self.assertTrue(north["relay_operated"])
+        # The relay operated before the backup incomer opened; opening the
+        # upstream breaker then removes feeder current and resets the pickup bit.
+        self.assertEqual(north["relay_operation_count"], 1)
+        self.assertFalse(north["relay_operated"])
         self.assertEqual(north["breaker_failure_count"], 1)
         self.assertTrue(north["breaker_closed"])
         self.assertFalse(incomer["breaker_closed"])

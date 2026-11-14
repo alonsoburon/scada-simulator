@@ -35,7 +35,12 @@ class ChilledWaterPlantTests(unittest.TestCase):
         self.assertLess(self.chilled["storage_mwh"], start_storage)
 
     def test_plant_outage_exhausts_cold_reserve_then_diverts_product_and_starves_filler(self):
-        outage = [{"name": "Utility loss", "area": "Chilled water", "severity": "Large"}]
+        outage = [
+            {"name": "Utility loss", "area": "Chilled water", "severity": "Large",
+             "target_asset": "Chiller A"},
+            {"name": "Utility loss", "area": "Chilled water", "severity": "Large",
+             "target_asset": "Chiller B"},
+        ]
         self.advance(1)
         start_storage = self.chilled["storage_mwh"]
         initial_supply_temp = self.chilled["supply_temperature_c"]

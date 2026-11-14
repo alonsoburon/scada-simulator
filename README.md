@@ -99,7 +99,7 @@ Built-in scenarios:
 - `frozen-water-level-transmitter`: a demand upset moves the raw-water tank level while a frozen transmitter reports `BAD`; the automatic pump loop continues using the held measurement, then recovers when the instrument fault clears.
 - `mine-water-treatment-upset-and-recovery`: source turbidity, chemical use, filtration loading, transfer-line delay, and treated-tank quality move at different rates during an upset and recovery.
 - `water-distribution-outage-and-demand-recovery`: an isolated distribution-pump outage draws down the elevated tank; a demand surge lowers high-zone pressure before tank refill restores district service.
-- `chilled-water-loss-and-recovery`: a chilled-water feeder loss draws down thermal reserve; depleted cooling capacity diverts hot product, drains the balance tank, and slows filling until cooling recovers.
+- `chilled-water-loss-and-recovery`: both compressor feeders fail while circulation remains available; thermal reserve carries cooling before depletion diverts hot product, drains the balance tank, and slows filling.
 - `boiler-header-pressure-and-recovery`: boiler capacity loss drains header inventory; pasteurizer temperatures lag the pressure drop and recover after the fault clears.
 - `cip-water-steam-and-production-recovery`: a pasteurizer CIP cycle sequences rinse, caustic, hot sanitation, final rinse, and release; shared water or steam shortages hold the phase and production returns after cleaning.
 - `cip-wastewater-quality-and-reuse`: CIP return enters equalization and treatment through an outage and recovery; compare neutralization, solids removal, chemical inventories, sludge pressing, quality-gated reuse, and outfall.

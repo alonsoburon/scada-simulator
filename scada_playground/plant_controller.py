@@ -294,6 +294,9 @@ class PlantController:
                 equipment["starts"] += 1
                 state["sequence_index"] += 1
                 state["last_transition"] = f"{self.LABELS[name]} run feedback confirmed"
+                if state["sequence_index"] >= len(self.START_ORDER):
+                    state["mode"] = "RUNNING"
+                    state["permissive_reason"] = "All equipment running; process permissives healthy"
             return
 
         state["mode"] = "STOPPING"
@@ -315,6 +318,9 @@ class PlantController:
             equipment.update(state="STOPPED", elapsed_s=0)
             state["sequence_index"] += 1
             state["last_transition"] = f"{self.LABELS[name]} stopped"
+            if state["sequence_index"] >= len(self.STOP_ORDER):
+                state["mode"] = "STOPPED"
+                state["permissive_reason"] = "All process motors stopped in sequence"
 
     @staticmethod
     def availability(state: dict) -> dict[str, bool]:

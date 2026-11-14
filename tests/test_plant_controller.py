@@ -20,21 +20,21 @@ class PlantControllerTests(unittest.TestCase):
 
     def test_start_and_stop_follow_ordered_sequences(self):
         self.controller.request(self.state, "STOP")
-        self.advance(80)
+        self.advance(81)
         self.assertEqual(self.state["mode"], "STOPPED")
         self.assertTrue(all(item["state"] == "STOPPED" for item in self.state["equipment"].values()))
 
         self.controller.request(self.state, "START")
-        self.advance(80)
+        self.advance(81)
         self.assertEqual(self.state["mode"], "RUNNING")
         self.assertTrue(all(item["state"] == "RUNNING" for item in self.state["equipment"].values()))
         self.assertEqual(self.state["equipment"]["tailings_pump"]["starts"], 2)
 
     def test_startup_waits_for_water_and_power_permissives(self):
         self.controller.request(self.state, "STOP")
-        self.advance(80)
+        self.advance(81)
         self.controller.request(self.state, "START")
-        self.advance(30, process_water_level_pct=10.0)
+        self.advance(40, process_water_level_pct=10.0)
         self.assertEqual(self.state["process_water_level_feedback_pct"], 10.0)
         self.assertEqual(self.state["equipment"]["tailings_pump"]["state"], "RUNNING")
         self.assertEqual(self.state["equipment"]["flotation"]["state"], "STOPPED")
@@ -50,16 +50,16 @@ class PlantControllerTests(unittest.TestCase):
 
     def test_ordered_motor_start_adds_a_decaying_grid_load_transient(self):
         self.controller.request(self.state, "STOP")
-        self.advance(80)
+        self.advance(81)
         self.controller.request(self.state, "START")
 
-        self.controller.advance(self.state, 81, [], **self.utilities)
+        self.controller.advance(self.state, 82, [], **self.utilities)
         pump_start_load = self.state["motor_starting_load_mw"]
         self.assertAlmostEqual(pump_start_load,
-                               self.controller.MOTOR_STARTING_LOAD_MW["tailings_pump"])
-        self.assertEqual(self.state["equipment"]["tailings_pump"]["state"], "STARTING")
+                               self.controller.MOTOR_STARTING_LOAD_MW["tailings_decant_pump"])
+        self.assertEqual(self.state["equipment"]["tailings_decant_pump"]["state"], "STARTING")
 
-        self.controller.advance(self.state, 82, [], **self.utilities)
+        self.controller.advance(self.state, 83, [], **self.utilities)
         self.assertGreater(self.state["motor_starting_load_mw"], 0.0)
         self.assertLess(self.state["motor_starting_load_mw"], pump_start_load)
 

@@ -12,6 +12,9 @@ class MinePowerIntegrationTests(unittest.TestCase):
         concentrator_model = CopperConcentrator()
         water = water_model.initialize()
         concentrator = concentrator_model.initialize()
+        # Start without pre-filled tailings-pond inventory so makeup demand
+        # measures reclaim-loop performance rather than drawing down the pond.
+        concentrator["tailings_pond_inventory_m3"] = 0.0
         for tick in range(1, 3_601):
             concentrator_model.advance(concentrator, tick, [],
                                        water_shortage_m3h=water["unmet_demand_m3h"])

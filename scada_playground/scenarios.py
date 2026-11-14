@@ -62,7 +62,7 @@ SCENARIOS = {
         expected_observations=(
             "Haul trucks deliver finite payloads after loading and loaded trips; return trips carry no ore.",
             "A single shovel and crusher tip serve FIFO queues; watch queue length and per-truck wait tags as arrival bunching changes cycle time.",
-            "Loaded uphill speed is capped by tractive power for the truck's gross mass and road grade; engine load and fuel use follow the same traction calculation.",
+            "Loaded uphill speed is capped by tractive power for the truck's gross mass and the elevation-driven road grade; engine load and fuel use follow the same traction calculation.",
             "Sustained descents add brake heat in proportion to absorbed gravitational power, then the brakes cool over time; compare loaded and empty returns.",
             "Dispatch holds against ROM plus payload already committed on loaded trucks, reducing stockpile overshoot while late trucks finish their trips.",
             "The crusher conveyor trip stops ROM discharge, so incoming truckloads raise the ROM stockpile while downstream buffers continue feeding the concentrator.",
@@ -155,11 +155,15 @@ SCENARIOS = {
     "chilled-water-loss-and-recovery": ScenarioDefinition(
         scenario_id="chilled-water-loss-and-recovery",
         name="Chilled-water failure, thermal reserve, and production recovery",
-        description="A plant-wide chilled-water feeder loss draws down thermal storage; once cold reserve is exhausted, pasteurized product is diverted, the product buffer drains, and filling slows until the chillers recover.",
+        description="Both chiller-compressor feeders fail while the chilled-water circulation pumps remain available; thermal storage carries the pasteurizer load, then product is diverted when the cold reserve is exhausted.",
         duration_seconds=10_800,
         steps=(
             ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
-                                             "target_area": "Chilled water", "duration_seconds": 7_200}),
+                                             "target_area": "Chilled water", "target_asset": "Chiller A",
+                                             "duration_seconds": 7_200}),
+            ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                             "target_area": "Chilled water", "target_asset": "Chiller B",
+                                             "duration_seconds": 7_200}),
         ),
         expected_observations=(
             "The chillers ramp down after feeder loss while the chilled-water reserve temporarily carries the pasteurizer cooler load.",

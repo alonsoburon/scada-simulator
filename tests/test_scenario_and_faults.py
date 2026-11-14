@@ -44,20 +44,27 @@ class ScenarioRunnerTests(unittest.TestCase):
 
     def test_water_distribution_scenario_overlaps_tank_outage_and_demand_surge(self):
         definition = ScenarioRunner().definition("water-distribution-outage-and-demand-recovery")
-        outage, upset = definition.steps
+        outage, upset, leak = definition.steps
         self.assertEqual(outage.parameters["target_area"], "Water distribution")
         self.assertEqual(outage.parameters["incident_name"], "Utility loss")
         self.assertEqual(upset.parameters["incident_name"], "Process upset")
         self.assertLess(upset.at_seconds,
                         outage.at_seconds + outage.parameters["duration_seconds"])
+        self.assertEqual(leak.action, "incident")
+        self.assertEqual(leak.parameters["incident_name"], "Water main leak")
+        self.assertEqual(leak.parameters["target_asset"], "District zone B")
+        self.assertEqual(leak.at_seconds, 3_600)
         self.assertTrue(any("pressure" in note.lower() and "tank" in note.lower()
                             for note in definition.expected_observations))
 
     def test_chilled_water_scenario_exhausts_reserve_before_power_recovery(self):
         definition = ScenarioRunner().definition("chilled-water-loss-and-recovery")
-        outage = definition.steps[0]
+        outage, second_chiller = definition.steps
         self.assertEqual(outage.parameters["target_area"], "Chilled water")
         self.assertEqual(outage.parameters["incident_name"], "Utility loss")
+        self.assertEqual(outage.parameters["target_asset"], "Chiller A")
+        self.assertEqual(second_chiller.parameters["target_asset"], "Chiller B")
+        self.assertEqual(second_chiller.at_seconds, outage.at_seconds)
         self.assertGreater(outage.parameters["duration_seconds"], 3_600)
         self.assertTrue(any("buffer" in note.lower() and "filler" in note.lower()
                             for note in definition.expected_observations))
