@@ -30,6 +30,7 @@ from chilled_water import ChilledWaterPlant
 from site_buildings import SiteBuildings
 from underground_ventilation import UndergroundVentilation
 from end_of_line import EndOfLineLogistics
+from batch_blending import BatchBlending
 
 
 AREAS = {
@@ -56,8 +57,8 @@ AREAS = {
     "Compressed air": ["Compressor A", "Compressor B", "Dryer A", "Receiver 01", "Ring main"],
     "Chilled water": ["Chiller A", "Chiller B", "Primary pumps", "Condenser water pumps",
                       "Cooling tower", "Supply header"],
-    "Ingredient dosing": ["Doser 01", "Doser 02", "Doser 03", "Doser 04", "Micro ingredients"],
-    "Batch blending": ["Mixer 01", "Mixer 02", "Batch tank A", "Batch tank B", "Transfer manifold"],
+    "Ingredient dosing": ["Base concentrate tank", "Syrup tank", "Base dosing pump", "Syrup dosing pump", "Treated-water inlet"],
+    "Batch blending": ["Mix tank A", "Blend outlet", "Recipe controller"],
     "Thermal processing": ["Pasteurizer 01", "Pasteurizer 02", "CIP return", "Hot water loop", "Cooling section"],
     "CIP": ["CIP tank A", "CIP tank B", "CIP supply", "CIP return", "Chemical dosing"],
     "Filling": ["Filler 01", "Filler 02", "Capper 01", "Labeler 01", "Inspection station"],
@@ -193,6 +194,7 @@ PLANT_CONTROLLER = PlantController()
 BUILDING_MODEL = SiteBuildings()
 VENTILATION_MODEL = UndergroundVentilation()
 END_OF_LINE_MODEL = EndOfLineLogistics()
+BATCH_MODEL = BatchBlending()
 SCENARIO_RUNNER = ScenarioRunner()
 PROTOCOL_FAULTS = ProtocolFaultInjector()
 
@@ -239,6 +241,7 @@ def initialize(seed: int = 17) -> None:
         haulage_state = HAULAGE_MODEL.initialize()
         utility_state = UTILITY_MODEL.initialize()
         end_of_line_state = END_OF_LINE_MODEL.initialize()
+        batch_blending_state = BATCH_MODEL.initialize()
         chilled_state = CHILLED_MODEL.initialize()
         CHILLED_MODEL.advance(chilled_state, 0, [],
             cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(utility_state), seed=seed)
@@ -261,6 +264,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         modeled_assets.update((area, asset) for area, assets in END_OF_LINE_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
+        modeled_assets.update((area, asset) for area, assets in BATCH_MODEL.AREA_ASSETS.items()
                               for asset in assets)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
@@ -288,6 +293,7 @@ def initialize(seed: int = 17) -> None:
         POWER_MODEL.advance(power_state, 0, [], process_load_mw=initial_process_power_mw,
                             water_load_mw=initial_water_power_mw,
                             utility_load_mw=(utility_state["electric_load_mw"]
+                                             + batch_blending_state["electric_load_mw"]
                                              + chilled_state["electric_load_mw"]
                                              + eol_initial_load_mw),
                             site_building_load_mw=buildings_state["electric_load_mw"],
@@ -305,6 +311,7 @@ def initialize(seed: int = 17) -> None:
         tags.extend(CHILLED_MODEL.telemetry(chilled_state, seed))
         tags.extend(BUILDING_MODEL.telemetry(buildings_state, seed))
         tags.extend(END_OF_LINE_MODEL.telemetry(end_of_line_state, seed))
+        tags.extend(BATCH_MODEL.telemetry(batch_blending_state, seed))
         ventilation_tags = VENTILATION_MODEL.telemetry(ventilation_state, seed)
         for tag in ventilation_tags:
             tag["dynamic_model"] = True
@@ -320,6 +327,7 @@ def initialize(seed: int = 17) -> None:
                                 "process_control": process_control_state,
                                 "haulage": haulage_state,
                                 "end_of_line": end_of_line_state,
+                                "batch_blending": batch_blending_state,
                                 "simulation_id": uuid.uuid4().hex,
                                 "water_alarm_states": {},
                                 "water_distribution_alarm_states": {},
@@ -327,6 +335,7 @@ def initialize(seed: int = 17) -> None:
                                 "building_alarm_states": {},
                                 "ventilation_alarm_states": {},
                                 "end_of_line_alarm_states": {},
+                                "batch_blending_alarm_states": {},
                                 "concentrator_alarm_states": {},
                                 "haulage_alarm_states": {},
                                 "events": [], "history": [], "alarms": [], "next_event": 1,
@@ -364,6 +373,10 @@ def initialize(seed: int = 17) -> None:
             sim["end_of_line"] = END_OF_LINE_MODEL.initialize()
         END_OF_LINE_MODEL.migrate(sim["end_of_line"])
         sim.setdefault("end_of_line_alarm_states", {})
+        if "batch_blending" not in sim:
+            sim["batch_blending"] = BATCH_MODEL.initialize()
+        BATCH_MODEL.migrate(sim["batch_blending"])
+        sim.setdefault("batch_blending_alarm_states", {})
         if "mine_ventilation" not in sim:
             sim["mine_ventilation"] = VENTILATION_MODEL.initialize()
             VENTILATION_MODEL.advance(sim["mine_ventilation"], sim.get("tick", 0), [], seed=sim["seed"])
@@ -379,6 +392,8 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update(("Underground mining", asset) for asset in
                               ("Ventilation fans", "Decline level 1", "Decline level 2", "Ore pass system"))
         modeled_assets.update((area, asset) for area, assets in END_OF_LINE_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
+        modeled_assets.update((area, asset) for area, assets in BATCH_MODEL.AREA_ASSETS.items()
                               for asset in assets)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
         modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
@@ -416,6 +431,7 @@ def initialize(seed: int = 17) -> None:
                                 water_load_mw=water_load_mw,
                                 utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
                                                  + sim["chilled_water"]["electric_load_mw"]
+                                                 + sim["batch_blending"]["electric_load_mw"]
                                                  + sim["end_of_line"]["electric_load_mw"]),
                                 site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                                 site_nonbuilding_request_mw=5.6,
@@ -440,6 +456,7 @@ def initialize(seed: int = 17) -> None:
         building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
         sim["tags"].extend(building_tags)
         sim["tags"].extend(END_OF_LINE_MODEL.telemetry(sim["end_of_line"], sim["seed"]))
+        sim["tags"].extend(BATCH_MODEL.telemetry(sim["batch_blending"], sim["seed"]))
     unique_tags = {}
     for tag in st.session_state.sim["tags"]:
         unique_tags[tag["tag"]] = tag
@@ -510,6 +527,7 @@ def publish_snapshot() -> dict:
         "chilled_water": CHILLED_MODEL.public_state(sim["chilled_water"]),
         "site_buildings": BUILDING_MODEL.public_state(sim["site_buildings"]),
         "end_of_line": END_OF_LINE_MODEL.public_state(sim["end_of_line"]),
+        "batch_blending": BATCH_MODEL.public_state(sim["batch_blending"]),
         "mine_ventilation": VENTILATION_MODEL.public_state(sim["mine_ventilation"]),
         "concentrator": {key: value for key, value in sim["concentrator"].items() if key != "history"},
         "process_control": PLANT_CONTROLLER.public_state(sim["process_control"]),
@@ -771,6 +789,55 @@ def advance(force: bool = False) -> None:
         sim["water_network"].get("boiler_feedwater_in_transit_m3", 0.0) * 3600.0)
     prior_case_service_fraction = sim["end_of_line"].get("case_acceptance_fraction", 1.0)
     prior_wastewater_availability = sim["water_network"].get("wastewater_available_fraction", 1.0)
+    prior_blending_water_m3h = (
+        sim["water_network"].get("blending_water_in_transit_m3", 0.0) * 3600.0)
+    prior_product_demand_lpm = sum(
+        item["process_rate"] for item in sim["plant_utilities"]["pasteurizers"].values())
+    BATCH_MODEL.advance(
+        sim["batch_blending"], sim["tick"], utility_events,
+        product_demand_lpm=prior_product_demand_lpm,
+        water_delivery_m3h=prior_blending_water_m3h,
+        water_turbidity_ntu=sim["water_network"]["nodes"]["treated_tank"]["turbidity_ntu"],
+        water_chlorine_mg_l=sim["water_network"]["nodes"]["treated_tank"]["chlorine_residual_mg_l"],
+        power_available_fraction=sim["power_network"].get("factory_utilities_power_fraction", 1.0),
+        seed=sim["seed"],
+    )
+    blend = sim["batch_blending"]
+    blend_conditions = {
+        "mix_tank_low": (blend["mix_tank_level_pct"] < 20.0,
+                         blend["mix_tank_level_pct"] > 35.0,
+                         "Blend tank inventory is low; pasteurizers are drawing down their buffer", "HIGH"),
+        "ingredient_base_low": (blend["base_tank_inventory_kg"] < 0.15 * blend["base_tank_capacity_kg"],
+                                blend["base_tank_inventory_kg"] > 0.25 * blend["base_tank_capacity_kg"],
+                                "Base-concentrate inventory is low", "HIGH"),
+        "ingredient_syrup_low": (blend["syrup_tank_inventory_kg"] < 0.15 * blend["syrup_tank_capacity_kg"],
+                                 blend["syrup_tank_inventory_kg"] > 0.25 * blend["syrup_tank_capacity_kg"],
+                                 "Syrup inventory is low", "HIGH"),
+        "mix_water_shortage": (blend["water_service_fraction"] < 0.90,
+                               blend["water_service_fraction"] > 0.97,
+                               "Treated-water delivery is limiting recipe blending", "HIGH"),
+        "mix_water_quality": (not blend["water_quality_permissive"],
+                              blend["water_quality_permissive"],
+                              "Treated-water quality is outside the blend permissive; mixing is inhibited",
+                              "CRITICAL"),
+        "recipe_deviation": (blend["recipe_ratio_error_pct"] > 3.0,
+                             blend["recipe_ratio_error_pct"] < 1.5,
+                             "Recipe controller deviation exceeds the mixing tolerance; new batches are held",
+                             "HIGH"),
+        "product_feed_low": (blend["product_feed_service_fraction"] < 0.95,
+                             blend["product_feed_service_fraction"] > 0.99,
+                             "Blend tank cannot meet pasteurizer product demand", "CRITICAL"),
+    }
+    blend_alarm_states = sim.setdefault("batch_blending_alarm_states", {})
+    for key, (active, cleared, message, severity) in blend_conditions.items():
+        was_active = blend_alarm_states.get(key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Batch blending",
+                "severity": severity, "message": message, "state": "ACTIVE / UNACK"})
+        elif was_active and cleared:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Batch blending",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+        blend_alarm_states[key] = active if not was_active else not cleared
     CHILLED_MODEL.advance(
         sim["chilled_water"], sim["tick"], utility_events,
         cooling_demand_kw=UTILITY_MODEL.chilled_water_demand_kw(sim["plant_utilities"]),
@@ -783,6 +850,7 @@ def advance(force: bool = False) -> None:
         water_available_fraction=prior_factory_water_availability,
         boiler_feedwater_delivery_m3h=prior_boiler_feedwater_delivery_m3h,
         downstream_case_service_fraction=prior_case_service_fraction,
+        product_feed_service_fraction=sim["batch_blending"]["product_feed_service_fraction"],
         wastewater_available_fraction=prior_wastewater_availability,
         chilled_water_service_fraction=sim["chilled_water"]["cooling_service_fraction"],
         chilled_water_supply_temperature_c=sim["chilled_water"]["supply_temperature_c"],
@@ -800,6 +868,7 @@ def advance(force: bool = False) -> None:
                         water_load_mw=water_power_load_mw,
                         utility_load_mw=(sim["plant_utilities"]["electric_load_mw"]
                                          + sim["chilled_water"]["electric_load_mw"]
+                                         + sim["batch_blending"]["electric_load_mw"]
                                          + sim["end_of_line"]["electric_load_mw"]),
                         site_building_load_mw=sim["site_buildings"]["electric_load_mw"],
                         site_nonbuilding_request_mw=5.6,
@@ -927,6 +996,8 @@ def advance(force: bool = False) -> None:
                         factory_cip_effluent_m3h=sim["plant_utilities"]["cip_effluent_m3h"],
                         factory_boiler_feedwater_demand_m3h=(
                             sim["plant_utilities"]["feedwater_demand_m3h"]),
+                        factory_blending_water_demand_m3h=(
+                            sim["batch_blending"]["mix_water_demand_m3h"]),
                         factory_cip_return_ph=sim["plant_utilities"]["cip"]["return_ph"],
                         factory_cip_conductivity_us_cm=sim["plant_utilities"]["cip"]["return_conductivity_us_cm"],
                         power_available_fraction=sim["power_network"]["water_power_fraction"])
@@ -1230,6 +1301,7 @@ def advance(force: bool = False) -> None:
     water_tags, _diagram = WATER_MODEL.telemetry(sim["water_network"])
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
+    batch_tags = BATCH_MODEL.telemetry(sim["batch_blending"], sim["seed"])
     chilled_tags = CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"])
     building_tags = BUILDING_MODEL.telemetry(sim["site_buildings"], sim["seed"])
     end_of_line_tags = END_OF_LINE_MODEL.telemetry(sim["end_of_line"], sim["seed"])
@@ -1237,6 +1309,7 @@ def advance(force: bool = False) -> None:
     water_by_tag = {tag["tag"]: tag for tag in water_tags}
     power_by_tag = {tag["tag"]: tag for tag in power_tags}
     utility_by_tag = {tag["tag"]: tag for tag in utility_tags}
+    batch_by_tag = {tag["tag"]: tag for tag in batch_tags}
     chilled_by_tag = {tag["tag"]: tag for tag in chilled_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
     end_of_line_by_tag = {tag["tag"]: tag for tag in end_of_line_tags}
@@ -1251,6 +1324,8 @@ def advance(force: bool = False) -> None:
             tag.update(power_by_tag[tag["tag"]])
         elif tag["tag"] in utility_by_tag:
             tag.update(utility_by_tag[tag["tag"]])
+        elif tag["tag"] in batch_by_tag:
+            tag.update(batch_by_tag[tag["tag"]])
         elif tag["tag"] in chilled_by_tag:
             tag.update(chilled_by_tag[tag["tag"]])
         elif tag["tag"] in building_by_tag:
@@ -1406,7 +1481,7 @@ def render_dashboard():
     if sim["protocol_faults"]:
         st.warning(f"{len(sim['protocol_faults'])} protocol fault(s) currently alter downstream telemetry.")
 
-    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities", "Underground ventilation", "Palletizing & warehouse"])
+    tabs = st.tabs(["Factory overview", "Water network", "Mineral process", "Area detail", "Mobile fleet", "Tag explorer", "Alarm console", "Power network", "Learning missions", "Plant utilities", "Underground ventilation", "Palletizing & warehouse", "Batch blending"])
     with tabs[0]:
         st.subheader("Plant health by area")
         overview = tags_df.groupby("area").agg(tags=("tag", "count"), stale=("quality", lambda x: int((x != "GOOD").sum())),
@@ -2062,6 +2137,7 @@ def render_dashboard():
             ("Medium · Utility disturbance", "Inject Utility loss in Boiler house or Compressed air. Trace which downstream areas lose pressure, flow, or production. Identify leading and lagging signals."),
             ("Large · Plant-wide incident", "Inject a Large incident into Whole factory. Rank affected areas by urgency, draft an alarm grouping strategy, and decide what evidence a shift handover needs."),
             ("Cold chain · Dispatch and refrigeration", "Run `warehouse-cold-store-outage-and-recovery`. Determine whether dispatch congestion or refrigeration failed first; compare cases in each buffer, room temperature, accumulated exposure, and the case-packer response."),
+            ("Recipe supply · Ingredients and treated water", "Compare `batch_blending` tank level with the base and syrup dosing tags and the treated-water delivery in `water_supply_network.process_demand`. Inject Mechanical degradation on a dosing pump and identify when the mix buffer begins limiting pasteurizers."),
             ("Integration challenge", "Design a canonical tag model for area, asset, signal, units, range, quality, timestamp, and source. Export a snapshot and sketch how your historian would ingest it."),
             ("Alarm rationalization", "Compare the alarm list with tag quality and trends. Define priority, deadband, delay, shelving rules, and operator response for each failure mode."),
         ]
@@ -2276,6 +2352,39 @@ def render_dashboard():
             st.info("Advance the factory or run the cold-store outage scenario to build logistics trends.")
         st.caption(f"Case-packer acceptance {logistics['case_acceptance_fraction']*100:.0f}% · palletizing {logistics['cases_palletized_mpm']:.1f} cases/min · wrapping {logistics['cases_wrapped_mpm']:.1f} cases/min · accumulated warm-product exposure {logistics['cold_store_temperature_exposure_case_h']:.1f} case·h")
         st.markdown("**Fault drill:** run `warehouse-cold-store-outage-and-recovery`. Track the cold-room temperature and case buffers separately: a restored temperature does not erase product's accumulated time above the simulated limit.")
+
+    with tabs[12]:
+        blend = sim["batch_blending"]
+        st.subheader("Recipe batching · ingredient and treated-water balance")
+        st.caption("Pasteurizer feed comes from a finite blend tank. The mixer preserves the recipe ratio and slows to the scarcest of treated water, base concentrate, syrup, mixer capacity, and tank headroom.")
+        metrics = st.columns(6)
+        for col, label, value in zip(metrics,
+            ["Blend tank", "Product feed", "Pasteurizer demand", "Treated water", "Base concentrate", "Syrup"],
+            [f"{blend['mix_tank_inventory_l']:.0f}/{blend['mix_tank_capacity_l']:.0f} L",
+             f"{blend['product_feed_lpm']:.1f} L/min",
+             f"{blend['product_demand_lpm']:.1f} L/min",
+             f"{blend['mix_water_delivered_m3h']:.1f}/{blend['mix_water_demand_m3h']:.1f} m³/h",
+             f"{blend['base_tank_inventory_kg']:.0f}/{blend['base_tank_capacity_kg']:.0f} kg",
+             f"{blend['syrup_tank_inventory_kg']:.0f}/{blend['syrup_tank_capacity_kg']:.0f} kg"]):
+            col.metric(label, value)
+        st.caption(f"Mixer {blend['mixer_rate_lpm']:.1f}/{blend['mixer_request_lpm']:.1f} L/min · recipe water fraction {BATCH_MODEL.WATER_L_PER_L*100:.0f}% · base concentrate {BATCH_MODEL.BASE_KG_PER_L*100:.0f}% · syrup {BATCH_MODEL.SYRUP_KG_PER_L*100:.0f}% by mass · treated-water quality {blend['water_turbidity_ntu']:.2f} NTU / {blend['water_chlorine_mg_l']:.2f} mg/L ({'permissive' if blend['water_quality_permissive'] else 'blocked'}) · estimated product-feed service {blend['product_feed_service_fraction']*100:.1f}%")
+        history = pd.DataFrame(blend["history"])
+        if not history.empty:
+            left, right = st.columns(2)
+            with left:
+                fig = px.line(history, x="sim_seconds", y=["mix_tank_level_pct"],
+                    labels={"sim_seconds": "Simulated seconds", "mix_tank_level_pct": "Tank level (%)"},
+                    color_discrete_sequence=["#277da1"])
+                fig.update_layout(title="Finite blend-tank inventory", uirevision="blend-tank")
+                st.plotly_chart(fig, width="stretch")
+            with right:
+                fig = px.line(history, x="sim_seconds", y=["product_demand_lpm", "product_feed_lpm", "mixer_rate_lpm"],
+                    labels={"sim_seconds": "Simulated seconds", "value": "L/min", "variable": "Flow"},
+                    color_discrete_sequence=["#e07a5f", "#43aa8b", "#9b5de5"])
+                fig.update_layout(title="Recipe production and pasteurizer feed", uirevision="blend-flow")
+                st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Advance the factory or inject a dosing or water-supply fault to build blend trends.")
 
 
 

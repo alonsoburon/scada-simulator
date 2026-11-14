@@ -296,6 +296,17 @@ def get_plant_utilities_state() -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_batch_blending_state() -> dict[str, Any]:
+    """Read mix-tank inventory, recipe ingredient stocks, dosing rates, and treated-water service."""
+    data = snapshot()
+    blending = data.get("batch_blending")
+    if not blending:
+        raise RuntimeError("Batch-blending model is absent; restart the playground to load its current snapshot schema")
+    return {"simulated": True, "snapshot_timestamp": data["timestamp"],
+            "sim_seconds": data["sim_seconds"], "running": data["running"], **blending}
+
+
+@mcp.tool()
 def get_chilled_water_state() -> dict[str, Any]:
     """Read chiller output, thermal storage, supply temperature, and product-cooling service."""
     data = snapshot()

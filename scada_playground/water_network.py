@@ -165,6 +165,10 @@ class MineWaterNetwork:
                 "factory_boiler_feedwater_demand_m3h": 6.4,
                 "boiler_feedwater_delivered_m3h": 6.4,
                 "boiler_feedwater_in_transit_m3": 0.0,
+                "factory_blending_water_demand_m3h": 16.392,
+                "blending_water_delivered_m3h": 16.392,
+                "blending_water_in_transit_m3": 0.0,
+                "unmet_blending_water_m3h": 0.0,
                 "boiler_feedwater_service_fraction": 1.0,
                 "unmet_boiler_feedwater_m3h": 0.0,
                 "unmet_demand_m3h": 0.0, "unmet_treated_demand_m3h": 0.0,
@@ -179,7 +183,7 @@ class MineWaterNetwork:
                 "cumulative_concentrator_return_m3": 0.0,
                 "electrical_load_kw": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {},
-                "schema_revision": 5,
+                "schema_revision": 6,
                 "distribution": self.DISTRIBUTION.initialize()}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
@@ -219,7 +223,7 @@ class MineWaterNetwork:
 
     def migrate(self, state: dict) -> None:
         """Add the concentrator reclaim circuit to sessions created by older builds."""
-        if state.get("schema_revision") == 5:
+        if state.get("schema_revision") == 6:
             ready = all(key in state for key in (
                 "nodes", "pumps", "controllers", "valves", "links", "treatment",
                 "wastewater", "distribution", "history"))
@@ -317,6 +321,10 @@ class MineWaterNetwork:
         state.setdefault("boiler_feedwater_service_fraction", 1.0)
         state.setdefault("unmet_boiler_feedwater_m3h", 0.0)
         state.setdefault("cumulative_boiler_feedwater_m3", 0.0)
+        state.setdefault("factory_blending_water_demand_m3h", 16.392)
+        state.setdefault("blending_water_delivered_m3h", 0.0)
+        state.setdefault("blending_water_in_transit_m3", 0.0)
+        state.setdefault("unmet_blending_water_m3h", 0.0)
         self.TREATMENT.migrate(state["treatment"])
         if "wastewater" not in state:
             state["wastewater"] = self.WASTEWATER.initialize()
@@ -357,7 +365,7 @@ class MineWaterNetwork:
             sample.setdefault("wastewater_effluent_ph", 7.0)
             sample.setdefault("wastewater_effluent_tss_mg_l", 0.0)
             sample.setdefault("wastewater_sludge_hopper_kg", 0.0)
-        state["schema_revision"] = 5
+        state["schema_revision"] = 6
 
     def maintain_pump(self, state: dict, pump_name: str, *, fault_active: bool = False) -> float:
         """Restore a water pump only after electrical isolation and coastdown."""
@@ -601,6 +609,7 @@ class MineWaterNetwork:
                 concentrator_demand_m3h: float = 0.0, concentrator_reclaim_m3h: float = 0.0,
                 factory_cip_demand_m3h: float = 0.0, factory_cip_effluent_m3h: float = 0.0,
                 factory_boiler_feedwater_demand_m3h: float = 0.0,
+                factory_blending_water_demand_m3h: float = 0.0,
                 factory_cip_return_ph: float = 7.0,
                 factory_cip_conductivity_us_cm: float = 100.0,
                 power_available_fraction: float | None = None) -> None:
@@ -617,6 +626,8 @@ class MineWaterNetwork:
         state["factory_cip_demand_m3h"] = max(0.0, factory_cip_demand_m3h)
         state["factory_boiler_feedwater_demand_m3h"] = max(
             0.0, factory_boiler_feedwater_demand_m3h)
+        state["factory_blending_water_demand_m3h"] = max(
+            0.0, factory_blending_water_demand_m3h)
         state["factory_cip_effluent_m3h"] = max(0.0, factory_cip_effluent_m3h)
         state["concentrator_recovery_pct"] = (100.0 * state["concentrator_reclaim_m3h"] /
                                                 state["concentrator_demand_m3h"]
@@ -644,7 +655,8 @@ class MineWaterNetwork:
             grid_power_fraction=utility_factor)
         state["treated_customer_demand_m3h"] = state["distribution"]["customer_demand_m3h"]
         state["treated_demand_m3h"] = (distribution_refill_request
-                                        + state["factory_boiler_feedwater_demand_m3h"])
+                                        + state["factory_boiler_feedwater_demand_m3h"]
+                                        + state["factory_blending_water_demand_m3h"])
         self.TREATMENT.prepare(state["treatment"], sim_seconds, active_events, utility_factor)
 
         # PI loops regulate the three pumped tank inlets. Output moves through a VFD ramp limit.
@@ -820,8 +832,14 @@ class MineWaterNetwork:
         distribution_served = distribution_refill_request * treated_service
         boiler_feedwater_served = (state["factory_boiler_feedwater_demand_m3h"]
                                    * treated_service)
+        blending_water_served = (state["factory_blending_water_demand_m3h"]
+                                 * treated_service)
         state["boiler_feedwater_delivered_m3h"] = boiler_feedwater_served
         state["boiler_feedwater_in_transit_m3"] = boiler_feedwater_served / 3600.0
+        state["blending_water_delivered_m3h"] = blending_water_served
+        state["blending_water_in_transit_m3"] = blending_water_served / 3600.0
+        state["unmet_blending_water_m3h"] = (
+            state["factory_blending_water_demand_m3h"] - blending_water_served)
         state["unmet_boiler_feedwater_m3h"] = (
             state["factory_boiler_feedwater_demand_m3h"] - boiler_feedwater_served)
         state["boiler_feedwater_service_fraction"] = (
@@ -913,7 +931,8 @@ class MineWaterNetwork:
         state["cumulative_source_withdrawal_m3"] += inlet["raw_transfer"] / 3600.0
         state["cumulative_process_consumption_m3"] += process_consumption / 3600.0
         state["cumulative_treated_delivery_m3"] += (
-            distribution_result["delivered_m3h"] + boiler_feedwater_served) / 3600.0
+            distribution_result["delivered_m3h"] + boiler_feedwater_served
+            + blending_water_served) / 3600.0
         state["cumulative_treatment_backwash_m3"] += backwash_water / 3600.0
         state["cumulative_concentrator_return_m3"] += state["concentrator_reclaim_m3h"] / 3600.0
 
@@ -947,6 +966,8 @@ class MineWaterNetwork:
                                      "factory_cip_demand_m3h": state["factory_cip_demand_m3h"],
                                      "factory_boiler_feedwater_demand_m3h": state["factory_boiler_feedwater_demand_m3h"],
                                      "boiler_feedwater_delivered_m3h": state["boiler_feedwater_delivered_m3h"],
+                                     "factory_blending_water_demand_m3h": state["factory_blending_water_demand_m3h"],
+                                     "blending_water_delivered_m3h": state["blending_water_delivered_m3h"],
                                      "factory_water_available_fraction": state["factory_water_available_fraction"],
                                      "factory_cip_effluent_m3h": actual_cip_effluent,
                                      "concentrator_reclaim_m3h": state["concentrator_reclaim_m3h"],
@@ -1082,6 +1103,9 @@ class MineWaterNetwork:
         add("process_demand", "boiler_feedwater_demand", state["factory_boiler_feedwater_demand_m3h"], "m³/h", 0, 40, 0.005)
         add("process_demand", "boiler_feedwater_delivered", state["boiler_feedwater_delivered_m3h"], "m³/h", 0, 40, 0.005)
         add("process_demand", "boiler_feedwater_unmet", state["unmet_boiler_feedwater_m3h"], "m³/h", 0, 40, 0.005)
+        add("process_demand", "blending_water_demand", state["factory_blending_water_demand_m3h"], "m³/h", 0, 20, 0.005)
+        add("process_demand", "blending_water_delivered", state["blending_water_delivered_m3h"], "m³/h", 0, 20, 0.005)
+        add("process_demand", "blending_water_unmet", state["unmet_blending_water_m3h"], "m³/h", 0, 20, 0.005)
         add("process_demand", "factory_cip_served", state["factory_cip_served_m3h"], "m³/h", 0, 40, 0.005)
         add("process_demand", "concentrator_unmet_demand", state.get("concentrator_unmet_m3h", 0.0), "m³/h", 0, 800, 0.005)
         add("process_demand", "factory_cip_water_availability", state["factory_water_available_fraction"] * 100, "%", 0, 100)

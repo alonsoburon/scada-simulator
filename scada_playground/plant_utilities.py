@@ -195,6 +195,7 @@ class FactoryUtilities:
                 power_available_fraction: float = 1.0, water_available_fraction: float = 1.0,
                 boiler_feedwater_delivery_m3h: float = 6.4,
                 downstream_case_service_fraction: float = 1.0,
+                product_feed_service_fraction: float = 1.0,
                 wastewater_available_fraction: float = 1.0,
                 chilled_water_service_fraction: float = 1.0,
                 chilled_water_supply_temperature_c: float = 6.8,
@@ -387,7 +388,8 @@ class FactoryUtilities:
             cip_is_cleaning_line = (state["cip"]["active"]
                                     and state["cip"]["target_unit"] == name)
             pasteurizer["process_rate"] = (0.0 if cip_is_cleaning_line else
-                90.0 * local_steam_service * product_tank_headroom_control)
+                90.0 * local_steam_service * product_tank_headroom_control
+                * max(0.0, min(1.0, product_feed_service_fraction)))
             pasteurizer["steam_service_fraction"] = local_steam_service
             pasteurizer["pasteurized_rate"] = (pasteurizer["process_rate"]
                 if pasteurizer["temperature_c"] >= self.PASTEURIZATION_LIMIT_C else 0.0)
