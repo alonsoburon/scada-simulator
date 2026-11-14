@@ -120,6 +120,15 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertTrue(any("elevation" in note.lower()
                             for note in definition.expected_observations))
 
+    def test_reagent_stockout_scenario_sequences_depletion_then_bounded_delivery(self):
+        definition = ScenarioRunner().definition("flotation-reagent-stockout-and-recovery")
+        self.assertEqual(definition.duration_seconds, 5_400)
+        self.assertEqual([step.action for step in definition.steps],
+                         ["set_flotation_reagent_inventory", "deliver_flotation_reagent"])
+        self.assertEqual([step.at_seconds for step in definition.steps], [300, 1_800])
+        self.assertTrue(any("recovery" in note.lower() and "lag" in note.lower()
+                            for note in definition.expected_observations))
+
     def test_scenario_actions_are_dispatched_at_their_simulated_offset(self):
         runner = ScenarioRunner()
         sim = simulation_state()

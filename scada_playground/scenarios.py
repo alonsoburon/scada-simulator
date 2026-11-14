@@ -94,6 +94,22 @@ SCENARIOS = {
             "After the faults clear, process variables and inventories recover at different rates.",
         ),
     ),
+    "flotation-reagent-stockout-and-recovery": ScenarioDefinition(
+        scenario_id="flotation-reagent-stockout-and-recovery",
+        name="Flotation reagent stockout and delivery recovery",
+        description="A low finite collector inventory runs out during normal flotation; reduced dosing degrades copper recovery until a simulated reagent delivery restores the tank and recovery ramps back.",
+        duration_seconds=5_400,
+        steps=(
+            ScenarioStep(300, "set_flotation_reagent_inventory", {"inventory_l": 10.0}),
+            ScenarioStep(1_800, "deliver_flotation_reagent", {"delivery_l": 5_000.0}),
+        ),
+        expected_observations=(
+            "The scenario begins with normal feed, then sets the finite collector tank near empty; the dosing pump draws only available stock and reaches zero flow.",
+            "Copper recovery drifts down after reagent depletion rather than changing instantly; compare inventory, requested dose, actual dose, and recovery tags.",
+            "A simulated tanker delivery restores finite tank inventory; actual dose returns subject to pump capacity and recovery follows with flotation residence and smoothing lag.",
+            "The low reagent alarm clears only after inventory rises above its reset threshold; the replay is deterministic and does not model reagent chemistry.",
+        ),
+    ),
     "mine-water-pump-and-demand": ScenarioDefinition(
         scenario_id="mine-water-pump-and-demand",
         name="Mine water demand surge and pump degradation",

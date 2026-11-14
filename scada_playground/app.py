@@ -668,6 +668,16 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
             PLANT_CONTROLLER.request(control, process_action)
     elif step.action == "maintain_equipment":
         maintain_process_equipment(sim, params["target_asset"])
+    elif step.action == "set_flotation_reagent_inventory":
+        plant = sim["concentrator"]
+        inventory_l = float(params["inventory_l"])
+        if (not math.isfinite(inventory_l) or inventory_l < 0.0
+                or inventory_l > plant["reagent_tank_capacity_l"]):
+            raise ValueError("Scenario reagent inventory must fit the finite flotation tank")
+        plant["reagent_inventory_l"] = inventory_l
+    elif step.action == "deliver_flotation_reagent":
+        CONCENTRATOR_MODEL.receive_flotation_reagent(
+            sim["concentrator"], float(params["delivery_l"]))
     elif step.action == "cip_start":
         started = UTILITY_MODEL.CIP_MODEL.start(
             sim["plant_utilities"]["cip"], params.get("target_unit", "pasteurizer_01"), sim["tick"])

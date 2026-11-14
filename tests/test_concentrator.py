@@ -47,6 +47,19 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertLess(self.state["copper_recovery_pct"], stocked_recovery - 5.0)
         self.assertGreater(stocked_dose, 200.0)
 
+    def test_reagent_delivery_restores_dose_before_recovery_fully_recovers(self):
+        self.advance(300)
+        self.state["reagent_inventory_l"] = 10.0
+        self.advance(1_200)
+        stockout_recovery = self.state["copper_recovery_pct"]
+        self.assertEqual(self.state["reagent_dose_l_h"], 0.0)
+        self.model.receive_flotation_reagent(self.state, 5_000.0)
+        self.advance(1)
+        self.assertGreater(self.state["reagent_dose_l_h"], 200.0)
+        self.assertLess(self.state["copper_recovery_pct"], 88.0)
+        self.advance(900)
+        self.assertGreater(self.state["copper_recovery_pct"], stockout_recovery + 20.0)
+
     def test_flotation_reagent_inventory_conserves_stock_and_delivery_is_bounded(self):
         initial = self.state["reagent_inventory_l"]
         self.advance(3_600)
