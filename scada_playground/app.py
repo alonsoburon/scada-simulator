@@ -814,6 +814,14 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                     raise ValueError(f"Delivery exceeds fuel tank headroom ({max(0.0, headroom_l):.0f} L)")
                 fuel_bay["fuel_bay_inventory_l"] += delivery_l
                 message = f"Received {delivery_l:.0f} L at the pit fuel bay."
+            elif action == "deliver_flotation_reagent":
+                delivery_l = float(command.get("reagent_delivery_l", 0.0))
+                if (command.get("target_area") != "Grinding and flotation"
+                        or command.get("target_asset") != "Flotation reagent tank"):
+                    raise ValueError("Reagent delivery requires Grinding and flotation / Flotation reagent tank")
+                received = CONCENTRATOR_MODEL.receive_flotation_reagent(
+                    sim["concentrator"], delivery_l)
+                message = f"Received {delivery_l:.0f} L flotation reagent; tank now holds {received:.0f} L."
             elif action == "process_control":
                 control = sim["process_control"]
                 process_action = command.get("process_action", "").upper()
@@ -1260,6 +1268,10 @@ def advance(force: bool = False) -> None:
             "Concentrate cake stockpile high; filter press discharge is backing up", "HIGH"),
         "concentrator_water_shortage": ("Grinding and flotation", plant["fresh_water_shortage_m3h"] > 25,
             plant["fresh_water_shortage_m3h"] < 5, "Concentrator process water shortfall is limiting feed", "CRITICAL"),
+        "flotation_reagent_low": ("Grinding and flotation",
+            plant["reagent_inventory_l"] < 0.15 * plant["reagent_tank_capacity_l"],
+            plant["reagent_inventory_l"] > 0.25 * plant["reagent_tank_capacity_l"],
+            "Flotation reagent stock is low; check delivery schedule and dosing equipment", "HIGH"),
     }
     concentration_states = sim.setdefault("concentrator_alarm_states", {})
     for alarm_key, (area, active, clear_now, message, severity) in concentrator_conditions.items():
@@ -1965,6 +1977,24 @@ def render_dashboard():
         st.caption(f"Mine block {plant['mine_block_index']} · {plant['mine_block_domain'].replace('_', ' ')} · grade {plant['mine_block_grade_pct']:.2f}% Cu · hardness {plant['mine_block_hardness_factor']:.2f} pu → mill feed {plant['ore_hardness_factor']:.2f} pu · excavated {plant['mine_block_mined_t']:.0f}/{plant['mine_block_target_t']:.0f} t ({plant['mine_block_remaining_t']:.0f} t remaining)")
         st.caption(f"Tailings storage {plant['tailings_storage_inventory_t']/1_000_000:.2f}/{plant['tailings_storage_capacity_t']/1_000_000:.2f} Mt · retained pore water {plant['tailings_storage_water_inventory_m3']/1_000:.0f}k m³ · decant pond {plant['tailings_pond_inventory_m3']:.0f}/{plant['tailings_pond_capacity_m3']:.0f} m³ · decant return {plant['tailings_decant_water_m3h']:.0f} m³/h · pump {plant['tailings_decant_condition']*100:.0f}% / {plant['tailings_decant_pump_power_mw']:.3f} MW · pond feed factor {plant['tailings_pond_backpressure']:.2f} · spill {plant['tailings_pond_spill_m3']:.3f} m³/scan")
         st.caption(f"Mill feed size classes · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · breakage/pass {plant['coarse_breakage_per_pass']*100:.0f}% coarse, {plant['intermediate_breakage_per_pass']*100:.0f}% intermediate · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
+        reagent_cols = st.columns([1, 1, 2])
+        reagent_cols[0].metric("Flotation reagent", f"{plant['reagent_inventory_l']:.0f} L",
+                               f"{100 * plant['reagent_inventory_l'] / plant['reagent_tank_capacity_l']:.1f}% tank")
+        reagent_cols[1].metric("Actual / requested dose", f"{plant['reagent_dose_l_h']:.0f} L/h",
+                               f"requested {plant['reagent_requested_l_h']:.0f} L/h")
+        reagent_headroom_l = max(0.0, plant["reagent_tank_capacity_l"] - plant["reagent_inventory_l"])
+        with reagent_cols[2].form(f"deliver_flotation_reagent_{sim['simulation_id']}"):
+            reagent_delivery_l = st.number_input("Receive simulated reagent delivery (L)",
+                min_value=0.0, max_value=float(reagent_headroom_l),
+                value=min(5_000.0, reagent_headroom_l), step=500.0)
+            receive_reagent = st.form_submit_button("Receive reagent delivery",
+                                                    disabled=reagent_headroom_l <= 0.0)
+        if receive_reagent:
+            try:
+                CONCENTRATOR_MODEL.receive_flotation_reagent(plant, reagent_delivery_l)
+                st.success(f"Received {reagent_delivery_l:.0f} L into the finite flotation reagent tank.")
+            except ValueError as error:
+                st.error(str(error))
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. Motor starts add a decaying electrical load to the mine grid, so large drives can disturb voltage, frequency, and reserves. These aggregate transients are illustrative, not a certified motor-start or protection study. The factory timeline must be running or single-stepped for sequences to progress.")
             st.metric("Motor acceleration load", f"{control['motor_starting_load_mw']:.2f} MW")

@@ -36,6 +36,55 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertLess(self.state["copper_recovery_pct"], 88)
         self.assertGreater(self.state["sag_vibration_mm_s"], 8)
 
+    def test_flotation_reagent_stockout_reduces_dose_and_copper_recovery(self):
+        self.advance(1_800)
+        stocked_recovery = self.state["copper_recovery_pct"]
+        stocked_dose = self.state["reagent_dose_l_h"]
+        self.state["reagent_inventory_l"] = 0.0
+        self.advance(600)
+        self.assertEqual(self.state["reagent_dose_l_h"], 0.0)
+        self.assertEqual(self.state["reagent_pump_flow_factor"], 0.0)
+        self.assertLess(self.state["copper_recovery_pct"], stocked_recovery - 5.0)
+        self.assertGreater(stocked_dose, 200.0)
+
+    def test_flotation_reagent_inventory_conserves_stock_and_delivery_is_bounded(self):
+        initial = self.state["reagent_inventory_l"]
+        self.advance(3_600)
+        consumed = self.state["reagent_consumed_l"]
+        self.assertAlmostEqual(initial - consumed, self.state["reagent_inventory_l"], places=6)
+        headroom = self.state["reagent_tank_capacity_l"] - self.state["reagent_inventory_l"]
+        self.model.receive_flotation_reagent(self.state, headroom)
+        self.assertAlmostEqual(self.state["reagent_inventory_l"],
+                               self.state["reagent_tank_capacity_l"])
+        with self.assertRaises(ValueError):
+            self.model.receive_flotation_reagent(self.state, 1.0)
+        with self.assertRaises(ValueError):
+            self.model.receive_flotation_reagent(self.state, float("nan"))
+
+    def test_flotation_reagent_dose_is_limited_by_dosing_pump_capacity(self):
+        fault = {"name": "Mechanical degradation", "area": "Grinding and flotation",
+                 "severity": "Large"}
+        self.advance(1, [fault])
+        self.assertLess(self.state["reagent_dose_l_h"], self.state["reagent_requested_l_h"])
+        self.assertAlmostEqual(self.state["reagent_pump_flow_factor"],
+                               self.state["reagent_dose_l_h"]
+                               / self.state["reagent_requested_l_h"])
+
+    def test_flotation_reagent_pump_loses_flow_with_process_power(self):
+        self.advance(1, power_available_fraction=0.0)
+        self.assertEqual(self.state["reagent_dose_l_h"], 0.0)
+        self.assertEqual(self.state["reagent_inventory_l"], self.model.FLOTATION_REAGENT_INITIAL_L)
+
+    def test_legacy_concentrator_state_adds_finite_reagent_inventory(self):
+        legacy = self.model.initialize()
+        for key in ("reagent_inventory_l", "reagent_tank_capacity_l", "reagent_consumed_l",
+                    "reagent_delivery_total_l", "reagent_dose_l_h", "reagent_requested_l_h",
+                    "reagent_pump_condition", "reagent_pump_flow_factor"):
+            legacy.pop(key)
+        self.model.migrate(legacy)
+        self.assertEqual(legacy["reagent_inventory_l"], self.model.FLOTATION_REAGENT_INITIAL_L)
+        self.assertEqual(legacy["reagent_tank_capacity_l"], self.model.FLOTATION_REAGENT_TANK_CAPACITY_L)
+
     def test_conveyor_jam_is_buffered_before_reaching_mill_feed(self):
         self.advance(300)
         baseline_feed = self.state["plant_feed_tph"]

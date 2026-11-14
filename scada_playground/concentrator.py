@@ -12,6 +12,10 @@ import random
 
 class CopperConcentrator:
     GRINDING_CIRCUIT_RESIDENCE_S = 900.0
+    FLOTATION_REAGENT_TANK_CAPACITY_L = 50_000.0
+    FLOTATION_REAGENT_INITIAL_L = 25_000.0
+    FLOTATION_REAGENT_DOSE_L_T = 0.28
+    FLOTATION_REAGENT_PUMP_CAPACITY_L_H = 360.0
     BALL_SPECIFIC_ENERGY_KWH_T = 5.15
     FLOTATION_CELL_COUNT = 6
     FLOTATION_BANK_VOLUME_M3 = 540.0
@@ -44,7 +48,7 @@ class CopperConcentrator:
         "Open-pit mining": ["Pit sector A"],
         "Crushing and screening": ["Primary crusher", "Ore conveyors"],
         "Grinding and flotation": ["SAG mill", "Ball mill 01", "Cyclone cluster", "Flotation cells",
-                                   "Flotation air blower"],
+                                   "Flotation air blower", "Flotation reagent dosing pump"],
         "Concentrate handling": ["Concentrate thickener", "Filter press"],
         "Tailings and reclaim": ["Tailings thickener", "Tailings pump station A",
                                  "Tailings decant pump", "Tailings storage facility"],
@@ -167,6 +171,11 @@ class CopperConcentrator:
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
             "flotation_cell_copper_inventory_t": flotation_cell_copper_inventory_t,
             "flotation_copper_inventory_t": sum(flotation_cell_copper_inventory_t),
+            "reagent_inventory_l": self.FLOTATION_REAGENT_INITIAL_L,
+            "reagent_tank_capacity_l": self.FLOTATION_REAGENT_TANK_CAPACITY_L,
+            "reagent_consumed_l": 0.0, "reagent_delivery_total_l": 0.0,
+            "reagent_dose_l_h": 245.0, "reagent_requested_l_h": 245.0,
+            "reagent_pump_condition": 1.0, "reagent_pump_flow_factor": 1.0,
             "flotation_copper_product_tph": 870.0 * 0.0062 * 0.88,
             "cumulative_flotation_copper_feed_t": 0.0,
             "cumulative_flotation_copper_product_t": 0.0,
@@ -222,6 +231,9 @@ class CopperConcentrator:
                     "mine_block_target_t", "mine_block_mined_t", "mine_block_remaining_t",
                     "mine_block_hardness_factor",
                     "flotation_cell_copper_inventory_t", "flotation_copper_inventory_t",
+                    "reagent_inventory_l", "reagent_tank_capacity_l", "reagent_consumed_l",
+                    "reagent_delivery_total_l", "reagent_dose_l_h", "reagent_requested_l_h",
+                    "reagent_pump_condition", "reagent_pump_flow_factor",
                     "flotation_copper_product_tph", "cumulative_flotation_copper_feed_t",
                     "cumulative_flotation_copper_product_t", "cumulative_flotation_copper_tailings_t",
                     "concentrate_thickener_copper_inventory_t", "filter_press_batch_copper_inventory_t",
@@ -563,6 +575,18 @@ class CopperConcentrator:
         return (product_copper_tph, downstream_copper_tph,
                 min(100.0, max(0.0, apparent_recovery)))
 
+    def receive_flotation_reagent(self, state: dict, liters: float) -> float:
+        """Receive a simulated reagent delivery into the finite flotation tank."""
+        self.migrate(state)
+        if not math.isfinite(liters) or liters <= 0.0:
+            raise ValueError("Reagent delivery must be positive and finite")
+        headroom = state["reagent_tank_capacity_l"] - state["reagent_inventory_l"]
+        if liters > headroom + 1e-6:
+            raise ValueError(f"Delivery exceeds reagent tank headroom ({max(0.0, headroom):.0f} L)")
+        state["reagent_inventory_l"] += liters
+        state["reagent_delivery_total_l"] += liters
+        return state["reagent_inventory_l"]
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 water_shortage_m3h: float = 0.0, seed: int = 17,
                 mine_delivery_t: float | None = None,
@@ -621,6 +645,9 @@ class CopperConcentrator:
         state["sag_condition"] = health["sag_mill"] * (1.0 - equipment_faults["sag_mill"] * 0.48)
         state["ball_condition"] = health["ball_mill"] * (1.0 - equipment_faults["ball_mill"] * 0.40)
         state["flotation_condition"] = health["flotation"] * (1.0 - equipment_faults["flotation"] * 0.28)
+        reagent_pump_fault = self._severity(events, "Mechanical degradation",
+                                            ("Grinding and flotation",))
+        state["reagent_pump_condition"] = 1.0 - reagent_pump_fault * 0.65
         state["tailings_condition"] = (health["tailings_pump"] * health["tailings_thickener"]
                                         * (1.0 - max(equipment_faults["tailings_pump"],
                                                      equipment_faults["tailings_thickener"]) * 0.65))
@@ -824,14 +851,27 @@ class CopperConcentrator:
 
         flotation_air = (540.0 * (1 - equipment_faults["flotation"] * 0.3) * power_factor
                          if equipment_available.get("flotation", True) else 0.0)
-        reagent = 245.0 * (1 + 0.12 * math.sin(sim_seconds / 600))
+        reagent_requested = (self.FLOTATION_REAGENT_DOSE_L_T * cyclone_overflow
+                             * (1 + 0.12 * math.sin(sim_seconds / 600)))
+        reagent_pump_factor = (state["reagent_pump_condition"] * power_factor
+                               if equipment_available.get("reagent_pump", True) else 0.0)
+        reagent_capacity = self.FLOTATION_REAGENT_PUMP_CAPACITY_L_H * reagent_pump_factor
+        reagent = min(reagent_requested, reagent_capacity,
+                      state["reagent_inventory_l"] / max(dt_h, 1e-12))
+        state["reagent_requested_l_h"] = reagent_requested
+        state["reagent_dose_l_h"] = reagent
+        state["reagent_pump_flow_factor"] = (reagent / reagent_requested
+                                             if reagent_requested > 1e-9 else 1.0)
+        reagent_consumed_l = reagent * dt_h
+        state["reagent_inventory_l"] = max(0.0, state["reagent_inventory_l"] - reagent_consumed_l)
+        state["reagent_consumed_l"] += reagent_consumed_l
         pulp_flow_m3h = cyclone_overflow * (1.0 / 2.7 + state["water_specific_m3_t"])
         state["flotation_residence_time_min"] = min(90.0, 540.0 * 60.0 / max(pulp_flow_m3h, 1.0))
         product_fine_share = product_size_fractions[0]
         size_floatability = min(1.15, max(0.65, 0.80 + 0.40 * product_fine_share / 0.486))
         air_factor = min(1.15, max(0.0, flotation_air / 540.0))
         reagent_dose_l_t = reagent / max(cyclone_overflow, 1.0)
-        reagent_factor = min(1.12, max(0.65, (reagent_dose_l_t / 0.28) ** 0.30))
+        reagent_factor = min(1.12, max(0.05, (reagent_dose_l_t / self.FLOTATION_REAGENT_DOSE_L_T) ** 0.30))
         kinetic_rate_per_min = 0.10 * size_floatability * air_factor * reagent_factor * state["flotation_condition"]
         cell_residence_min = state["flotation_residence_time_min"] / self.FLOTATION_CELL_COUNT
         kinetic_recovery = 100.0 * (1.0 - (1.0 + kinetic_rate_per_min * cell_residence_min) **
@@ -1108,6 +1148,7 @@ class CopperConcentrator:
         state["sag_motor_running"] = float(powered and equipment_available.get("sag_mill", True))
         state["ball_motor_running"] = float(powered and equipment_available.get("ball_mill", True))
         state["flotation_motor_running"] = float(powered and equipment_available.get("flotation", True))
+        state["reagent_pump_running"] = float(powered and reagent_pump_factor > 0.01 and reagent > 0.0)
         state["tailings_motor_running"] = float(powered and equipment_available.get("tailings_pump", True))
         state["crusher_vibration_mm_s"] = (2.4 + equipment_faults["crusher"] * 10
                                              + (1.0 - health["crusher"]) * 12 + jam * 5)
@@ -1209,6 +1250,18 @@ class CopperConcentrator:
                     "equipment_running": (state.get("conveyors_motor_running", state["crushing_running"]), "bool", 0, 1)},
             },
             "Grinding and flotation": {
+                "Flotation reagent tank": {
+                    "inventory": (state["reagent_inventory_l"], "L", 0, state["reagent_tank_capacity_l"]),
+                    "level": (100.0 * state["reagent_inventory_l"] / max(state["reagent_tank_capacity_l"], 1e-9), "%", 0, 100),
+                    "cumulative_consumption": (state["reagent_consumed_l"], "L", 0, 1_000_000),
+                },
+                "Flotation reagent dosing pump": {
+                    "dosing_flow": (state["reagent_dose_l_h"], "L/h", 0, 500),
+                    "requested_flow": (state["reagent_requested_l_h"], "L/h", 0, 500),
+                    "flow_fraction": (100.0 * state["reagent_pump_flow_factor"], "%", 0, 120),
+                    "operating_condition": (100.0 * state["reagent_pump_condition"], "%", 0, 100),
+                    "equipment_running": (state.get("reagent_pump_running", 0.0), "bool", 0, 1),
+                },
                 "SAG mill": {"ore_rate": (state["sag_feed_tph"], "t/h", 0, 2_000),
                     "motor_power": (state["sag_power_mw"], "MW", 0, 30),
                     "motor_current": (self._motor_current_a(state["sag_power_mw"]), "A", 0, 2_500),

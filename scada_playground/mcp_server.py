@@ -352,12 +352,14 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident",
                                      "reset_feeder_protection", "maintain_equipment",
-                                     "maintain_water_pump", "deliver_mine_fuel"],
+                                     "maintain_water_pump", "deliver_mine_fuel",
+                                     "deliver_flotation_reagent"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
                        target_asset: str = "", fault_location_pct: float = 90.0,
                        primary_breaker_failure: bool = False,
-                       target_tag: str = "", fuel_delivery_l: float = 0.0) -> dict[str, Any]:
+                       target_tag: str = "", fuel_delivery_l: float = 0.0,
+                       reagent_delivery_l: float = 0.0) -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
     manually reset a locked-out distribution feeder after its fault has cleared, or maintain a
     stopped process asset or isolated water pump after its active mechanical fault has cleared.
@@ -384,11 +386,13 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     allow it to coast to zero speed, and clear its mechanical fault first.
     For deliver_mine_fuel, target_area must be Mobile fleet, target_asset must be Mine fuel bay,
     and fuel_delivery_l must be a positive quantity that fits in the site tank.
+    For deliver_flotation_reagent, target_area must be Grinding and flotation,
+    target_asset must be Flotation reagent tank, and reagent_delivery_l must fit in its capacity.
     No physical device can be controlled.
     """
     allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
                "reset_feeder_protection", "maintain_equipment", "maintain_water_pump",
-               "deliver_mine_fuel"}
+               "deliver_mine_fuel", "deliver_flotation_reagent"}
     if action not in allowed:
         raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
     if action == "inject_incident":
@@ -473,13 +477,23 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
         remaining = fuel.get("fuel_bay_capacity_l", 0.0) - fuel.get("fuel_bay_inventory_l", 0.0)
         if fuel_delivery_l > remaining + 1e-6:
             raise ValueError(f"Fuel delivery exceeds site tank headroom ({max(0.0, remaining):.0f} L)")
+    if action == "deliver_flotation_reagent":
+        if target_area != "Grinding and flotation" or target_asset != "Flotation reagent tank":
+            raise ValueError("deliver_flotation_reagent requires Grinding and flotation / Flotation reagent tank")
+        if not math.isfinite(reagent_delivery_l) or reagent_delivery_l <= 0.0:
+            raise ValueError("reagent_delivery_l must be a positive finite quantity")
+        plant = snapshot().get("concentrator", {})
+        remaining = plant.get("reagent_tank_capacity_l", 0.0) - plant.get("reagent_inventory_l", 0.0)
+        if reagent_delivery_l > remaining + 1e-6:
+            raise ValueError(f"Reagent delivery exceeds tank headroom ({max(0.0, remaining):.0f} L)")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds, "target_asset": target_asset or None,
                            "fault_location_pct": fault_location_pct,
                            "primary_breaker_failure": primary_breaker_failure,
                            "target_tag": target_tag or None,
-                           "fuel_delivery_l": fuel_delivery_l})
+                           "fuel_delivery_l": fuel_delivery_l,
+                           "reagent_delivery_l": reagent_delivery_l})
 
 
 @mcp.tool()
