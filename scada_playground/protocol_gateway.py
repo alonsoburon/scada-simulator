@@ -39,9 +39,9 @@ html,body,#map{height:100%;margin:0;font:14px system-ui,sans-serif} #map{backgro
 .legend{position:absolute;z-index:1000;right:12px;bottom:22px;background:#fff;padding:8px 11px;border-radius:7px;box-shadow:0 2px 10px #0002;line-height:1.7}
 .swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
 </style></head><body><div id="map"></div><div class="status" id="status">Connecting to live fleet…</div>
-<div class="legend"><span class="swatch" style="background:#e76f51"></span>Haul truck<br><span class="swatch" style="background:#577590"></span>Service truck<br><span class="swatch" style="background:#43aa8b"></span>Site bus</div>
+<div class="legend"><span class="swatch" style="background:#e76f51"></span>Haul truck<br><span class="swatch" style="background:#577590"></span>Service truck<br><span class="swatch" style="background:#43aa8b"></span>Site bus<br><span class="swatch" style="background:#9b5de5"></span>Base tanker<br><span class="swatch" style="background:#277da1"></span>Syrup tanker</div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
-const center=[-24.277,-69.067], colors={"Haul truck":"#e76f51","Service truck":"#577590","Site bus":"#43aa8b"};
+const center=[-24.277,-69.067], colors={"Haul truck":"#e76f51","Service truck":"#577590","Site bus":"#43aa8b","Base tanker":"#9b5de5","Syrup tanker":"#277da1"};
 const map=L.map('map',{zoomControl:true,preferCanvas:true}).setView(center,12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}).addTo(map);
 const routeLayer=L.layerGroup().addTo(map), siteLayer=L.layerGroup().addTo(map), markers=new Map();
@@ -52,7 +52,7 @@ function animate(marker, from, to, duration=850){const start=performance.now();f
 let lastFrameKey=null;
 function connect(){const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/fleet');
  ws.onmessage=event=>{const data=JSON.parse(event.data);const frameKey=`${data.sim_seconds}:${data.running}`;if(frameKey===lastFrameKey)return;lastFrameKey=frameKey;
-  if(!routesReady){for(const route of data.routes||[]){const latlngs=route.points.map(p=>[p.latitude,p.longitude]);latlngs.push(latlngs[0]);L.polyline(latlngs,{color:colors[route.vehicle_type]||'#666',weight:4,opacity:.76}).addTo(routeLayer)}routesReady=true}
+  if(!routesReady){for(const route of data.routes||[]){const latlngs=route.points.map(p=>[p.latitude,p.longitude]);if(route.closed!==false)latlngs.push(latlngs[0]);L.polyline(latlngs,{color:colors[route.vehicle_type]||'#666',weight:4,opacity:.76}).addTo(routeLayer)}routesReady=true}
   for(const v of data.fleet||[]){const color=colors[v.vehicle_type]||'#555', point=[v.latitude,v.longitude];let marker=markers.get(v.unit);
    const icon=L.divIcon({className:'',html:`<div class="vehicle" style="color:${color};transform:rotate(${v.heading}deg)">▲</div>`,iconSize:[22,24],iconAnchor:[11,12]});
    if(!marker){marker=L.marker(point,{icon}).addTo(map);markers.set(v.unit,marker)}else{const from=marker.getLatLng();if(Math.abs(from.lat-point[0])+Math.abs(from.lng-point[1])>0.000001){marker.setIcon(icon);animate(marker,[from.lat,from.lng],point)}}

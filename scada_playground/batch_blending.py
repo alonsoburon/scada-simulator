@@ -9,6 +9,8 @@ class BatchBlending:
         "Ingredient dosing": ["Base concentrate tank", "Syrup tank", "Base dosing pump",
                               "Syrup dosing pump", "Treated-water inlet"],
         "Batch blending": ["Mix tank A", "Blend outlet", "Recipe controller"],
+        "Bulk receiving": ["Receiving weighbridge", "Tanker unloading bay",
+                           "Base concentrate tanker", "Syrup tanker"],
     }
     BASE_KG_PER_L = 0.12
     SYRUP_KG_PER_L = 0.04
@@ -20,6 +22,10 @@ class BatchBlending:
     WATER_BUFFER_TARGET_L = 8_000.0
     MAX_WATER_TURBIDITY_NTU = 5.0
     MAX_WATER_CHLORINE_MG_L = 0.8
+    SUPPLIER_ROUTES = (
+        (-24.3050, -69.0950), (-24.2990, -69.0830),
+        (-24.2860, -69.0760), (-24.2780, -69.0680),
+    )
 
     def initialize(self) -> dict:
         return {
@@ -46,8 +52,29 @@ class BatchBlending:
             "water_service_fraction": 1.0,
             "base_tank_inventory_kg": 34_000.0,
             "base_tank_capacity_kg": 40_000.0,
+            "base_shipment_state": "IDLE",
+            "base_shipment_eta_s": 0,
+            "base_shipment_remaining_kg": 0.0,
+            "base_shipment_load_kg": 0.0,
+            "base_shipment_unload_rate_kg_h": 12_000.0,
+            "base_receiving_rate_kg_h": 0.0,
+            "base_receiving_pump_speed_pct": 0.0,
+            "base_shipment_cumulative_received_kg": 0.0,
+            "base_shipment_cumulative_ordered": 0,
             "syrup_tank_inventory_kg": 17_000.0,
             "syrup_tank_capacity_kg": 20_000.0,
+            "syrup_shipment_state": "IDLE",
+            "syrup_shipment_eta_s": 0,
+            "syrup_shipment_remaining_kg": 0.0,
+            "syrup_shipment_load_kg": 0.0,
+            "syrup_shipment_unload_rate_kg_h": 8_000.0,
+            "syrup_receiving_rate_kg_h": 0.0,
+            "syrup_receiving_pump_speed_pct": 0.0,
+            "syrup_shipment_cumulative_received_kg": 0.0,
+            "syrup_shipment_cumulative_ordered": 0,
+            "receiving_bay_active_material": "NONE",
+            "receiving_bay_service_fraction": 1.0,
+            "weighbridge_state": "IDLE",
             "base_dosing_rate_kg_h": 1_296.0,
             "syrup_dosing_rate_kg_h": 432.0,
             "base_dosing_service_fraction": 1.0,
@@ -69,6 +96,8 @@ class BatchBlending:
             "water_bypass_flow_m3h": 0.0,
             "cumulative_base_kg": 0.0,
             "cumulative_syrup_kg": 0.0,
+            "base_initial_inventory_kg": 34_000.0,
+            "syrup_initial_inventory_kg": 17_000.0,
             "electric_load_mw": 0.025,
             "requested_load_mw": 0.025,
             "history": [],
@@ -126,6 +155,96 @@ class BatchBlending:
                                           "Recipe controller")
         recipe_upset = self._severity(events, "Process upset", "Batch blending", "Recipe controller")
         outlet_fault = self._severity(events, "Mechanical degradation", "Batch blending", "Blend outlet")
+        receiving_fault = self._severity(events, "Mechanical degradation", "Bulk receiving",
+                                          "Tanker unloading bay")
+        receiving_power_fault = self._severity(events, "Utility loss", "Bulk receiving",
+                                               "Tanker unloading bay")
+        receiving_service = (max(0.0, 1.0 - 0.75 * receiving_fault)
+                             * max(0.0, 1.0 - receiving_power_fault / 0.78))
+        state["receiving_bay_service_fraction"] = receiving_service
+        base_tanker_fault = self._severity(events, "Mechanical degradation", "Bulk receiving",
+                                           "Base concentrate tanker")
+        syrup_tanker_fault = self._severity(events, "Mechanical degradation", "Bulk receiving",
+                                            "Syrup tanker")
+        state["base_receiving_rate_kg_h"] = 0.0
+        state["syrup_receiving_rate_kg_h"] = 0.0
+
+        # A delivery is a finite tanker load with an order threshold, road lead
+        # time, shared receiving bay, and bounded unloading rate. It is never
+        # teleported into a process tank. A stopped line can leave a tanker
+        # waiting because storage space is still a physical limit.
+        material_specs = (
+            ("base", 18_000.0, 21_000.0, 600, 12_000.0),
+            ("syrup", 9_000.0, 10_000.0, 720, 8_000.0),
+        )
+        for material, reorder, nominal_load, lead_time, unload_rate in material_specs:
+            stock_key = f"{material}_tank_inventory_kg"
+            state_key = f"{material}_shipment_state"
+            eta_key = f"{material}_shipment_eta_s"
+            remaining_key = f"{material}_shipment_remaining_kg"
+            load_key = f"{material}_shipment_load_kg"
+            unload_key = f"{material}_shipment_unload_rate_kg_h"
+            if state[state_key] == "IDLE" and state[stock_key] <= reorder:
+                load = min(nominal_load, max(0.0,
+                    state[f"{material}_tank_capacity_kg"] - state[stock_key]))
+                if load > 1.0:
+                    state[state_key] = "EN_ROUTE"
+                    state[eta_key] = lead_time
+                    state[remaining_key] = load
+                    state[load_key] = load
+                    state[unload_key] = unload_rate
+                    state[f"{material}_shipment_cumulative_ordered"] += 1
+            if state[state_key] == "EN_ROUTE":
+                state[eta_key] = max(0, state[eta_key] - dt_s)
+                if state[eta_key] == 0:
+                    state[state_key] = "QUEUED"
+            elif state[state_key] == "RETURNING":
+                state[eta_key] = max(0, state[eta_key] - dt_s)
+                if state[eta_key] == 0:
+                    state[state_key] = "IDLE"
+
+        queued = [material for material, *_ in material_specs
+                  if state[f"{material}_shipment_state"] in {"QUEUED", "UNLOADING"}]
+        active = state.get("receiving_bay_active_material", "NONE")
+        if active not in queued:
+            active = queued[0] if queued else "NONE"
+        state["receiving_bay_active_material"] = active
+        state["weighbridge_state"] = "OCCUPIED" if active != "NONE" else "IDLE"
+        for material, *_ in material_specs:
+            state_key = f"{material}_shipment_state"
+            if material != active and state[state_key] == "UNLOADING":
+                state[state_key] = "QUEUED"
+        for material in ("base", "syrup"):
+            tanker_fault = base_tanker_fault if material == "base" else syrup_tanker_fault
+            tanker_service = max(0.0, 1.0 - 0.75 * tanker_fault)
+            target_speed = (100.0 * receiving_service * tanker_service
+                            if material == active else 0.0)
+            speed_key = f"{material}_receiving_pump_speed_pct"
+            speed = state[speed_key]
+            ramp_pct_per_s = 10.0 if target_speed > speed else 30.0
+            change = ramp_pct_per_s * dt_s
+            state[speed_key] = max(0.0, min(100.0,
+                speed + max(-change, min(change, target_speed - speed))))
+        if active != "NONE":
+            stock_key = f"{active}_tank_inventory_kg"
+            room_kg = max(0.0, state[f"{active}_tank_capacity_kg"] - state[stock_key])
+            tanker_fault = base_tanker_fault if active == "base" else syrup_tanker_fault
+            tanker_service = max(0.0, 1.0 - 0.75 * tanker_fault)
+            pump_speed = state[f"{active}_receiving_pump_speed_pct"]
+            can_unload = pump_speed > 0.1 and room_kg > 1e-6
+            state[f"{active}_shipment_state"] = "UNLOADING" if can_unload else "QUEUED"
+            unloaded = min(state[f"{active}_shipment_remaining_kg"], room_kg,
+                           state[f"{active}_shipment_unload_rate_kg_h"]
+                           * pump_speed / 100.0 * dt_h)
+            state[stock_key] += unloaded
+            state[f"{active}_shipment_remaining_kg"] -= unloaded
+            state[f"{active}_shipment_cumulative_received_kg"] += unloaded
+            state[f"{active}_receiving_rate_kg_h"] = unloaded / dt_h if dt_h > 0 else 0.0
+            if state[f"{active}_shipment_remaining_kg"] <= 1e-6:
+                state[f"{active}_shipment_remaining_kg"] = 0.0
+                state[f"{active}_shipment_state"] = "RETURNING"
+                state[f"{active}_shipment_eta_s"] = (600 if active == "base" else 720)
+                state["receiving_bay_active_material"] = "NONE"
         utility_fault = max(
             self._severity(events, "Utility loss", "Batch blending", "Mix tank A"),
             self._severity(events, "Utility loss", "Batch blending", "Recipe controller"))
@@ -246,8 +365,13 @@ class BatchBlending:
         state["mix_water_level_pct"] = 100.0 * state["mix_water_inventory_l"] / self.WATER_BUFFER_CAPACITY_L
         state["mix_water_demand_m3h"] = (water_request_lpm + water_refill) * 60.0 / 1_000.0
         state["mix_water_in_transit_m3"] = state["mix_water_delivered_m3h"] / 3_600.0
-        state["electric_load_mw"] = (12.0 + 0.055 * mixing_rate) / 1_000.0
-        state["requested_load_mw"] = (12.0 + 0.055 * mixer_request) / 1_000.0
+        receiving_load_kw = (4.0 + 0.0009 * (state["base_receiving_rate_kg_h"]
+                             + state["syrup_receiving_rate_kg_h"])
+                             if state["receiving_bay_active_material"] != "NONE"
+                             and receiving_service > 0 else 0.0)
+        state["receiving_load_mw"] = receiving_load_kw / 1_000.0
+        state["electric_load_mw"] = (12.0 + 0.055 * mixing_rate + receiving_load_kw) / 1_000.0
+        state["requested_load_mw"] = (12.0 + 0.055 * mixer_request + receiving_load_kw) / 1_000.0
 
         if sim_seconds > 0 and sim_seconds % 15 == 0:
             state["history"].append({key: state[key] for key in (
@@ -261,15 +385,20 @@ class BatchBlending:
 
         def add(asset: str, signal: str, value: float, units: str,
                 low: float, high: float, noise: float = 0.002) -> None:
-            area = "Batch blending" if asset in {
-                "Mix tank A", "Blend outlet", "Recipe controller"} else "Ingredient dosing"
+            area = ("Batch blending" if asset in {
+                "Mix tank A", "Blend outlet", "Recipe controller"}
+                    else "Bulk receiving" if asset in {
+                "Receiving weighbridge", "Tanker unloading bay",
+                "Base concentrate tanker", "Syrup tanker"}
+                    else "Ingredient dosing")
             tag = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{signal}"
             stable = sum((i + 1) * ord(ch) for i, ch in enumerate(tag))
             rng = random.Random(seed * 1_000_003 + state["sim_seconds"] * 9_176 + stable)
             if units not in {"bool", "enum"} and noise:
                 value += rng.gauss(0.0, max(1e-9, high - low) * noise)
+            digits = 6 if signal in {"gps_latitude", "gps_longitude"} else 3
             rows.append({"tag": tag, "area": area, "unit": asset, "sensor": signal,
-                         "units": units, "value": round(max(low, min(high, value)), 3),
+                         "units": units, "value": round(max(low, min(high, value)), digits),
                          "quality": "GOOD", "low": low, "high": high,
                          "base": (low + high) / 2.0, "phase": 0.0,
                          "last_change": "Recipe and finite batch inventory model",
@@ -315,6 +444,51 @@ class BatchBlending:
         add("Syrup dosing pump", "service", state["syrup_dosing_service_fraction"] * 100, "%", 0, 100, 0.0)
         add("Recipe controller", "ratio_error", state["recipe_ratio_error_pct"], "%", -20, 20)
         add("Recipe controller", "permissive", float(state["recipe_permissive"]), "bool", 0, 1, 0.0)
+        add("Receiving weighbridge", "occupied", float(state["weighbridge_state"] == "OCCUPIED"),
+            "bool", 0, 1, 0.0)
+        add("Tanker unloading bay", "service", state["receiving_bay_service_fraction"] * 100,
+            "%", 0, 100, 0.0)
+        add("Tanker unloading bay", "active_receiving_rate",
+            state["base_receiving_rate_kg_h"] + state["syrup_receiving_rate_kg_h"],
+            "kg/h", 0, 20_000, 0.0)
+        add("Tanker unloading bay", "pump_speed",
+            max(state["base_receiving_pump_speed_pct"],
+                state["syrup_receiving_pump_speed_pct"]), "%", 0, 100, 0.0)
+        add("Tanker unloading bay", "active_material",
+            {"NONE": 0, "base": 1, "syrup": 2}.get(
+                state["receiving_bay_active_material"], 0), "enum", 0, 2, 0.0)
+        state_codes = {"IDLE": 0, "EN_ROUTE": 1, "QUEUED": 2, "UNLOADING": 3,
+                       "RETURNING": 4}
+        for material, asset in (("base", "Base concentrate tanker"),
+                                ("syrup", "Syrup tanker")):
+            delivery_state = state[f"{material}_shipment_state"]
+            add(asset, "delivery_state", state_codes.get(delivery_state, 0), "enum", 0, 4, 0.0)
+            add(asset, "eta_min", state[f"{material}_shipment_eta_s"] / 60.0,
+                "min", 0, 240, 0.0)
+            add(asset, "load_remaining", state[f"{material}_shipment_remaining_kg"],
+                "kg", 0, 25_000, 0.0)
+            add(asset, "unload_rate", state[f"{material}_receiving_rate_kg_h"],
+                "kg/h", 0, 20_000, 0.0)
+            add(asset, "unload_pump_speed",
+                state[f"{material}_receiving_pump_speed_pct"], "%", 0, 100, 0.0)
+            lead_time = 600 if material == "base" else 720
+            progress = (min(1.0, max(0.0,
+                1.0 - state[f"{material}_shipment_eta_s"] / lead_time))
+                        if delivery_state == "EN_ROUTE" else
+                        min(1.0, max(0.0, state[f"{material}_shipment_eta_s"] / lead_time))
+                        if delivery_state == "RETURNING" else
+                        1.0 if delivery_state in {"QUEUED", "UNLOADING"} else 0.0)
+            route_position = progress * (len(self.SUPPLIER_ROUTES) - 1)
+            route_segment = min(len(self.SUPPLIER_ROUTES) - 2, int(route_position))
+            segment_fraction = route_position - route_segment
+            start = self.SUPPLIER_ROUTES[route_segment]
+            end = self.SUPPLIER_ROUTES[route_segment + 1]
+            latitude = start[0] + (end[0] - start[0]) * segment_fraction
+            longitude = start[1] + (end[1] - start[1]) * segment_fraction
+            speed = 30.0 if delivery_state in {"EN_ROUTE", "RETURNING"} else 0.0
+            add(asset, "gps_latitude", latitude, "°", -24.4, -24.2, 0.0)
+            add(asset, "gps_longitude", longitude, "°", -69.2, -68.9, 0.0)
+            add(asset, "gps_speed", speed, "km/h", 0, 60, 0.0)
         return rows
 
     @staticmethod

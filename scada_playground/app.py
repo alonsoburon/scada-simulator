@@ -49,7 +49,9 @@ AREAS = {
     "Mobile fleet": [f"Haul truck {i:02}" for i in range(1, 13)] + [f"Service truck {i:02}" for i in range(1, 5)] + [f"Site bus {i:02}" for i in range(1, 4)],
     "Site buildings": ["Control room", "Workshop", "Warehouse", "Laboratory", "Substation building", "Pump house", "Office block", "Gatehouse"],
     "Inbound logistics": ["Truck scale", "Unloading bay", "Conveyor 01", "Conveyor 02", "Dust collector"],
-    "Bulk receiving": ["Silo A", "Silo B", "Silo C", "Silo D", "Silo E"],
+    "Bulk receiving": ["Silo A", "Silo B", "Silo C", "Silo D", "Silo E",
+                       "Receiving weighbridge", "Tanker unloading bay",
+                       "Base concentrate tanker", "Syrup tanker"],
     "Raw materials": ["Mill 01", "Mill 02", "Screen 01", "Blender 01", "Transfer pumps"],
     "Water intake": ["Intake screen", "Raw water pumps", "Clarifier", "Raw water tank", "Chlorination"],
     "Water treatment": ["Filter train A", "Filter train B", "RO skid", "Treated tank", "Dosing skid"],
@@ -140,6 +142,18 @@ FLEET_ROUTES = {
         ("Operations building", -24.2740, -69.0690, 18),
         ("Process plant stop", -24.2780, -69.0670, 22),
         ("Pit access stop", -24.2840, -69.0740, 16),
+    ],
+    "Base tanker": [
+        ("Supplier yard", -24.3050, -69.0950, 0),
+        ("North service road", -24.2990, -69.0830, 0),
+        ("Plant access road", -24.2860, -69.0760, 0),
+        ("Bulk receiving", -24.2780, -69.0680, 0),
+    ],
+    "Syrup tanker": [
+        ("Supplier yard", -24.3050, -69.0950, 0),
+        ("North service road", -24.2990, -69.0830, 0),
+        ("Plant access road", -24.2860, -69.0760, 0),
+        ("Bulk receiving", -24.2780, -69.0680, 0),
     ],
 }
 
@@ -485,6 +499,8 @@ def publish_snapshot() -> dict:
     chilled_by_tag = {tag["tag"]: tag for tag in chilled_tags}
     building_by_tag = {tag["tag"]: tag for tag in building_tags}
     ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
+    batch_tags = BATCH_MODEL.telemetry(sim["batch_blending"], sim["seed"])
+    batch_by_tag = {tag["tag"]: tag for tag in batch_tags}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
             tag.update(water_by_tag[tag["tag"]])
@@ -498,6 +514,8 @@ def publish_snapshot() -> dict:
             tag.update(building_by_tag[tag["tag"]])
         elif tag["tag"] in ventilation_by_tag:
             tag.update(ventilation_by_tag[tag["tag"]])
+        elif tag["tag"] in batch_by_tag:
+            tag.update(batch_by_tag[tag["tag"]])
         elif tag["tag"] in concentrator_by_tag:
             tag.update(concentrator_by_tag[tag["tag"]])
     PROCESS_MODEL.apply_instrument_faults(sim["tags"], sim["events"], sim["tick"])
@@ -508,6 +526,48 @@ def publish_snapshot() -> dict:
         if comms_fault:
             tag["quality"] = "STALE"
             tag["last_change"] = "Network partition"
+    supplier_fleet = []
+    for material, asset, vehicle_type in (
+        ("base", "Base concentrate tanker", "Base tanker"),
+        ("syrup", "Syrup tanker", "Syrup tanker"),
+    ):
+        prefix = f"bulk_receiving.{asset.lower().replace(' ', '_')}"
+        point = {tag["sensor"]: tag["value"] for tag in batch_tags
+                 if tag["tag"].startswith(prefix + ".")}
+        model = sim["batch_blending"]
+        delivery_state = model[f"{material}_shipment_state"]
+        lead_time = 600 if material == "base" else 720
+        eta = model[f"{material}_shipment_eta_s"]
+        state_labels = {
+            "IDLE": "At supplier yard",
+            "EN_ROUTE": f"En route to plant · ETA {eta / 60:.0f} min",
+            "QUEUED": "Waiting at receiving bay",
+            "UNLOADING": f"Unloading {material} at receiving bay",
+            "RETURNING": f"Returning to supplier · ETA {eta / 60:.0f} min",
+        }
+        if delivery_state == "EN_ROUTE":
+            progress = min(1.0, max(0.0, 1.0 - eta / lead_time))
+        elif delivery_state == "RETURNING":
+            progress = min(1.0, max(0.0, eta / lead_time))
+        else:
+            progress = 1.0 if delivery_state in {"QUEUED", "UNLOADING"} else 0.0
+        route = BATCH_MODEL.SUPPLIER_ROUTES
+        route_position = progress * (len(route) - 1)
+        segment = min(len(route) - 2, int(route_position))
+        start, end = route[segment], route[segment + 1]
+        heading = __import__("math").degrees(__import__("math").atan2(
+            end[1] - start[1], end[0] - start[0])) % 360
+        if delivery_state == "RETURNING":
+            heading = (heading + 180) % 360
+        supplier_fleet.append({
+            "unit": asset, "vehicle_type": vehicle_type,
+            "latitude": point.get("gps_latitude", route[0][0]),
+            "longitude": point.get("gps_longitude", route[0][1]),
+            "speed_kmh": point.get("gps_speed", 0.0), "heading": heading,
+            "payload_t": model[f"{material}_shipment_remaining_kg"] / 1_000.0,
+            "state": state_labels.get(delivery_state, delivery_state),
+            "queue_position": 1 if delivery_state == "QUEUED" else 0,
+        })
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sim_seconds": sim["tick"],
@@ -543,8 +603,9 @@ def publish_snapshot() -> dict:
                    "speed_kmh": fleet_motion(unit, sim["tick"])[2],
                    "heading": fleet_motion(unit, sim["tick"])[3],
                    "payload_t": fleet_motion(unit, sim["tick"])[4],
-                   "state": fleet_motion(unit, sim["tick"])[5]} for unit in fleet_units],
+                   "state": fleet_motion(unit, sim["tick"])[5]} for unit in fleet_units] + supplier_fleet,
         "routes": [{"vehicle_type": vehicle_type,
+                    "closed": vehicle_type not in {"Base tanker", "Syrup tanker"},
                     "points": [{"name": p[0], "latitude": p[1], "longitude": p[2]} for p in route]}
                    for vehicle_type, route in FLEET_ROUTES.items()],
     }
@@ -820,6 +881,18 @@ def advance(force: bool = False) -> None:
                               blend["water_quality_permissive"],
                               "Treated-water quality is outside the blend permissive; mixing is inhibited",
                               "CRITICAL"),
+        "base_tanker_delayed": (blend["base_shipment_state"] == "QUEUED"
+                                 and blend["base_tank_inventory_kg"] < 10_000.0,
+                                 blend["base_shipment_state"] != "QUEUED"
+                                 or blend["base_tank_inventory_kg"] > 14_000.0,
+                                 "Base-concentrate tanker is waiting at receiving while usable stock is low",
+                                 "HIGH"),
+        "syrup_tanker_delayed": (blend["syrup_shipment_state"] == "QUEUED"
+                                 and blend["syrup_tank_inventory_kg"] < 5_000.0,
+                                 blend["syrup_shipment_state"] != "QUEUED"
+                                 or blend["syrup_tank_inventory_kg"] > 7_000.0,
+                                 "Syrup tanker is waiting at receiving while usable stock is low",
+                                 "HIGH"),
         "recipe_deviation": (blend["recipe_ratio_error_pct"] > 3.0,
                              blend["recipe_ratio_error_pct"] < 1.5,
                              "Recipe controller deviation exceeds the mixing tolerance; new batches are held",
@@ -2137,7 +2210,7 @@ def render_dashboard():
             ("Medium · Utility disturbance", "Inject Utility loss in Boiler house or Compressed air. Trace which downstream areas lose pressure, flow, or production. Identify leading and lagging signals."),
             ("Large · Plant-wide incident", "Inject a Large incident into Whole factory. Rank affected areas by urgency, draft an alarm grouping strategy, and decide what evidence a shift handover needs."),
             ("Cold chain · Dispatch and refrigeration", "Run `warehouse-cold-store-outage-and-recovery`. Determine whether dispatch congestion or refrigeration failed first; compare cases in each buffer, room temperature, accumulated exposure, and the case-packer response."),
-            ("Recipe supply · Ingredients and treated water", "Compare `batch_blending` tank level with the base and syrup dosing tags and the treated-water delivery in `water_supply_network.process_demand`. Inject Mechanical degradation on a dosing pump and identify when the mix buffer begins limiting pasteurizers."),
+            ("Recipe supply · Ingredients and treated water", "Run `bulk-ingredient-delivery-disruption`. Compare tanker GPS, receiving-bay service, base-tank stock, blend-buffer inventory, and pasteurizer feed to identify the two separate inventory delays. Then run `recipe-water-and-ingredient-shortage` to compare ingredient and treated-water constraints."),
             ("Integration challenge", "Design a canonical tag model for area, asset, signal, units, range, quality, timestamp, and source. Export a snapshot and sketch how your historian would ingest it."),
             ("Alarm rationalization", "Compare the alarm list with tag quality and trends. Define priority, deadband, delay, shelving rules, and operator response for each failure mode."),
         ]
@@ -2368,6 +2441,15 @@ def render_dashboard():
              f"{blend['syrup_tank_inventory_kg']:.0f}/{blend['syrup_tank_capacity_kg']:.0f} kg"]):
             col.metric(label, value)
         st.caption(f"Mixer {blend['mixer_rate_lpm']:.1f}/{blend['mixer_request_lpm']:.1f} L/min · recipe water fraction {BATCH_MODEL.WATER_L_PER_L*100:.0f}% · base concentrate {BATCH_MODEL.BASE_KG_PER_L*100:.0f}% · syrup {BATCH_MODEL.SYRUP_KG_PER_L*100:.0f}% by mass · treated-water quality {blend['water_turbidity_ntu']:.2f} NTU / {blend['water_chlorine_mg_l']:.2f} mg/L ({'permissive' if blend['water_quality_permissive'] else 'blocked'}) · estimated product-feed service {blend['product_feed_service_fraction']*100:.1f}%")
+        supplier_metrics = st.columns(4)
+        for col, label, value in zip(supplier_metrics,
+            ["Base tanker", "Base delivery", "Syrup tanker", "Receiving bay"],
+            [f"{blend['base_shipment_state']} · ETA {blend['base_shipment_eta_s']/60:.0f} min",
+             f"{blend['base_shipment_remaining_kg']:.0f} kg · {blend['base_receiving_rate_kg_h']:.0f} kg/h",
+             f"{blend['syrup_shipment_state']} · ETA {blend['syrup_shipment_eta_s']/60:.0f} min",
+             f"{blend['receiving_bay_active_material']} · {blend['receiving_bay_service_fraction']*100:.0f}% service"]):
+            col.metric(label, value)
+        st.caption(f"Cumulative received: base {blend['base_shipment_cumulative_received_kg']:.0f} kg, syrup {blend['syrup_shipment_cumulative_received_kg']:.0f} kg · orders: base {blend['base_shipment_cumulative_ordered']}, syrup {blend['syrup_shipment_cumulative_ordered']}. Run `bulk-ingredient-delivery-disruption` to see a tanker arrive during a receiving-bay power outage.")
         history = pd.DataFrame(blend["history"])
         if not history.empty:
             left, right = st.columns(2)

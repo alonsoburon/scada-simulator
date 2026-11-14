@@ -323,6 +323,26 @@ SCENARIOS = {
             "When the controller fault clears, the mixer refills the tank at a bounded rate and product feed recovers progressively.",
         ),
     ),
+    "bulk-ingredient-delivery-disruption": ScenarioDefinition(
+        scenario_id="bulk-ingredient-delivery-disruption",
+        name="Bulk ingredient delivery delay",
+        description="A receiving-bay power loss overlaps a scheduled concentrate-tanker arrival. Tank inventory and blend buffers delay the production impact, then finite unloading limits recovery.",
+        duration_seconds=129_600,
+        steps=(
+            ScenarioStep(43_200, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                                "target_area": "Bulk receiving",
+                                                "target_asset": "Tanker unloading bay",
+                                                "duration_seconds": 57_600}),
+        ),
+        expected_observations=(
+            "The base-concentrate tank reaches its reorder threshold and creates a finite tanker shipment with a road ETA.",
+            "The truck's GPS position moves along its supplier route; it queues at the weighbridge while the receiving bay has no power.",
+            "The tank inventory continues to fall during the delivery delay, while the mix tank temporarily protects pasteurizer feed.",
+            "The prolonged unloading outage eventually empties the base tank and then the blend buffer, so pasteurizer feed falls after both inventory delays.",
+            "After power returns, the mix tank and ingredient stock recover gradually at the finite tanker-pump and mixer rates.",
+            "The shipment is counted into the base-tank mass balance only as material crosses the unloading connection.",
+        ),
+    ),
     "cip-water-steam-and-production-recovery": ScenarioDefinition(
         scenario_id="cip-water-steam-and-production-recovery",
         name="CIP water and steam demand with production recovery",
