@@ -19,6 +19,10 @@ class CopperConcentrator:
     BALL_SPECIFIC_ENERGY_KWH_T = 5.15
     FLOTATION_CELL_COUNT = 6
     FLOTATION_BANK_VOLUME_M3 = 540.0
+    SECONDARY_CRUSHER_CAPACITY_TPH = 1_520.0
+    CONE_CRUSHER_CAPACITY_TPH = 1_480.0
+    SCREEN_CAPACITY_TPH = 1_700.0
+    SCREEN_BASE_EFFICIENCY = 0.90
     GEOLOGICAL_DOMAINS = (
         # name, weight, mean Cu grade, grade scatter, hardness, hardness scatter
         ("weathered", 0.14, 0.59, 0.10, 0.84, 0.08),
@@ -46,7 +50,8 @@ class CopperConcentrator:
     TAILINGS_DECANT_PUMP_EFFICIENCY = 0.72
     AREA_ASSETS = {
         "Open-pit mining": ["Pit sector A"],
-        "Crushing and screening": ["Primary crusher", "Ore conveyors"],
+        "Crushing and screening": ["Primary crusher", "Secondary crusher", "Cone crusher 01",
+                                   "Screen deck A", "Ore conveyors"],
         "Grinding and flotation": ["SAG mill", "Ball mill 01", "Cyclone cluster", "Flotation cells",
                                    "Flotation air blower", "Flotation reagent dosing pump"],
         "Concentrate handling": ["Concentrate thickener", "Filter press"],
@@ -57,6 +62,9 @@ class CopperConcentrator:
               "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump")
     MAINTAINABLE_EQUIPMENT = {
         "crusher": ("Primary crusher", "crusher"),
+        "secondary_crusher": ("Secondary crusher", "secondary_crusher"),
+        "cone_crusher": ("Cone crusher 01", "cone_crusher"),
+        "screen_deck": ("Screen deck A", "screen_deck"),
         "conveyors": ("Ore conveyors", "conveyors"),
         "sag_mill": ("SAG mill", "sag_mill"),
         "ball_mill": ("Ball mill", "ball_mill"),
@@ -70,6 +78,8 @@ class CopperConcentrator:
     EQUIPMENT_TARGET_ALIASES = {"tailings_pump": ("Tailings pump station A",)}
     MAINTENANCE_AREAS = {
         "crusher": "Crushing and screening", "conveyors": "Crushing and screening",
+        "secondary_crusher": "Crushing and screening", "cone_crusher": "Crushing and screening",
+        "screen_deck": "Crushing and screening",
         "sag_mill": "Grinding and flotation", "ball_mill": "Grinding and flotation",
         "flotation": "Grinding and flotation",
         "concentrate_thickener": "Concentrate handling", "filter_press": "Concentrate handling",
@@ -166,6 +176,9 @@ class CopperConcentrator:
             "cumulative_tailings_copper_received_t": 0.0,
             "cumulative_tailings_copper_pumped_t": 0.0,
             "rom_feed_tph": 1_180.0, "crusher_feed_tph": 1_080.0, "crushed_ore_tph": 1_030.0,
+            "secondary_crusher_feed_tph": 1_144.44, "cone_crusher_feed_tph": 1_144.44,
+            "screen_feed_tph": 1_144.44, "screen_oversize_tph": 114.44,
+            "screen_efficiency_pct": 90.0,
             "plant_feed_tph": 870.0, "sag_feed_tph": 870.0, "ball_circuit_feed_tph": 1_689.0,
             "cyclone_overflow_tph": 870.0, "tailings_tph": 849.0, "concentrate_tph": 21.0,
             "copper_feed_grade_pct": 0.62, "copper_recovery_pct": 88.0,
@@ -198,21 +211,29 @@ class CopperConcentrator:
             "water_available_fraction": 1.0, "water_recovery_pct": 42.0,
             "fresh_water_shortage_m3h": 0.0,
             "sag_power_mw": 15.0, "ball_power_mw": 8.7, "crusher_power_mw": 2.2,
+            "secondary_crusher_power_mw": 0.858, "cone_crusher_power_mw": 1.202,
+            "screen_power_mw": 0.252,
             "conveyor_power_mw": 0.45, "flotation_air_power_mw": 1.62,
             "flotation_aux_power_mw": 0.35, "tailings_pump_power_mw": 0.62,
             "tailings_thickener_power_mw": 0.18, "concentrate_thickener_power_mw": 0.11,
             "filter_press_power_mw": 0.12, "process_aux_power_mw": 0.50,
-            "total_power_mw": 29.85,
+            "total_power_mw": 32.162,
             "flotation_air_nm3_min": 540.0, "reagent_l_h": 245.0,
             "crusher_condition": 1.0, "sag_condition": 1.0, "ball_condition": 1.0,
+            "secondary_crusher_condition": 1.0, "cone_crusher_condition": 1.0,
+            "screen_deck_condition": 1.0,
             "flotation_condition": 1.0, "tailings_condition": 1.0,
             "concentrate_condition": 1.0,
             "equipment_health": {name: 1.0 for name in self.MAINTAINABLE_EQUIPMENT},
             "crusher_vibration_mm_s": 2.4, "sag_vibration_mm_s": 2.8,
+            "secondary_crusher_vibration_mm_s": 2.7, "cone_crusher_vibration_mm_s": 2.6,
+            "screen_deck_vibration_mm_s": 2.0,
             "ball_vibration_mm_s": 2.4, "flotation_vibration_mm_s": 1.8,
             "tailings_vibration_mm_s": 2.1, "crushing_running": 1.0,
             "sag_running": 1.0, "flotation_running": 1.0, "measurement_drift": 0.0,
             "ball_running": 1.0, "crusher_motor_running": 1.0, "conveyors_motor_running": 1.0,
+            "secondary_crusher_motor_running": 1.0, "cone_crusher_motor_running": 1.0,
+            "screen_deck_motor_running": 1.0,
             "sag_motor_running": 1.0, "ball_motor_running": 1.0,
             "flotation_motor_running": 1.0, "tailings_motor_running": 1.0,
             "tailings_thickener_motor_running": 1.0,
@@ -253,7 +274,13 @@ class CopperConcentrator:
                     "tailings_decant_water_m3h", "tailings_pond_spill_m3",
                     "cumulative_tailings_decant_m3",
                     "cumulative_tailings_pond_spill_m3", "cumulative_tailings_pond_evaporation_m3",
-                    "conveyor_power_mw", "flotation_air_power_mw", "flotation_aux_power_mw",
+                    "conveyor_power_mw", "secondary_crusher_power_mw", "cone_crusher_power_mw",
+                    "screen_power_mw", "secondary_crusher_feed_tph", "cone_crusher_feed_tph",
+                    "screen_feed_tph", "screen_oversize_tph", "screen_efficiency_pct",
+                    "secondary_crusher_motor_running", "cone_crusher_motor_running",
+                    "screen_deck_motor_running", "secondary_crusher_condition",
+                    "cone_crusher_condition", "screen_deck_condition",
+                    "flotation_air_power_mw", "flotation_aux_power_mw",
                     "tailings_pump_power_mw", "tailings_thickener_power_mw",
                     "tailings_decant_pump_power_mw",
                     "tailings_decant_condition", "tailings_decant_motor_running",
@@ -267,6 +294,8 @@ class CopperConcentrator:
                     "cumulative_concentrate_produced_t", "cumulative_concentrate_shipped_t",
                     "cumulative_tailings_received_t", "cumulative_tailings_pumped_t",
                     "ball_running", "crusher_motor_running", "conveyors_motor_running",
+                    "secondary_crusher_motor_running", "cone_crusher_motor_running",
+                    "screen_deck_motor_running",
                     "sag_motor_running", "ball_motor_running", "flotation_motor_running",
                     "tailings_motor_running", "tailings_thickener_motor_running",
                     "concentrate_thickener_motor_running", "filter_press_motor_running",
@@ -305,6 +334,13 @@ class CopperConcentrator:
             sample.setdefault("flotation_copper_inventory_t", 0.9)
             sample.setdefault("reagent_inventory_l", self.FLOTATION_REAGENT_INITIAL_L)
             sample.setdefault("reagent_dose_l_h", 245.0)
+            sample.setdefault("secondary_crusher_feed_tph",
+                              sample.get("crusher_feed_tph", 1_030.0) / self.SCREEN_BASE_EFFICIENCY)
+            sample.setdefault("cone_crusher_feed_tph", sample["secondary_crusher_feed_tph"])
+            sample.setdefault("screen_feed_tph", sample["secondary_crusher_feed_tph"])
+            sample.setdefault("screen_oversize_tph",
+                              sample["screen_feed_tph"] - sample.get("crusher_feed_tph", 1_030.0))
+            sample.setdefault("screen_efficiency_pct", 100.0 * self.SCREEN_BASE_EFFICIENCY)
             for index in range(self.FLOTATION_CELL_COUNT):
                 sample.setdefault(f"collector_availability_cell_{index + 1:02d}", 100.0)
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
@@ -346,7 +382,9 @@ class CopperConcentrator:
         for copper_key, (solids_key, grade_fraction) in legacy_grade_inventory.items():
             if copper_key in missing:
                 state[copper_key] = max(0.0, state.get(solids_key, 0.0)) * grade_fraction
-        power_components = ("conveyor_power_mw", "flotation_air_power_mw", "flotation_aux_power_mw",
+        power_components = ("conveyor_power_mw", "secondary_crusher_power_mw",
+                            "cone_crusher_power_mw", "screen_power_mw",
+                            "flotation_air_power_mw", "flotation_aux_power_mw",
                             "tailings_pump_power_mw", "tailings_thickener_power_mw",
                             "tailings_decant_pump_power_mw",
                             "concentrate_thickener_power_mw", "filter_press_power_mw",
@@ -354,6 +392,12 @@ class CopperConcentrator:
         if any(key in missing for key in power_components):
             state["conveyor_power_mw"] = (0.45 * state.get("crushed_ore_tph", 0.0) / 1_200.0
                                           * state.get("conveyors_motor_running", 1.0))
+            state["secondary_crusher_power_mw"] = (0.75 * state.get("secondary_crusher_feed_tph", 0.0)
+                / 1_000.0 * state.get("secondary_crusher_motor_running", 1.0))
+            state["cone_crusher_power_mw"] = (1.05 * state.get("cone_crusher_feed_tph", 0.0)
+                / 1_000.0 * state.get("cone_crusher_motor_running", 1.0))
+            state["screen_power_mw"] = (0.22 * state.get("screen_feed_tph", 0.0)
+                / 1_000.0 * state.get("screen_deck_motor_running", 1.0))
             state["flotation_air_power_mw"] = (
                 state.get("flotation_air_nm3_min", 0.0) * 60.0 * 0.05 / 1_000.0)
             state["flotation_aux_power_mw"] = (0.35 * min(1.0, state.get("plant_feed_tph", 0.0) / 900.0)
@@ -379,6 +423,7 @@ class CopperConcentrator:
             state["process_aux_power_mw"] = 0.50
             state["total_power_mw"] = sum(state.get(key, 0.0) for key in (
                 "sag_power_mw", "ball_power_mw", "crusher_power_mw", "conveyor_power_mw",
+                "secondary_crusher_power_mw", "cone_crusher_power_mw", "screen_power_mw",
                 "flotation_air_power_mw", "flotation_aux_power_mw", "tailings_pump_power_mw",
                 "tailings_decant_pump_power_mw",
                 "tailings_thickener_power_mw", "concentrate_thickener_power_mw",
@@ -613,7 +658,8 @@ class CopperConcentrator:
         equipment_available = equipment_available or {
             "tailings_pump": True, "tailings_thickener": True,
             "concentrate_thickener": True, "filter_press": True, "flotation": True, "ball_mill": True,
-            "sag_mill": True, "conveyors": True, "crusher": True,
+            "sag_mill": True, "conveyors": True, "screen_deck": True,
+            "cone_crusher": True, "secondary_crusher": True, "crusher": True,
         }
         jam = self._severity(events, "Conveyor jam", ("Crushing and screening",))
         upset = self._severity(events, "Process upset", ("Grinding and flotation", "Whole factory"))
@@ -632,6 +678,8 @@ class CopperConcentrator:
         state["ore_hardness_kwh_t"] = 17.0 * state["ore_hardness_factor"]
         mine_grade_pct = state["mine_block_grade_pct"]
         equipment_areas = {"crusher": "Crushing and screening", "conveyors": "Crushing and screening",
+                           "secondary_crusher": "Crushing and screening",
+                           "cone_crusher": "Crushing and screening", "screen_deck": "Crushing and screening",
                            "sag_mill": "Grinding and flotation", "ball_mill": "Grinding and flotation",
                            "flotation": "Grinding and flotation",
                            "concentrate_thickener": "Concentrate handling",
@@ -648,6 +696,12 @@ class CopperConcentrator:
                                    - self._mechanical_damage_rate_per_s(fault_factor))
         state["crusher_condition"] = health["crusher"] * (1.0 - equipment_faults["crusher"] * 0.55)
         state["conveyors_condition"] = health["conveyors"] * (1.0 - equipment_faults["conveyors"] * 0.25)
+        state["secondary_crusher_condition"] = health["secondary_crusher"] * (
+            1.0 - equipment_faults["secondary_crusher"] * 0.45)
+        state["cone_crusher_condition"] = health["cone_crusher"] * (
+            1.0 - equipment_faults["cone_crusher"] * 0.45)
+        state["screen_deck_condition"] = health["screen_deck"] * (
+            1.0 - equipment_faults["screen_deck"] * 0.35)
         state["sag_condition"] = health["sag_mill"] * (1.0 - equipment_faults["sag_mill"] * 0.48)
         state["ball_condition"] = health["ball_mill"] * (1.0 - equipment_faults["ball_mill"] * 0.40)
         state["flotation_condition"] = health["flotation"] * (1.0 - equipment_faults["flotation"] * 0.28)
@@ -673,10 +727,27 @@ class CopperConcentrator:
         # payloads; standalone model experiments retain a smooth mine-source input.
         scheduled_rom_feed = 1_120.0 * (1 + 0.07 * math.sin(sim_seconds / 140) + 0.025 * math.sin(sim_seconds / 23))
         jam_factor = 0.0 if jam >= 0.78 else 1.0 - jam
-        crusher_running = equipment_available.get("crusher", True) and equipment_available.get("conveyors", True)
-        crusher_capacity = (1_460.0 * state["crusher_condition"] * state["conveyors_condition"]
-                            * jam_factor * power_factor
-                            if crusher_running else 0.0)
+        crusher_running = all(equipment_available.get(name, True) for name in
+                              ("crusher", "conveyors", "secondary_crusher", "cone_crusher", "screen_deck"))
+        primary_capacity = (1_460.0 * state["crusher_condition"] * state["conveyors_condition"]
+                            * jam_factor * power_factor if crusher_running else 0.0)
+        screen_efficiency = min(0.94, max(0.68, self.SCREEN_BASE_EFFICIENCY
+                                         * state["screen_deck_condition"]))
+        state["screen_efficiency_pct"] = 100.0 * screen_efficiency
+        # The screen returns oversize to the secondary/cone circuit. Its
+        # efficiency therefore multiplies the gross capacity of each closed-
+        # circuit stage to give fresh product capacity.
+        secondary_capacity = (self.SECONDARY_CRUSHER_CAPACITY_TPH
+                             * state["secondary_crusher_condition"] * jam_factor * power_factor
+                             if equipment_available.get("secondary_crusher", True) else 0.0)
+        cone_capacity = (self.CONE_CRUSHER_CAPACITY_TPH
+                         * state["cone_crusher_condition"] * jam_factor * power_factor
+                         if equipment_available.get("cone_crusher", True) else 0.0)
+        screen_capacity = (self.SCREEN_CAPACITY_TPH * state["screen_deck_condition"]
+                           * jam_factor * power_factor
+                           if equipment_available.get("screen_deck", True) else 0.0)
+        closed_circuit_capacity = min(secondary_capacity, cone_capacity, screen_capacity) * screen_efficiency
+        crusher_capacity = min(primary_capacity, closed_circuit_capacity)
         plant_target = 900.0 * (1.0 - upset * 0.18)
         water_factor = min(1.0, max(0.0, 1.0 - water_shortage_m3h / max(plant_target * 0.30, 1.0)))
         dt_h = 1.0 / 3600.0
@@ -1050,6 +1121,11 @@ class CopperConcentrator:
 
         state["crusher_feed_tph"] = self._smooth(state["crusher_feed_tph"], crushed_rate, 45)
         state["crushed_ore_tph"] = state["crusher_feed_tph"]
+        closed_circuit_feed = crushed_rate / max(screen_efficiency, 1e-9)
+        state["secondary_crusher_feed_tph"] = closed_circuit_feed
+        state["cone_crusher_feed_tph"] = closed_circuit_feed
+        state["screen_feed_tph"] = closed_circuit_feed
+        state["screen_oversize_tph"] = max(0.0, closed_circuit_feed - crushed_rate)
         state["plant_feed_tph"] = self._smooth(state["plant_feed_tph"], cyclone_overflow, 75)
         state["sag_feed_tph"] = self._smooth(state["sag_feed_tph"], sag_rate, 65)
         state["ball_circuit_feed_tph"] = self._smooth(state["ball_circuit_feed_tph"], ball_rate, 75)
@@ -1167,6 +1243,12 @@ class CopperConcentrator:
         powered = power_factor > 0.05
         state["crusher_motor_running"] = float(powered and equipment_available.get("crusher", True))
         state["conveyors_motor_running"] = float(powered and equipment_available.get("conveyors", True))
+        state["secondary_crusher_motor_running"] = float(
+            powered and equipment_available.get("secondary_crusher", True))
+        state["cone_crusher_motor_running"] = float(
+            powered and equipment_available.get("cone_crusher", True))
+        state["screen_deck_motor_running"] = float(
+            powered and equipment_available.get("screen_deck", True))
         state["sag_motor_running"] = float(powered and equipment_available.get("sag_mill", True))
         state["ball_motor_running"] = float(powered and equipment_available.get("ball_mill", True))
         state["flotation_motor_running"] = float(powered and equipment_available.get("flotation", True))
@@ -1174,6 +1256,15 @@ class CopperConcentrator:
         state["tailings_motor_running"] = float(powered and equipment_available.get("tailings_pump", True))
         state["crusher_vibration_mm_s"] = (2.4 + equipment_faults["crusher"] * 10
                                              + (1.0 - health["crusher"]) * 12 + jam * 5)
+        state["secondary_crusher_vibration_mm_s"] = (
+            2.7 + equipment_faults["secondary_crusher"] * 10
+            + (1.0 - health["secondary_crusher"]) * 12 + jam * 4)
+        state["cone_crusher_vibration_mm_s"] = (
+            2.6 + equipment_faults["cone_crusher"] * 10
+            + (1.0 - health["cone_crusher"]) * 12 + jam * 4)
+        state["screen_deck_vibration_mm_s"] = (
+            2.0 + equipment_faults["screen_deck"] * 8
+            + (1.0 - health["screen_deck"]) * 10 + jam * 2)
         state["sag_vibration_mm_s"] = (2.8 + equipment_faults["sag_mill"] * 8
                                        + (1.0 - health["sag_mill"]) * 12)
         state["ball_vibration_mm_s"] = (2.4 + equipment_faults["ball_mill"] * 7
@@ -1190,6 +1281,14 @@ class CopperConcentrator:
             powered and equipment_available.get("concentrate_thickener", True))
         state["filter_press_motor_running"] = float(powered and equipment_available.get("filter_press", True))
         state["conveyor_power_mw"] = 0.45 * (crushed_rate / 1_200.0) * state["conveyors_motor_running"]
+        state["secondary_crusher_power_mw"] = (
+            0.75 * state["secondary_crusher_feed_tph"] / 1_000.0
+            * state["secondary_crusher_motor_running"])
+        state["cone_crusher_power_mw"] = (
+            1.05 * state["cone_crusher_feed_tph"] / 1_000.0
+            * state["cone_crusher_motor_running"])
+        state["screen_power_mw"] = (0.22 * state["screen_feed_tph"] / 1_000.0
+                                     * state["screen_deck_motor_running"])
         state["flotation_air_power_mw"] = flotation_air * 60.0 * 0.05 / 1_000.0
         state["flotation_aux_power_mw"] = (0.35 * min(1.0, cyclone_overflow / 900.0)
                                            * state["flotation_motor_running"])
@@ -1206,6 +1305,7 @@ class CopperConcentrator:
         state["process_aux_power_mw"] = 0.50
         state["total_power_mw"] = sum(state[key] for key in (
             "sag_power_mw", "ball_power_mw", "crusher_power_mw", "conveyor_power_mw",
+            "secondary_crusher_power_mw", "cone_crusher_power_mw", "screen_power_mw",
             "flotation_air_power_mw", "flotation_aux_power_mw", "tailings_pump_power_mw",
             "tailings_decant_pump_power_mw",
             "tailings_thickener_power_mw", "concentrate_thickener_power_mw",
@@ -1221,6 +1321,11 @@ class CopperConcentrator:
                 "flotation_copper_inventory_t": state["flotation_copper_inventory_t"],
                 "reagent_inventory_l": state["reagent_inventory_l"],
                 "reagent_dose_l_h": state["reagent_dose_l_h"],
+                "secondary_crusher_feed_tph": state["secondary_crusher_feed_tph"],
+                "cone_crusher_feed_tph": state["cone_crusher_feed_tph"],
+                "screen_feed_tph": state["screen_feed_tph"],
+                "screen_oversize_tph": state["screen_oversize_tph"],
+                "screen_efficiency_pct": state["screen_efficiency_pct"],
                 **{f"collector_availability_cell_{index + 1:02d}":
                    100.0 * state["flotation_cell_collector_factor"][index]
                    for index in range(self.FLOTATION_CELL_COUNT)},
@@ -1270,6 +1375,23 @@ class CopperConcentrator:
                     "motor_current": (self._motor_current_a(state["crusher_power_mw"]), "A", 0, 500),
                     "vibration_rms": (state["crusher_vibration_mm_s"], "mm/s", 0, 30),
                     "equipment_running": (state.get("crusher_motor_running", state["crushing_running"]), "bool", 0, 1)},
+                "Secondary crusher": {"feed_rate": (state["secondary_crusher_feed_tph"], "t/h", 0, 2_500),
+                    "motor_power": (state["secondary_crusher_power_mw"], "MW", 0, 3),
+                    "motor_current": (self._motor_current_a(state["secondary_crusher_power_mw"]), "A", 0, 500),
+                    "vibration_rms": (state["secondary_crusher_vibration_mm_s"], "mm/s", 0, 30),
+                    "equipment_running": (state["secondary_crusher_motor_running"], "bool", 0, 1)},
+                "Cone crusher 01": {"feed_rate": (state["cone_crusher_feed_tph"], "t/h", 0, 2_500),
+                    "motor_power": (state["cone_crusher_power_mw"], "MW", 0, 4),
+                    "motor_current": (self._motor_current_a(state["cone_crusher_power_mw"]), "A", 0, 700),
+                    "vibration_rms": (state["cone_crusher_vibration_mm_s"], "mm/s", 0, 30),
+                    "equipment_running": (state["cone_crusher_motor_running"], "bool", 0, 1)},
+                "Screen deck A": {"feed_rate": (state["screen_feed_tph"], "t/h", 0, 2_500),
+                    "oversize_return": (state["screen_oversize_tph"], "t/h", 0, 1_000),
+                    "screen_efficiency": (state["screen_efficiency_pct"], "%", 50, 100),
+                    "motor_power": (state["screen_power_mw"], "MW", 0, 1),
+                    "motor_current": (self._motor_current_a(state["screen_power_mw"]), "A", 0, 200),
+                    "vibration_rms": (state["screen_deck_vibration_mm_s"], "mm/s", 0, 30),
+                    "equipment_running": (state["screen_deck_motor_running"], "bool", 0, 1)},
                 "Ore conveyors": {"ore_rate": (state["crushed_ore_tph"], "t/h", 0, 2_000),
                     "stockpile_inventory": (state["crushed_stockpile_t"], "t", 0, 8_000),
                     "motor_power": (state["conveyor_power_mw"], "MW", 0, 1),

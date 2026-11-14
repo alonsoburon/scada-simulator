@@ -237,7 +237,8 @@ def initialize(seed: int = 17) -> None:
                                  "low": low, "high": high, "base": low + base * (high-low),
                                  "value": low + base * (high-low), "quality": "GOOD", "unit_no": ui,
                                  "phase": rng.random() * 6.28, "last_change": "Normal"})
-                if area == "Mobile fleet":
+                if (area == "Mobile fleet"
+                        and unit.rsplit(" ", 1)[0] in FLEET_ROUTES):
                     # GPS coordinates describe a closed, fictional site route in northern Chile.
                     for gps_name, gps_unit, low, high, gps_base in [
                         ("gps_latitude", "°", -24.4, -24.2, SITE_CENTER["lat"]),
@@ -2068,7 +2069,11 @@ def render_dashboard():
         st.caption(f"Concentrate thickener {plant['concentrate_thickener_inventory_t']:.1f}/{plant['concentrate_thickener_capacity_t']:.0f} t · filter press {plant['filter_press_phase'].lower()} ({plant['filter_press_batch_t']:.2f}/{plant['filter_press_batch_capacity_t']:.1f} t batch) · cake stockpile {plant['concentrate_cake_inventory_t']:.1f}/{plant['concentrate_cake_capacity_t']:.0f} t solids · dry silo {plant['loadout_silo_inventory_t']:.1f}/{plant['loadout_silo_capacity_t']:.0f} t solids · train {plant['rail_train_state'].lower()} ({plant['rail_train_inventory_t']:.0f}/{plant['rail_train_capacity_t']:.0f} t) · shipped {plant['cumulative_concentrate_shipped_t']:.1f} t solids")
         flow_stages = [
             ("ROM feed", plant["rom_feed_tph"], "#277da1"),
-            ("Crusher", plant["crushed_ore_tph"], "#4c78a8"),
+            ("Primary product", plant["crushed_ore_tph"], "#4c78a8"),
+            ("Secondary feed", plant["secondary_crusher_feed_tph"], "#f2a541"),
+            ("Cone feed", plant["cone_crusher_feed_tph"], "#43aa8b"),
+            ("Screen feed", plant["screen_feed_tph"], "#9b5de5"),
+            ("Screen oversize return", plant["screen_oversize_tph"], "#e07a5f"),
             ("SAG fresh feed", plant["sag_feed_tph"], "#f2a541"),
             ("Ball circuit", plant["ball_circuit_feed_tph"], "#e07a5f"),
             ("Cyclone overflow", plant["cyclone_overflow_tph"], "#43aa8b"),
@@ -2085,6 +2090,34 @@ def render_dashboard():
         history = pd.DataFrame(plant["history"])
         if not history.empty:
             with process_left:
+                crush_trend = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                    vertical_spacing=0.14, specs=[[{}], [{"secondary_y": True}]],
+                    subplot_titles=("Fresh and recirculating solids through crushing",
+                                    "Screen return load and separation efficiency"))
+                for key, label, color in (
+                    ("crusher_feed_tph", "Primary crusher product", "#277da1"),
+                    ("secondary_crusher_feed_tph", "Secondary crusher feed", "#f2a541"),
+                    ("cone_crusher_feed_tph", "Cone crusher feed", "#43aa8b"),
+                    ("screen_feed_tph", "Screen feed", "#9b5de5"),
+                ):
+                    crush_trend.add_trace(go.Scatter(x=history.time, y=history[key],
+                        name=label, line={"color": color}), row=1, col=1)
+                crush_trend.add_trace(go.Scatter(x=history.time, y=history.screen_oversize_tph,
+                    name="Oversize return", line={"color": "#e07a5f"}), row=2, col=1,
+                    secondary_y=False)
+                crush_trend.add_trace(go.Scatter(x=history.time, y=history.screen_efficiency_pct,
+                    name="Screen efficiency", line={"color": "#6c757d"}), row=2, col=1,
+                    secondary_y=True)
+                crush_trend.update_yaxes(title_text="Solids rate (t/h)", rangemode="tozero",
+                                         row=1, col=1)
+                crush_trend.update_yaxes(title_text="Return load (t/h)", rangemode="tozero",
+                                         row=2, col=1, secondary_y=False)
+                crush_trend.update_yaxes(title_text="Efficiency (%)", range=[50, 100],
+                                         row=2, col=1, secondary_y=True)
+                crush_trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
+                crush_trend.update_layout(height=500, legend={"orientation": "h", "y": 1.06},
+                    uirevision="closed-circuit-crushing-trend")
+                st.plotly_chart(crush_trend, width="stretch")
                 trend = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.15,
                                       specs=[[{"secondary_y": True}], [{"secondary_y": True}]])
                 trend.add_trace(go.Scatter(x=history.time, y=history.plant_feed_tph, name="Plant feed",

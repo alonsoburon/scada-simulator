@@ -11,18 +11,22 @@ import math
 class PlantController:
     START_ORDER = ("tailings_decant_pump", "tailings_pump", "tailings_thickener", "filter_press",
                    "concentrate_thickener", "flotation", "ball_mill",
-                   "sag_mill", "conveyors", "crusher")
-    STOP_ORDER = ("crusher", "conveyors", "sag_mill", "ball_mill", "flotation",
+                   "sag_mill", "conveyors", "screen_deck", "cone_crusher",
+                   "secondary_crusher", "crusher")
+    STOP_ORDER = ("crusher", "secondary_crusher", "cone_crusher", "screen_deck",
+                  "conveyors", "sag_mill", "ball_mill", "flotation",
                   "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump",
                   "tailings_decant_pump")
     START_DELAY_S = {"tailings_decant_pump": 4, "tailings_pump": 4,
                      "tailings_thickener": 8, "filter_press": 8,
                      "concentrate_thickener": 7, "flotation": 5, "ball_mill": 12,
                      "sag_mill": 12, "conveyors": 5, "crusher": 8}
+    START_DELAY_S.update({"screen_deck": 4, "cone_crusher": 7, "secondary_crusher": 7})
     STOP_DELAY_S = {"crusher": 3, "conveyors": 5, "sag_mill": 15,
                     "ball_mill": 10, "flotation": 5, "concentrate_thickener": 10,
                     "filter_press": 8, "tailings_thickener": 12, "tailings_pump": 8,
                     "tailings_decant_pump": 5}
+    STOP_DELAY_S.update({"secondary_crusher": 4, "cone_crusher": 4, "screen_deck": 3})
     # Additional real-power demand while each motor accelerates. These are
     # aggregate starter/inrush equivalents, not nameplate or protection values.
     MOTOR_STARTING_LOAD_MW = {
@@ -31,16 +35,23 @@ class PlantController:
         "concentrate_thickener": 0.15, "flotation": 0.55, "ball_mill": 2.4,
         "sag_mill": 3.8, "conveyors": 0.65, "crusher": 1.4,
     }
+    MOTOR_STARTING_LOAD_MW.update({"screen_deck": 0.22, "cone_crusher": 0.65,
+                                   "secondary_crusher": 0.55})
     MOTOR_STARTING_DECAY_S = 2.5
     LABELS = {"tailings_pump": "Tailings pump", "tailings_thickener": "Tailings thickener",
               "filter_press": "Concentrate filter press",
               "concentrate_thickener": "Concentrate thickener", "flotation": "Flotation air and cells",
               "ball_mill": "Ball mill", "sag_mill": "SAG mill",
               "conveyors": "Ore conveyors", "crusher": "Primary crusher",
+              "screen_deck": "Screen deck A", "cone_crusher": "Cone crusher 01",
+              "secondary_crusher": "Secondary crusher",
               "tailings_decant_pump": "Tailings decant pump"}
     ASSET_ALIASES = {"tailings_pump": ("Tailings pump station A",)}
     EQUIPMENT_AREAS = {
         "crusher": ("Crushing and screening",), "conveyors": ("Crushing and screening",),
+        "screen_deck": ("Crushing and screening",),
+        "cone_crusher": ("Crushing and screening",),
+        "secondary_crusher": ("Crushing and screening",),
         "sag_mill": ("Grinding and flotation",), "ball_mill": ("Grinding and flotation",),
         "flotation": ("Grinding and flotation",),
         "concentrate_thickener": ("Concentrate handling",),
@@ -167,7 +178,10 @@ class PlantController:
             "concentrate_thickener": ("flotation", "ball_mill", "sag_mill"),
             "flotation": ("ball_mill", "sag_mill"),
             "ball_mill": ("sag_mill",),
-            "conveyors": ("crusher",),
+            "conveyors": ("screen_deck", "cone_crusher", "secondary_crusher", "crusher"),
+            "screen_deck": ("cone_crusher", "secondary_crusher", "crusher"),
+            "cone_crusher": ("secondary_crusher", "crusher"),
+            "secondary_crusher": ("crusher",),
         }
         pending = list(equipment_names)
         expanded = set()

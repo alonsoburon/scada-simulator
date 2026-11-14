@@ -131,6 +131,23 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertGreater(self.state["plant_feed_tph"], baseline_feed * 0.85)
         self.assertLess(self.state["crushed_stockpile_t"], 3_200)
 
+    def test_screen_wear_increases_closed_circuit_recirculation_and_reduces_fresh_crush_rate(self):
+        healthy = self.model.initialize()
+        worn = self.model.initialize()
+        self.model.advance(healthy, 1, [])
+        fault = {"name": "Mechanical degradation", "area": "Crushing and screening",
+                 "severity": "Large", "target_asset": "Screen deck A"}
+        self.model.advance(worn, 1, [fault])
+
+        self.assertLess(worn["screen_efficiency_pct"], healthy["screen_efficiency_pct"])
+        self.assertGreater(worn["screen_oversize_tph"], healthy["screen_oversize_tph"])
+        self.assertLess(worn["crushed_ore_tph"], healthy["crushed_ore_tph"])
+        self.assertAlmostEqual(worn["equipment_health"]["secondary_crusher"], 1.0)
+        tags = {row["tag"]: row for row in self.model.telemetry(worn)}
+        self.assertIn("crushing_and_screening.screen_deck_a.screen_efficiency", tags)
+        self.assertIn("crushing_and_screening.cone_crusher_01.motor_power", tags)
+        self.assertIn("crushing_and_screening.secondary_crusher.vibration_rms", tags)
+
     def test_water_shortage_derates_feed_and_float_recovery(self):
         self.advance(900)
         normal = self.state["plant_feed_tph"]

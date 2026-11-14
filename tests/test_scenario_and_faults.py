@@ -20,6 +20,13 @@ def simulation_state() -> dict:
 
 
 class ScenarioRunnerTests(unittest.TestCase):
+    def test_pause_and_resume_without_active_scenario_are_safe(self):
+        runner = ScenarioRunner()
+        sim = simulation_state()
+        runner.pause(sim)
+        runner.resume(sim)
+        self.assertIsNone(sim["scenario_run"])
+
     def test_distribution_protection_scenario_targets_a_named_feeder(self):
         definition = ScenarioRunner().definition("distribution-overcurrent-reclose")
         step = definition.steps[0]

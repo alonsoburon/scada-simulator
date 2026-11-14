@@ -550,12 +550,14 @@ class ScenarioRunner:
         return sim["scenario_run"]
 
     def pause(self, sim: dict) -> None:
-        if sim.get("scenario_run", {}).get("status") == "running":
-            sim["scenario_run"]["status"] = "paused"
+        run = sim.get("scenario_run")
+        if run and run.get("status") == "running":
+            run["status"] = "paused"
 
     def resume(self, sim: dict) -> None:
-        if sim.get("scenario_run", {}).get("status") == "paused":
-            sim["scenario_run"]["status"] = "running"
+        run = sim.get("scenario_run")
+        if run and run.get("status") == "paused":
+            run["status"] = "running"
 
     def before_tick(self, sim: dict, apply_action: Callable[[dict, ScenarioStep], None]) -> None:
         run = sim.get("scenario_run")

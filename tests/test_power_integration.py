@@ -41,8 +41,7 @@ class MinePowerIntegrationTests(unittest.TestCase):
 
         for tick in range(1, 1_201):
             events = outage if 120 <= tick < 720 else []
-            process_request = (concentrator["sag_power_mw"] + concentrator["ball_power_mw"]
-                               + concentrator["crusher_power_mw"] + 1.0)
+            process_request = concentrator["total_power_mw"]
             water_request = sum(pump["power_kw"] for pump in water["pumps"].values()) / 1000
             grid.advance(power, tick, events, process_load_mw=process_request,
                          water_load_mw=water_request, seed=17)

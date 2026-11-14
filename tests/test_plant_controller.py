@@ -20,19 +20,19 @@ class PlantControllerTests(unittest.TestCase):
 
     def test_start_and_stop_follow_ordered_sequences(self):
         self.controller.request(self.state, "STOP")
-        self.advance(81)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "STOPPED")
         self.assertTrue(all(item["state"] == "STOPPED" for item in self.state["equipment"].values()))
 
         self.controller.request(self.state, "START")
-        self.advance(81)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "RUNNING")
         self.assertTrue(all(item["state"] == "RUNNING" for item in self.state["equipment"].values()))
         self.assertEqual(self.state["equipment"]["tailings_pump"]["starts"], 2)
 
     def test_startup_waits_for_water_and_power_permissives(self):
         self.controller.request(self.state, "STOP")
-        self.advance(81)
+        self.advance(110)
         self.controller.request(self.state, "START")
         self.advance(40, process_water_level_pct=10.0)
         self.assertEqual(self.state["process_water_level_feedback_pct"], 10.0)
@@ -50,7 +50,7 @@ class PlantControllerTests(unittest.TestCase):
 
     def test_ordered_motor_start_adds_a_decaying_grid_load_transient(self):
         self.controller.request(self.state, "STOP")
-        self.advance(81)
+        self.advance(110)
         self.controller.request(self.state, "START")
 
         self.controller.advance(self.state, 82, [], **self.utilities)
@@ -93,11 +93,26 @@ class PlantControllerTests(unittest.TestCase):
         self.controller.advance(self.state, 4, [], **self.utilities)
         with self.assertRaisesRegex(ValueError, "Finish the orderly stop"):
             self.controller.request(self.state, "START")
-        self.advance(80)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "STOPPED")
         self.controller.request(self.state, "START")
-        self.advance(80)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "RUNNING")
+
+    def test_screen_failure_trips_crushing_equipment_back_toward_the_feed_source(self):
+        fault = [{"name": "Mechanical degradation", "area": "Crushing and screening",
+                  "severity": "Large", "target_asset": "Screen deck A"}]
+        self.advance(3, events=fault)
+        for name in ("screen_deck", "cone_crusher", "secondary_crusher", "crusher"):
+            self.assertEqual(self.state["equipment"][name]["state"], "TRIPPED")
+        self.assertEqual(self.state["equipment"]["conveyors"]["state"], "RUNNING")
+        available = self.controller.availability(self.state)
+        self.assertFalse(available["screen_deck"])
+        concentrator = CopperConcentrator()
+        process = concentrator.initialize()
+        concentrator.advance(process, 1, fault, equipment_available=available)
+        self.assertEqual(process["cumulative_rom_discharge_t"], 0.0)
+        self.assertEqual(process["crusher_motor_running"], 0.0)
 
     def test_filter_press_fault_trips_upstream_feed_and_requires_manual_reset(self):
         fault = [{"name": "Mechanical degradation", "area": "Concentrate handling", "severity": "Large"}]
@@ -111,10 +126,10 @@ class PlantControllerTests(unittest.TestCase):
                                     voltage_pu=1, frequency_hz=50)
         self.assertEqual(self.state["trip_count"], 0)
         self.assertEqual(self.state["mode"], "STOPPING")
-        self.advance(80)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "STOPPED")
         self.controller.request(self.state, "START")
-        self.advance(80)
+        self.advance(110)
         self.assertEqual(self.state["mode"], "RUNNING")
 
     def test_electrical_protection_is_delayed_and_latched(self):
