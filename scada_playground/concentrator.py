@@ -32,6 +32,8 @@ class CopperConcentrator:
     TAILINGS_POND_CAPACITY_M3 = 120_000.0
     TAILINGS_POND_INITIAL_M3 = 30_000.0
     TAILINGS_POND_TARGET_M3 = 25_000.0
+    TAILINGS_POND_DERATE_START_FRACTION = 0.92
+    TAILINGS_POND_DERATE_STOP_FRACTION = 0.98
     TAILINGS_DECANT_CAPACITY_M3H = 500.0
     TAILINGS_DECANT_LEVELING_S = 7_200.0
     TAILINGS_EVAPORATION_M3H = 0.15
@@ -45,7 +47,7 @@ class CopperConcentrator:
                                    "Flotation air blower"],
         "Concentrate handling": ["Concentrate thickener", "Filter press"],
         "Tailings and reclaim": ["Tailings thickener", "Tailings pump station A",
-                                 "Tailings storage facility"],
+                                 "Tailings decant pump", "Tailings storage facility"],
     }
     STAGES = ("crushing", "sag_mill", "ball_mill", "cyclone", "flotation",
               "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump")
@@ -59,6 +61,7 @@ class CopperConcentrator:
         "filter_press": ("Filter press", "filter_press"),
         "tailings_thickener": ("Tailings thickener", "tailings_thickener"),
         "tailings_pump": ("Tailings pump", "tailings_pump"),
+        "tailings_decant_pump": ("Tailings decant pump", "tailings_decant_pump"),
     }
     MAINTENANCE_AREAS = {
         "crusher": "Crushing and screening", "conveyors": "Crushing and screening",
@@ -66,6 +69,7 @@ class CopperConcentrator:
         "flotation": "Grinding and flotation",
         "concentrate_thickener": "Concentrate handling", "filter_press": "Concentrate handling",
         "tailings_thickener": "Tailings and reclaim", "tailings_pump": "Tailings and reclaim",
+        "tailings_decant_pump": "Tailings and reclaim",
     }
     SIGNALS = (
         ("ore_rate", "t/h", 0, 2_000), ("motor_power", "MW", 0, 30),
@@ -129,8 +133,10 @@ class CopperConcentrator:
             "cumulative_tailings_water_retained_m3": 0.0,
             "tailings_pond_capacity_m3": self.TAILINGS_POND_CAPACITY_M3,
             "tailings_pond_inventory_m3": self.TAILINGS_POND_INITIAL_M3,
+            "tailings_pond_backpressure": 1.0,
             "tailings_decant_water_m3h": 0.0,
             "tailings_decant_pump_power_mw": 0.0,
+            "tailings_decant_condition": 1.0, "tailings_decant_motor_running": 1.0,
             "cumulative_tailings_decant_m3": 0.0,
             "tailings_pond_spill_m3": 0.0,
             "cumulative_tailings_pond_spill_m3": 0.0,
@@ -227,12 +233,14 @@ class CopperConcentrator:
                     "cumulative_tailings_deposited_t", "cumulative_tailings_copper_deposited_t",
                     "cumulative_tailings_water_retained_m3",
                     "tailings_pond_capacity_m3", "tailings_pond_inventory_m3",
+                    "tailings_pond_backpressure",
                     "tailings_decant_water_m3h", "tailings_pond_spill_m3",
                     "cumulative_tailings_decant_m3",
                     "cumulative_tailings_pond_spill_m3", "cumulative_tailings_pond_evaporation_m3",
                     "conveyor_power_mw", "flotation_air_power_mw", "flotation_aux_power_mw",
                     "tailings_pump_power_mw", "tailings_thickener_power_mw",
                     "tailings_decant_pump_power_mw",
+                    "tailings_decant_condition", "tailings_decant_motor_running",
                     "concentrate_thickener_power_mw", "filter_press_power_mw",
                     "process_aux_power_mw", "total_power_mw",
                     "concentrate_thickener_capacity_t", "filter_press_phase",
@@ -587,7 +595,8 @@ class CopperConcentrator:
                            "sag_mill": "grinding", "ball_mill": "grinding",
                            "flotation": "grinding",
                            "concentrate_thickener": "concentrate", "filter_press": "concentrate",
-                           "tailings_thickener": "tailings", "tailings_pump": "tailings"}
+                           "tailings_thickener": "tailings", "tailings_pump": "tailings",
+                           "tailings_decant_pump": "tailings"}
         for name, area in equipment_areas.items():
             if equipment_available.get(name, True):
                 health[name] = max(0.35, health[name]
@@ -599,6 +608,8 @@ class CopperConcentrator:
         state["flotation_condition"] = health["flotation"] * (1.0 - grinding_wear * 0.28)
         state["tailings_condition"] = (health["tailings_pump"] * health["tailings_thickener"]
                                         * (1.0 - tailings_wear * 0.65))
+        state["tailings_decant_condition"] = (
+            health["tailings_decant_pump"] * (1.0 - tailings_wear * 0.65))
         state["concentrate_condition"] = (health["concentrate_thickener"] * health["filter_press"]
                                            * (1.0 - concentrate_wear * 0.35))
         power_factor = (max(0.0, min(1.0, power_available_fraction))
@@ -621,6 +632,14 @@ class CopperConcentrator:
                               - state["tailings_storage_inventory_t"])
         tailings_storage_backpressure = min(1.0, max(0.0,
             storage_space_t / max(tailings_storage_capacity_t * 0.02, 1.0)))
+        tailings_pond_derate_range = max(
+            1.0, state["tailings_pond_capacity_m3"]
+            * (self.TAILINGS_POND_DERATE_STOP_FRACTION
+               - self.TAILINGS_POND_DERATE_START_FRACTION))
+        tailings_pond_backpressure = min(1.0, max(0.0,
+            (self.TAILINGS_POND_DERATE_STOP_FRACTION * state["tailings_pond_capacity_m3"]
+             - state["tailings_pond_inventory_m3"]) / tailings_pond_derate_range))
+        state["tailings_pond_backpressure"] = tailings_pond_backpressure
         tailings_sink_ready = (power_factor > 0.05 and equipment_available.get("tailings_thickener", True)
                                and equipment_available.get("tailings_pump", True))
         effective_tailings_pump_capacity = (
@@ -637,6 +656,7 @@ class CopperConcentrator:
         expected_tailings_feed = max(1.0, plant_target)
         tailings_backpressure = min(
             tailings_storage_backpressure,
+            tailings_pond_backpressure,
             max(0.0, min(1.0, tailings_feed_capacity / expected_tailings_feed)))
         if not tailings_sink_ready:
             water_capacity = state["tailings_thickener_water_capacity_m3"]
@@ -1008,8 +1028,12 @@ class CopperConcentrator:
         pond_after_evaporation = pond_available - evaporation_m3
         decant_request = max(0.0, (pond_after_evaporation - self.TAILINGS_POND_TARGET_M3)
                              * 3_600.0 / self.TAILINGS_DECANT_LEVELING_S)
+        decant_pump_running = (power_factor > 0.05
+                               and equipment_available.get("tailings_decant_pump", True))
         decant_capacity = min(self.TAILINGS_DECANT_CAPACITY_M3H,
                               max(0.0, gross_process_water - other_recovered_water))
+        decant_capacity *= (state["tailings_decant_condition"]
+                            if decant_pump_running else 0.0)
         tailings_decant = min(decant_request, decant_capacity,
                               pond_after_evaporation * 3_600.0)
         pond_after_decant = max(0.0, pond_after_evaporation - tailings_decant * dt_h)
@@ -1018,9 +1042,11 @@ class CopperConcentrator:
         state["tailings_pond_inventory_m3"] = min(
             state["tailings_pond_capacity_m3"], pond_after_decant)
         state["tailings_decant_water_m3h"] = tailings_decant
+        state["tailings_decant_motor_running"] = float(decant_pump_running)
         state["tailings_decant_pump_power_mw"] = (
             9.81 * self.TAILINGS_DECANT_HEAD_M * tailings_decant
-            / (3_600.0 * self.TAILINGS_DECANT_PUMP_EFFICIENCY * 1_000.0))
+            / (3_600.0 * self.TAILINGS_DECANT_PUMP_EFFICIENCY
+               * max(state["tailings_decant_condition"], 0.35) * 1_000.0))
         state["cumulative_tailings_decant_m3"] += tailings_decant * dt_h
         state["cumulative_tailings_pond_spill_m3"] += state["tailings_pond_spill_m3"]
         state["cumulative_tailings_pond_evaporation_m3"] += evaporation_m3
@@ -1253,13 +1279,13 @@ class CopperConcentrator:
                                                state["tailings_pond_capacity_m3"]),
                     "decant_pond_level": (100.0 * state["tailings_pond_inventory_m3"]
                                            / max(state["tailings_pond_capacity_m3"], 1e-9), "%", 0, 100),
+                    "high_level_feed_factor": (state["tailings_pond_backpressure"], "pu", 0, 1),
                     "decant_return_flow": (state["tailings_decant_water_m3h"], "m³/h", 0, 600),
                     "decant_pump_power": (state["tailings_decant_pump_power_mw"], "MW", 0, 0.2),
                     "decant_pump_current": (
                         self._motor_current_a(state["tailings_decant_pump_power_mw"], voltage_kv=0.4),
                         "A", 0, 100),
-                    "decant_pump_running": (float(state["tailings_decant_water_m3h"] > 1.0),
-                                             "bool", 0, 1),
+                    "decant_pump_running": (state["tailings_decant_motor_running"], "bool", 0, 1),
                     "pond_spill": (state["tailings_pond_spill_m3"], "m³", 0, 20),
                 },
             },

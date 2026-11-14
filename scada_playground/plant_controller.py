@@ -9,21 +9,25 @@ import math
 
 
 class PlantController:
-    START_ORDER = ("tailings_pump", "tailings_thickener", "filter_press",
+    START_ORDER = ("tailings_decant_pump", "tailings_pump", "tailings_thickener", "filter_press",
                    "concentrate_thickener", "flotation", "ball_mill",
                    "sag_mill", "conveyors", "crusher")
     STOP_ORDER = ("crusher", "conveyors", "sag_mill", "ball_mill", "flotation",
-                  "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump")
-    START_DELAY_S = {"tailings_pump": 4, "tailings_thickener": 8, "filter_press": 8,
+                  "concentrate_thickener", "filter_press", "tailings_thickener", "tailings_pump",
+                  "tailings_decant_pump")
+    START_DELAY_S = {"tailings_decant_pump": 4, "tailings_pump": 4,
+                     "tailings_thickener": 8, "filter_press": 8,
                      "concentrate_thickener": 7, "flotation": 5, "ball_mill": 12,
                      "sag_mill": 12, "conveyors": 5, "crusher": 8}
     STOP_DELAY_S = {"crusher": 3, "conveyors": 5, "sag_mill": 15,
                     "ball_mill": 10, "flotation": 5, "concentrate_thickener": 10,
-                    "filter_press": 8, "tailings_thickener": 12, "tailings_pump": 8}
+                    "filter_press": 8, "tailings_thickener": 12, "tailings_pump": 8,
+                    "tailings_decant_pump": 5}
     # Additional real-power demand while each motor accelerates. These are
     # aggregate starter/inrush equivalents, not nameplate or protection values.
     MOTOR_STARTING_LOAD_MW = {
-        "tailings_pump": 0.35, "tailings_thickener": 0.18, "filter_press": 0.12,
+        "tailings_pump": 0.35, "tailings_thickener": 0.18, "tailings_decant_pump": 0.08,
+        "filter_press": 0.12,
         "concentrate_thickener": 0.15, "flotation": 0.55, "ball_mill": 2.4,
         "sag_mill": 3.8, "conveyors": 0.65, "crusher": 1.4,
     }
@@ -32,7 +36,8 @@ class PlantController:
               "filter_press": "Concentrate filter press",
               "concentrate_thickener": "Concentrate thickener", "flotation": "Flotation air and cells",
               "ball_mill": "Ball mill", "sag_mill": "SAG mill",
-              "conveyors": "Ore conveyors", "crusher": "Primary crusher"}
+              "conveyors": "Ore conveyors", "crusher": "Primary crusher",
+              "tailings_decant_pump": "Tailings decant pump"}
 
     def initialize(self) -> dict:
         # The default dashboard opens on a stable operating plant. Its timeline is
@@ -199,6 +204,7 @@ class PlantController:
             "filter_press": ("Concentrate handling",),
             "tailings_thickener": ("Tailings and reclaim",),
             "tailings_pump": ("Tailings and reclaim",),
+            "tailings_decant_pump": ("Tailings and reclaim",),
         }
         affected = tuple(name for name, areas in area_by_equipment.items()
                          if any(event["name"] == "Mechanical degradation"
@@ -227,9 +233,9 @@ class PlantController:
                 return
             name = self.START_ORDER[state["sequence_index"]]
             equipment = state["equipment"][name]
-            if name == "tailings_pump":
+            if name in ("tailings_pump", "tailings_decant_pump"):
                 permit = process_power_fraction >= 0.90 and voltage_pu >= 0.92
-                reason = "Healthy mine bus required for tailings pump start"
+                reason = f"Healthy mine bus required for {self.LABELS[name]} start"
             elif name == "flotation":
                 permit = (state["equipment"]["tailings_pump"]["state"] == "RUNNING"
                           and state["equipment"]["tailings_thickener"]["state"] == "RUNNING"
