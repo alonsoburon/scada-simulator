@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 from protocol_faults import FAULT_MODES, PROTOCOLS
 from scenarios import SCENARIOS
+from concentrator import CopperConcentrator
 
 
 ROOT = Path(__file__).resolve().parent
@@ -365,6 +366,9 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     0-100 fault_location_pct and primary_breaker_failure for testing backup relay operation.
     Water main leak requires target_area='Water distribution' and target_asset set to
     District zone A, District zone B, or District zone C; severity sets the simulated break size.
+    Mechanical degradation in a modeled concentrator area may target one equipment asset;
+    that asset's condition, PLC protection, and matching generic area signals are affected
+    without mechanically degrading its neighboring equipment. Omit target_asset for an area-wide fault.
     Signal drift biases one analog measurement; Signal freeze holds its last value and
     marks its quality BAD. Both accept target_tag, and freeze affects the water-level
     controller when targeting one of its level transmitters.
@@ -400,6 +404,25 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
         if incident_name == "Water main leak" and (target_area != "Water distribution"
                 or target_asset not in {"District zone A", "District zone B", "District zone C"}):
             raise ValueError("Water main leak requires Water distribution and a named district zone target_asset")
+        if incident_name == "Mechanical degradation" and target_asset:
+            equipment = next((key for key, (label, _tag)
+                              in CopperConcentrator.MAINTAINABLE_EQUIPMENT.items()
+                              if target_asset.casefold() in {
+                                  key.casefold(), label.casefold(),
+                                  *(alias.casefold() for alias in
+                                    CopperConcentrator.EQUIPMENT_TARGET_ALIASES.get(key, ()))
+                              }), None)
+            modeled_areas = set(CopperConcentrator.MAINTENANCE_AREAS.values())
+            if target_area == "Whole factory" or target_area in modeled_areas:
+                if equipment is None:
+                    raise ValueError("target_asset must identify a named process asset")
+                if target_asset.casefold() == equipment.casefold():
+                    label = CopperConcentrator.MAINTAINABLE_EQUIPMENT[equipment][0]
+                    target_asset = CopperConcentrator.EQUIPMENT_TARGET_ALIASES.get(
+                        equipment, (label,))[0]
+            if equipment is not None and target_area != "Whole factory" and \
+                    CopperConcentrator.MAINTENANCE_AREAS[equipment] != target_area:
+                raise ValueError("target_asset does not belong to the selected process area")
         if target_tag:
             if incident_name not in {"Signal drift", "Signal freeze"}:
                 raise ValueError("target_tag is only valid for Signal drift or Signal freeze")

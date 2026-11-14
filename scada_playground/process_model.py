@@ -46,7 +46,9 @@ class FactoryProcessModel:
             raise ValueError("Severity must be Small, Medium, or Large")
         if area != "Whole factory" and area not in self.areas:
             raise ValueError(f"Unknown target area: {area}")
-        if target_asset is not None and target_asset not in self.areas.get(area, []):
+        valid_assets = (set(asset for assets in self.areas.values() for asset in assets)
+                        if area == "Whole factory" else set(self.areas.get(area, [])))
+        if target_asset is not None and target_asset not in valid_assets:
             raise ValueError(f"Unknown target asset {target_asset!r} in {area}")
         if name == "Electrical fault" and area != "Grid distribution":
             raise ValueError("Electrical fault must target Grid distribution")
@@ -155,7 +157,8 @@ class FactoryProcessModel:
             # Process-specific models own these values. Keep this broad model
             # responsible only for unmodeled equipment and the site fleet.
             if tag.get("dynamic_model"):
-                issues = active_by_area[tag["area"]]
+                issues = [event for event in active_by_area[tag["area"]]
+                          if event.target_asset is None or event.target_asset.casefold() == tag["unit"].casefold()]
                 comms_fault = next((event for event in issues
                                     if self.incidents[event.name] == "comms"), None)
                 tag["quality"] = "STALE" if comms_fault else "GOOD"
@@ -172,7 +175,8 @@ class FactoryProcessModel:
             base = tag["base"]
             span = tag["high"] - tag["low"]
             value = base
-            issues = active_by_area[tag["area"]]
+            issues = [event for event in active_by_area[tag["area"]]
+                      if event.target_asset is None or event.target_asset.casefold() == tag["unit"].casefold()]
             for event in issues:
                 intensity = {"Small": 0.12, "Medium": 0.34, "Large": 0.72}[event.severity]
                 kind = self.incidents[event.name]

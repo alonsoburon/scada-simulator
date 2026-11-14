@@ -1508,6 +1508,18 @@ with st.sidebar:
         target_asset = st.selectbox("Damaged district main", ["District zone A", "District zone B", "District zone C"])
         fault_location_pct = 90.0
         primary_breaker_failure = False
+    elif incident_name == "Mechanical degradation":
+        target = st.selectbox("Target area", ["Whole factory", *AREAS.keys()])
+        equipment = CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT
+        eligible = [CONCENTRATOR_MODEL.EQUIPMENT_TARGET_ALIASES.get(key, (label,))[0]
+                    for key, (label, _tag) in equipment.items()
+                    if target == "Whole factory" or CONCENTRATOR_MODEL.MAINTENANCE_AREAS[key] == target]
+        target_asset_label = st.selectbox(
+            "Affected equipment", ["All equipment in target area", *eligible],
+            help="Choose a single process asset to isolate the fault; leave the area-wide option for a broader event.")
+        target_asset = None if target_asset_label == "All equipment in target area" else target_asset_label
+        fault_location_pct = 90.0
+        primary_breaker_failure = False
     else:
         target = st.selectbox("Target area", ["Whole factory", *AREAS.keys()])
         target_asset = None

@@ -38,6 +38,17 @@ class PlantController:
               "ball_mill": "Ball mill", "sag_mill": "SAG mill",
               "conveyors": "Ore conveyors", "crusher": "Primary crusher",
               "tailings_decant_pump": "Tailings decant pump"}
+    ASSET_ALIASES = {"tailings_pump": ("Tailings pump station A",)}
+    EQUIPMENT_AREAS = {
+        "crusher": ("Crushing and screening",), "conveyors": ("Crushing and screening",),
+        "sag_mill": ("Grinding and flotation",), "ball_mill": ("Grinding and flotation",),
+        "flotation": ("Grinding and flotation",),
+        "concentrate_thickener": ("Concentrate handling",),
+        "filter_press": ("Concentrate handling",),
+        "tailings_thickener": ("Tailings and reclaim",),
+        "tailings_pump": ("Tailings and reclaim",),
+        "tailings_decant_pump": ("Tailings and reclaim",),
+    }
 
     def initialize(self) -> dict:
         # The default dashboard opens on a stable operating plant. Its timeline is
@@ -82,6 +93,16 @@ class PlantController:
     def _active(events: list[dict], name: str, areas: tuple[str, ...]) -> bool:
         return any(event["name"] == name and event["area"] in (*areas, "Whole factory") for event in events)
 
+    def _mechanical_fault_matches(self, event: dict, equipment: str,
+                                  areas: tuple[str, ...]) -> bool:
+        if event["name"] != "Mechanical degradation" or event["area"] not in (*areas, "Whole factory"):
+            return False
+        target = event.get("target_asset")
+        label = self.LABELS[equipment]
+        aliases = self.ASSET_ALIASES.get(equipment, ())
+        return not target or target.casefold() in {
+            equipment.casefold(), label.casefold(), *(alias.casefold() for alias in aliases)}
+
     def request(self, state: dict, command: str) -> None:
         command = command.strip().upper()
         if command not in {"START", "STOP"}:
@@ -111,12 +132,12 @@ class PlantController:
         if power_fraction < 0.90 or voltage_pu < 0.92 or frequency_hz < 49.5:
             raise ValueError("Reset blocked: electrical supply has not recovered to reset limits")
         jam_active = self._active(events, "Conveyor jam", ("Crushing and screening",))
-        large_mechanical = any(event["name"] == "Mechanical degradation"
-                               and event["severity"] == "Large"
-                               and event["area"] in ("Crushing and screening", "Grinding and flotation",
-                                                     "Concentrate handling", "Tailings and reclaim",
-                                                     "Whole factory")
-                               for event in events)
+        large_mechanical = any(
+            equipment["state"] == "TRIPPED"
+            and any(event["severity"] == "Large"
+                    and self._mechanical_fault_matches(event, name, areas) for event in events)
+            for name, areas in self.EQUIPMENT_AREAS.items()
+            for equipment in (state["equipment"][name],))
         if jam_active or large_mechanical:
             raise ValueError("Reset blocked: clear the active jam or severe mechanical condition first")
         cleared = []
@@ -196,20 +217,9 @@ class PlantController:
             return timers[key] >= 3
 
         jam = self._active(events, "Conveyor jam", ("Crushing and screening",))
-        area_by_equipment = {
-            "crusher": ("Crushing and screening",), "conveyors": ("Crushing and screening",),
-            "sag_mill": ("Grinding and flotation",), "ball_mill": ("Grinding and flotation",),
-            "flotation": ("Grinding and flotation",),
-            "concentrate_thickener": ("Concentrate handling",),
-            "filter_press": ("Concentrate handling",),
-            "tailings_thickener": ("Tailings and reclaim",),
-            "tailings_pump": ("Tailings and reclaim",),
-            "tailings_decant_pump": ("Tailings and reclaim",),
-        }
-        affected = tuple(name for name, areas in area_by_equipment.items()
-                         if any(event["name"] == "Mechanical degradation"
-                                and event["severity"] == "Large"
-                                and event["area"] in (*areas, "Whole factory") for event in events))
+        affected = tuple(name for name, areas in self.EQUIPMENT_AREAS.items()
+                         if any(event["severity"] == "Large"
+                                and self._mechanical_fault_matches(event, name, areas) for event in events))
         electrical_trip_ready = timed_condition("electrical_trip", electrical_trip)
         jam_trip_ready = timed_condition("crusher_jam", jam)
         mechanical_trip_ready = timed_condition("mechanical_trip", bool(affected))

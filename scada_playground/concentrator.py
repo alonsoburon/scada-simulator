@@ -63,6 +63,7 @@ class CopperConcentrator:
         "tailings_pump": ("Tailings pump", "tailings_pump"),
         "tailings_decant_pump": ("Tailings decant pump", "tailings_decant_pump"),
     }
+    EQUIPMENT_TARGET_ALIASES = {"tailings_pump": ("Tailings pump station A",)}
     MAINTENANCE_AREAS = {
         "crusher": "Crushing and screening", "conveyors": "Crushing and screening",
         "sag_mill": "Grinding and flotation", "ball_mill": "Grinding and flotation",
@@ -137,6 +138,7 @@ class CopperConcentrator:
             "tailings_decant_water_m3h": 0.0,
             "tailings_decant_pump_power_mw": 0.0,
             "tailings_decant_condition": 1.0, "tailings_decant_motor_running": 1.0,
+            "tailings_decant_vibration_mm_s": 1.8,
             "cumulative_tailings_decant_m3": 0.0,
             "tailings_pond_spill_m3": 0.0,
             "cumulative_tailings_pond_spill_m3": 0.0,
@@ -241,6 +243,7 @@ class CopperConcentrator:
                     "tailings_pump_power_mw", "tailings_thickener_power_mw",
                     "tailings_decant_pump_power_mw",
                     "tailings_decant_condition", "tailings_decant_motor_running",
+                    "tailings_decant_vibration_mm_s",
                     "concentrate_thickener_power_mw", "filter_press_power_mw",
                     "process_aux_power_mw", "total_power_mw",
                     "concentrate_thickener_capacity_t", "filter_press_phase",
@@ -416,6 +419,20 @@ class CopperConcentrator:
             return 0.0
         return 0.25 / 3_600.0 * (severity_factor / 0.78) ** 2
 
+    def _equipment_fault_severity(self, events: list[dict], equipment: str,
+                                  area: str) -> float:
+        """Resolve an area fault or an explicitly targeted mechanical fault."""
+        label = self.MAINTAINABLE_EQUIPMENT[equipment][0]
+        aliases = self.EQUIPMENT_TARGET_ALIASES.get(equipment, ())
+        factors = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
+        return max((factors[event["severity"]] for event in events
+                    if event["name"] == "Mechanical degradation"
+                    and event["area"] in (area, "Whole factory")
+                    and (not event.get("target_asset") or
+                         event["target_asset"].casefold() in
+                         {equipment.casefold(), label.casefold(), *(alias.casefold() for alias in aliases)})),
+                   default=0.0)
+
     def perform_maintenance(self, state: dict, equipment_name: str, *,
                             equipment_stopped: bool, fault_active: bool = False) -> float:
         """Restore one process asset to healthy condition while it is safely stopped."""
@@ -584,34 +601,38 @@ class CopperConcentrator:
             self.ORE_BLEND_RESIDENCE_S)))
         state["ore_hardness_kwh_t"] = 17.0 * state["ore_hardness_factor"]
         mine_grade_pct = state["mine_block_grade_pct"]
-        crushing_wear = self._severity(events, "Mechanical degradation", ("Crushing and screening",))
-        grinding_wear = self._severity(events, "Mechanical degradation", ("Grinding and flotation",))
-        concentrate_wear = self._severity(events, "Mechanical degradation", ("Concentrate handling",))
-        tailings_wear = self._severity(events, "Mechanical degradation", ("Tailings and reclaim",))
+        equipment_areas = {"crusher": "Crushing and screening", "conveyors": "Crushing and screening",
+                           "sag_mill": "Grinding and flotation", "ball_mill": "Grinding and flotation",
+                           "flotation": "Grinding and flotation",
+                           "concentrate_thickener": "Concentrate handling",
+                           "filter_press": "Concentrate handling",
+                           "tailings_thickener": "Tailings and reclaim",
+                           "tailings_pump": "Tailings and reclaim",
+                           "tailings_decant_pump": "Tailings and reclaim"}
+        equipment_faults = {name: self._equipment_fault_severity(events, name, area)
+                            for name, area in equipment_areas.items()}
         health = state["equipment_health"]
-        area_faults = {"crushing": crushing_wear, "grinding": grinding_wear,
-                       "concentrate": concentrate_wear, "tailings": tailings_wear}
-        equipment_areas = {"crusher": "crushing", "conveyors": "crushing",
-                           "sag_mill": "grinding", "ball_mill": "grinding",
-                           "flotation": "grinding",
-                           "concentrate_thickener": "concentrate", "filter_press": "concentrate",
-                           "tailings_thickener": "tailings", "tailings_pump": "tailings",
-                           "tailings_decant_pump": "tailings"}
-        for name, area in equipment_areas.items():
+        for name, fault_factor in equipment_faults.items():
             if equipment_available.get(name, True):
                 health[name] = max(0.35, health[name]
-                                   - self._mechanical_damage_rate_per_s(area_faults[area]))
-        state["crusher_condition"] = health["crusher"] * (1.0 - crushing_wear * 0.55)
-        state["conveyors_condition"] = health["conveyors"] * (1.0 - crushing_wear * 0.25)
-        state["sag_condition"] = health["sag_mill"] * (1.0 - grinding_wear * 0.48)
-        state["ball_condition"] = health["ball_mill"] * (1.0 - grinding_wear * 0.40)
-        state["flotation_condition"] = health["flotation"] * (1.0 - grinding_wear * 0.28)
+                                   - self._mechanical_damage_rate_per_s(fault_factor))
+        state["crusher_condition"] = health["crusher"] * (1.0 - equipment_faults["crusher"] * 0.55)
+        state["conveyors_condition"] = health["conveyors"] * (1.0 - equipment_faults["conveyors"] * 0.25)
+        state["sag_condition"] = health["sag_mill"] * (1.0 - equipment_faults["sag_mill"] * 0.48)
+        state["ball_condition"] = health["ball_mill"] * (1.0 - equipment_faults["ball_mill"] * 0.40)
+        state["flotation_condition"] = health["flotation"] * (1.0 - equipment_faults["flotation"] * 0.28)
         state["tailings_condition"] = (health["tailings_pump"] * health["tailings_thickener"]
-                                        * (1.0 - tailings_wear * 0.65))
+                                        * (1.0 - max(equipment_faults["tailings_pump"],
+                                                     equipment_faults["tailings_thickener"]) * 0.65))
         state["tailings_decant_condition"] = (
-            health["tailings_decant_pump"] * (1.0 - tailings_wear * 0.65))
+            health["tailings_decant_pump"]
+            * (1.0 - equipment_faults["tailings_decant_pump"] * 0.65))
+        state["tailings_decant_vibration_mm_s"] = (
+            1.8 + equipment_faults["tailings_decant_pump"] * 11
+            + (1.0 - health["tailings_decant_pump"]) * 12)
         state["concentrate_condition"] = (health["concentrate_thickener"] * health["filter_press"]
-                                           * (1.0 - concentrate_wear * 0.35))
+                                           * (1.0 - max(equipment_faults["concentrate_thickener"],
+                                                        equipment_faults["filter_press"]) * 0.35))
         power_factor = (max(0.0, min(1.0, power_available_fraction))
                         if power_available_fraction is not None else max(0.0, 1.0 - utility * 0.82))
 
@@ -801,7 +822,7 @@ class CopperConcentrator:
         if circuit_running:
             state["p80_microns"] = self._smooth(state["p80_microns"], target_p80, 240)
 
-        flotation_air = (540.0 * (1 - grinding_wear * 0.3) * power_factor
+        flotation_air = (540.0 * (1 - equipment_faults["flotation"] * 0.3) * power_factor
                          if equipment_available.get("flotation", True) else 0.0)
         reagent = 245.0 * (1 + 0.12 * math.sin(sim_seconds / 600))
         pulp_flow_m3h = cyclone_overflow * (1.0 / 2.7 + state["water_specific_m3_t"])
@@ -1088,16 +1109,17 @@ class CopperConcentrator:
         state["ball_motor_running"] = float(powered and equipment_available.get("ball_mill", True))
         state["flotation_motor_running"] = float(powered and equipment_available.get("flotation", True))
         state["tailings_motor_running"] = float(powered and equipment_available.get("tailings_pump", True))
-        state["crusher_vibration_mm_s"] = (2.4 + crushing_wear * 10
+        state["crusher_vibration_mm_s"] = (2.4 + equipment_faults["crusher"] * 10
                                              + (1.0 - health["crusher"]) * 12 + jam * 5)
-        state["sag_vibration_mm_s"] = (2.8 + grinding_wear * 8
+        state["sag_vibration_mm_s"] = (2.8 + equipment_faults["sag_mill"] * 8
                                        + (1.0 - health["sag_mill"]) * 12)
-        state["ball_vibration_mm_s"] = (2.4 + grinding_wear * 7
+        state["ball_vibration_mm_s"] = (2.4 + equipment_faults["ball_mill"] * 7
                                         + (1.0 - health["ball_mill"]) * 10)
-        state["flotation_vibration_mm_s"] = (1.8 + grinding_wear * 4
+        state["flotation_vibration_mm_s"] = (1.8 + equipment_faults["flotation"] * 4
                                              + (1.0 - health["flotation"]) * 8)
         tailings_health = min(health["tailings_pump"], health["tailings_thickener"])
-        state["tailings_vibration_mm_s"] = (2.1 + tailings_wear * 11
+        state["tailings_vibration_mm_s"] = (2.1 + max(
+            equipment_faults["tailings_pump"], equipment_faults["tailings_thickener"]) * 11
                                             + (1.0 - tailings_health) * 12)
         state["tailings_thickener_motor_running"] = float(
             powered and equipment_available.get("tailings_thickener", True))
@@ -1280,13 +1302,17 @@ class CopperConcentrator:
                     "decant_pond_level": (100.0 * state["tailings_pond_inventory_m3"]
                                            / max(state["tailings_pond_capacity_m3"], 1e-9), "%", 0, 100),
                     "high_level_feed_factor": (state["tailings_pond_backpressure"], "pu", 0, 1),
-                    "decant_return_flow": (state["tailings_decant_water_m3h"], "m³/h", 0, 600),
-                    "decant_pump_power": (state["tailings_decant_pump_power_mw"], "MW", 0, 0.2),
-                    "decant_pump_current": (
+                    "pond_spill": (state["tailings_pond_spill_m3"], "m³", 0, 20),
+                },
+                "Tailings decant pump": {
+                    "return_flow": (state["tailings_decant_water_m3h"], "m³/h", 0, 600),
+                    "motor_power": (state["tailings_decant_pump_power_mw"], "MW", 0, 0.2),
+                    "motor_current": (
                         self._motor_current_a(state["tailings_decant_pump_power_mw"], voltage_kv=0.4),
                         "A", 0, 100),
-                    "decant_pump_running": (state["tailings_decant_motor_running"], "bool", 0, 1),
-                    "pond_spill": (state["tailings_pond_spill_m3"], "m³", 0, 20),
+                    "vibration_rms": (state["tailings_decant_vibration_mm_s"], "mm/s", 0, 30),
+                    "equipment_running": (state["tailings_decant_motor_running"], "bool", 0, 1),
+                    "operating_condition": (state["tailings_decant_condition"], "pu", 0, 1),
                 },
             },
         }
