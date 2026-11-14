@@ -715,8 +715,8 @@ def maintain_process_equipment(sim: dict, target_asset: str) -> float:
         raise ValueError(f"Unknown process equipment: {target_asset!r}")
     equipment, (label, controller_key) = match
     area = CONCENTRATOR_MODEL.MAINTENANCE_AREAS[equipment]
-    active_fault = any(event.name == "Mechanical degradation"
-                       and event.area in (area, "Whole factory") for event in sim["events"])
+    active_fault = CONCENTRATOR_MODEL.equipment_fault_active(
+        [event.__dict__ for event in sim["events"]], equipment)
     equipment_stopped = (sim["process_control"]["equipment"][controller_key]["state"] == "STOPPED")
     previous = CONCENTRATOR_MODEL.perform_maintenance(
         sim["concentrator"], label, equipment_stopped=equipment_stopped, fault_active=active_fault)
@@ -2047,9 +2047,8 @@ def render_dashboard():
                 format_func=lambda key: CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT[key][0],
                 key=f"maintenance_asset_{sim['simulation_id']}")
             maintenance_label = CONCENTRATOR_MODEL.MAINTAINABLE_EQUIPMENT[maintenance_choice][0]
-            maintenance_area = CONCENTRATOR_MODEL.MAINTENANCE_AREAS[maintenance_choice]
-            maintenance_fault_active = any(event.name == "Mechanical degradation"
-                and event.area in (maintenance_area, "Whole factory") for event in sim["events"])
+            maintenance_fault_active = CONCENTRATOR_MODEL.equipment_fault_active(
+                [event.__dict__ for event in sim["events"]], maintenance_choice)
             maintenance_stopped = (control["equipment"][maintenance_choice]["state"] == "STOPPED")
             if st.button("Perform maintenance", disabled=not maintenance_stopped or maintenance_fault_active,
                          key=f"perform_maintenance_{sim['simulation_id']}"):

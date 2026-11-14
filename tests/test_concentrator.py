@@ -148,6 +148,17 @@ class CopperConcentratorTests(unittest.TestCase):
         self.assertIn("crushing_and_screening.cone_crusher_01.motor_power", tags)
         self.assertIn("crushing_and_screening.secondary_crusher.vibration_rms", tags)
 
+    def test_targeted_fault_only_blocks_maintenance_on_affected_equipment(self):
+        targeted = [{"name": "Mechanical degradation", "area": "Crushing and screening",
+                     "severity": "Large", "target_asset": "Screen deck A"}]
+        self.assertTrue(self.model.equipment_fault_active(targeted, "screen_deck"))
+        self.assertFalse(self.model.equipment_fault_active(targeted, "cone_crusher"))
+
+        area_wide = [{"name": "Mechanical degradation", "area": "Crushing and screening",
+                      "severity": "Medium", "target_asset": None}]
+        self.assertTrue(self.model.equipment_fault_active(area_wide, "screen_deck"))
+        self.assertTrue(self.model.equipment_fault_active(area_wide, "cone_crusher"))
+
     def test_water_shortage_derates_feed_and_float_recovery(self):
         self.advance(900)
         normal = self.state["plant_feed_tph"]

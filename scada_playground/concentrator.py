@@ -496,6 +496,13 @@ class CopperConcentrator:
                          {equipment.casefold(), label.casefold(), *(alias.casefold() for alias in aliases)})),
                    default=0.0)
 
+    def equipment_fault_active(self, events: list[dict], equipment: str) -> bool:
+        """Return whether a live mechanical event affects this named asset."""
+        if equipment not in self.MAINTAINABLE_EQUIPMENT:
+            raise ValueError(f"Unknown maintainable equipment: {equipment!r}")
+        return self._equipment_fault_severity(
+            events, equipment, self.MAINTENANCE_AREAS[equipment]) > 0.0
+
     def perform_maintenance(self, state: dict, equipment_name: str, *,
                             equipment_stopped: bool, fault_active: bool = False) -> float:
         """Restore one process asset to healthy condition while it is safely stopped."""
