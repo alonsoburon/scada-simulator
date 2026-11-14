@@ -56,11 +56,44 @@ class UndergroundVentilationTests(unittest.TestCase):
 
     def test_mine_power_derates_vfd_speed_and_motor_demand(self):
         constrained = self.model.initialize()
-        self.model.advance(constrained, 0, [], seed=17,
-                           power_available_fraction=0.36)
+        for tick in range(61):
+            self.model.advance(constrained, tick, [], seed=17,
+                               power_available_fraction=0.36)
         self.assertLess(constrained["total_airflow_m3s"], self.state["total_airflow_m3s"])
         self.assertLess(constrained["fan_power_kw"], self.state["fan_power_kw"])
         self.assertGreater(constrained["fan_power_kw"], 0)
+
+    def test_fan_vfd_tracks_diesel_air_demand_and_saves_power_at_low_activity(self):
+        low_activity = self.model.initialize()
+        for tick in range(601):
+            self.model.advance(low_activity, tick, [], haulage_activity=0.15)
+        full_activity = self.model.initialize()
+        for tick in range(601):
+            self.model.advance(full_activity, tick, [], haulage_activity=1.0)
+
+        self.assertLess(low_activity["required_airflow_m3s"],
+                        full_activity["required_airflow_m3s"])
+        self.assertLess(low_activity["total_airflow_m3s"],
+                        full_activity["total_airflow_m3s"])
+        self.assertLess(low_activity["fan_power_kw"], full_activity["fan_power_kw"])
+        self.assertAlmostEqual(low_activity["total_airflow_m3s"],
+                               low_activity["required_airflow_m3s"] *
+                               self.model.FAN_FLOW_CONTROL_MARGIN, delta=1.5)
+        self.assertTrue(all(fan["running"] for fan in low_activity["fans"].values()))
+
+    def test_gas_upset_increases_air_requirement_before_fan_capacity_is_exceeded(self):
+        normal = self.model.initialize()
+        upset = self.model.initialize()
+        event = [{"name": "Process upset", "area": "Underground mining",
+                  "severity": "Large"}]
+        for tick in range(601):
+            self.model.advance(normal, tick, [], haulage_activity=0.8)
+            self.model.advance(upset, tick, event, haulage_activity=0.8)
+        self.assertGreater(upset["required_airflow_m3s"],
+                           normal["required_airflow_m3s"])
+        self.assertGreater(upset["total_airflow_m3s"], normal["total_airflow_m3s"])
+        self.assertGreater(max(fan["speed_pct"] for fan in upset["fans"].values()), 99.0)
+        self.assertLess(upset["total_airflow_m3s"], upset["required_airflow_m3s"])
 
     def test_process_upset_increases_gas_source_and_telemetry_is_engineering_tagged(self):
         normal = self.model.initialize()

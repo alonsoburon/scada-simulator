@@ -32,6 +32,8 @@ class UndergroundVentilation:
     FAN_MAX_FLOW_M3S = 125.0
     FAN_RATED_KW = 1_100.0
     COMMON_RESISTANCE = 0.035
+    DIESEL_AIR_RATE_M3S_PER_KW = 0.06
+    FAN_FLOW_CONTROL_MARGIN = 0.95
 
     @classmethod
     def initialize(cls) -> dict:
@@ -86,6 +88,24 @@ class UndergroundVentilation:
         total = (lo + hi) / 2
         return total, system_pressure(total)
 
+    @classmethod
+    def _speed_for_flow(cls, state: dict, target_flow_m3s: float,
+                        maximum_speed_pct: float) -> float:
+        """Find the VFD speed for a flow target using the fan/system curves."""
+        lo, hi = 0.0, max(0.0, min(100.0, maximum_speed_pct))
+        if target_flow_m3s <= 0.0 or hi <= 0.0:
+            return 0.0
+        for _ in range(14):
+            mid = (lo + hi) / 2.0
+            probe = {"fans": {name: {**fan, "speed_pct": mid}
+                               for name, fan in state["fans"].items()}}
+            flow, _ = cls._network_flow(probe)
+            if flow < target_flow_m3s:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
     def advance(self, state: dict, sim_seconds: int, events: list[dict], *,
                 seed: int = 17, power_available_fraction: float = 1.0,
                 haulage_activity: float = 1.0) -> None:
@@ -97,20 +117,36 @@ class UndergroundVentilation:
         state["power_available_fraction"] = max(0.0, min(1.0, power_available_fraction)) * power_scale
         gas_scale = {"Small": 1.5, "Medium": 2.8, "Large": 5.0}.get(upset, 1.0)
         state["gas_release_factor"] = gas_scale
+        activity = max(0.0, min(1.5, float(haulage_activity)))
+        diesel_air_requirement = sum(
+            spec["diesel_kw"] * activity * self.DIESEL_AIR_RATE_M3S_PER_KW
+            for spec in self.BRANCHES.values())
+        fixed_air_requirement = sum(
+            max(0.0, spec["target_air_m3s"] - spec["diesel_kw"] * self.DIESEL_AIR_RATE_M3S_PER_KW)
+            for spec in self.BRANCHES.values())
+        # Keep a base allowance for people, ore-pass dust, and heat; scale the
+        # diesel component with equipment activity and add demand for gas upset.
+        state["required_airflow_m3s"] = (
+            fixed_air_requirement + diesel_air_requirement) * (1.0 + 0.06 * (gas_scale - 1.0))
         # A damaged fan is not instantly repaired when the event clears.
         condition_target = {"Small": 0.86, "Medium": 0.66, "Large": 0.40}.get(mechanical, 1.0)
         for i, (name, fan) in enumerate(state["fans"].items()):
             fan["condition"] += (condition_target - fan["condition"]) * 0.025
             # Short speed ramp captures VFD and rotating-inertia limits.
-            target = 100.0 * math.sqrt(state["power_available_fraction"])
-            fan["speed_command_pct"] = target
             should_run = state["power_available_fraction"] >= 0.08
             if fan["running"] != should_run:
                 fan["running"] = should_run
                 if should_run:
                     fan["starts"] += 1
-            fan["speed_pct"] += max(-0.8, min(0.8, target - fan["speed_pct"]))
             fan["flow_m3s"] = 0.0
+        # A common header pressure/airflow controller trims both parallel fans
+        # together. The power cap follows the fan affinity law (P ~ speed^3).
+        maximum_speed = 100.0 * state["power_available_fraction"] ** (1.0 / 3.0)
+        target_flow = state["required_airflow_m3s"] * self.FAN_FLOW_CONTROL_MARGIN
+        commanded_speed = self._speed_for_flow(state, target_flow, maximum_speed)
+        for fan in state["fans"].values():
+            fan["speed_command_pct"] = commanded_speed
+            fan["speed_pct"] += max(-0.8, min(0.8, commanded_speed - fan["speed_pct"]))
         total_flow, pressure = self._network_flow(state)
         conductances = {name: 1 / math.sqrt(spec["resistance"])
                         for name, spec in self.BRANCHES.items()}
