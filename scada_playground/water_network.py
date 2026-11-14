@@ -115,7 +115,8 @@ class MineWaterNetwork:
             pumps[name] = {**spec, "enabled": True, "running": True, "speed_pct": initial_speed,
                            "speed_command_pct": initial_speed, "manual_speed_pct": initial_speed,
                            "health_factor": 1.0, "condition_factor": 1.0,
-                           "efficiency": 1.0, "current_a": 0.0,
+                           "efficiency": 1.0, "mechanical_trip_timer_s": 0,
+                           "mechanical_trip_latched": False, "current_a": 0.0,
                            "power_kw": 0.0, "pump_head_m": 0.0, "vibration_mm_s": 1.2}
             gains = {"Intake pump": (1.0, 0.0003),
                      "Process feed pump": (1.2, 0.0010),
@@ -183,7 +184,7 @@ class MineWaterNetwork:
                 "cumulative_concentrator_return_m3": 0.0,
                 "electrical_load_kw": 0.0,
                 "sensor_rng_seed": 17, "sim_seconds": 0, "measurement_noise": {},
-                "schema_revision": 6,
+                "schema_revision": 7,
                 "distribution": self.DISTRIBUTION.initialize()}
         for key, spec in self.LINKS.items():
             flow, pressure = self._link_reading(state, key, spec)
@@ -223,7 +224,7 @@ class MineWaterNetwork:
 
     def migrate(self, state: dict) -> None:
         """Add the concentrator reclaim circuit to sessions created by older builds."""
-        if state.get("schema_revision") == 6:
+        if state.get("schema_revision") == 7:
             ready = all(key in state for key in (
                 "nodes", "pumps", "controllers", "valves", "links", "treatment",
                 "wastewater", "distribution", "history"))
@@ -239,7 +240,10 @@ class MineWaterNetwork:
                 ready = all("previous_velocity_m_s" in state["links"][key]
                             for key in self.LINKS)
             if ready:
-                ready = all("health_factor" in state["pumps"][name] for name in self.PUMPS)
+                ready = all("health_factor" in state["pumps"][name]
+                            and "mechanical_trip_latched" in state["pumps"][name]
+                            and "mechanical_trip_timer_s" in state["pumps"][name]
+                            for name in self.PUMPS)
             if ready:
                 return
         defaults = self.initialize()
@@ -265,6 +269,8 @@ class MineWaterNetwork:
                 state.setdefault(key, value)
         for name, pump in state["pumps"].items():
             pump.setdefault("health_factor", 1.0)
+            pump.setdefault("mechanical_trip_timer_s", 0)
+            pump.setdefault("mechanical_trip_latched", False)
             pump.setdefault("coastdown_time_constant_s", self.PUMPS[name]["coastdown_time_constant_s"])
             pump.setdefault("check_valve_closure_time_s", self.PUMPS[name]["check_valve_closure_time_s"])
             pump.setdefault("check_valve_cracking_head_m", self.PUMPS[name]["check_valve_cracking_head_m"])
@@ -365,7 +371,7 @@ class MineWaterNetwork:
             sample.setdefault("wastewater_effluent_ph", 7.0)
             sample.setdefault("wastewater_effluent_tss_mg_l", 0.0)
             sample.setdefault("wastewater_sludge_hopper_kg", 0.0)
-        state["schema_revision"] = 6
+        state["schema_revision"] = 7
 
     def maintain_pump(self, state: dict, pump_name: str, *, fault_active: bool = False) -> float:
         """Restore a water pump only after electrical isolation and coastdown."""
@@ -380,6 +386,8 @@ class MineWaterNetwork:
         pump["health_factor"] = 1.0
         pump["condition_factor"] = 1.0
         pump["efficiency"] = 1.0
+        pump["mechanical_trip_timer_s"] = 0
+        pump["mechanical_trip_latched"] = False
         return previous
 
     @staticmethod
@@ -637,12 +645,6 @@ class MineWaterNetwork:
                                + state["factory_cip_demand_m3h"])
         state["treated_customer_demand_m3h"] = state["distribution"]["customer_demand_m3h"]
         state["water_recovery_pct"] = 68.0 if stress == 1.0 else max(35.0, 68.0 - (stress - 1.0) * 18)
-        degradation = max(({"Small": 0.90, "Medium": 0.72, "Large": 0.52}[e["severity"]]
-                           for e in active_events if e["name"] == "Mechanical degradation"
-                           and e["area"] in ("Water supply network", "Whole factory")), default=1.0)
-        fault_intensity = 1.0 - degradation
-        damage_per_s = (0.25 / 3_600.0 * (fault_intensity / 0.48) ** 2
-                        if fault_intensity > 0 else 0.0)
         grid_power_factor = (max(0.0, min(1.0, power_available_fraction))
                              if power_available_fraction is not None else 1.0)
         local_water_power_factor = min(({"Small": 0.75, "Medium": 0.42, "Large": 0.0}[e["severity"]]
@@ -661,7 +663,25 @@ class MineWaterNetwork:
 
         # PI loops regulate the three pumped tank inlets. Output moves through a VFD ramp limit.
         for name, pump in state["pumps"].items():
-            pump["running"] = pump["enabled"] and utility_factor > 0.01
+            matching_faults = [event for event in active_events
+                               if event.get("name") == "Mechanical degradation"
+                               and event.get("area") in ("Water supply network", "Whole factory")
+                               and (not event.get("target_asset")
+                                    or event["target_asset"].casefold() == name.casefold())]
+            fault_rank = max(({"Small": 1, "Medium": 2, "Large": 3}[event["severity"]]
+                              for event in matching_faults), default=0)
+            degradation = {0: 1.0, 1: 0.90, 2: 0.72, 3: 0.52}[fault_rank]
+            if fault_rank == 3 and pump["running"] and pump["speed_pct"] > 1.0:
+                pump["mechanical_trip_timer_s"] += 1
+                if pump["mechanical_trip_timer_s"] >= 3:
+                    pump["mechanical_trip_latched"] = True
+            else:
+                pump["mechanical_trip_timer_s"] = 0
+            pump["running"] = (pump["enabled"] and utility_factor > 0.01
+                               and not pump["mechanical_trip_latched"])
+            fault_intensity = 1.0 - degradation
+            damage_per_s = (0.25 / 3_600.0 * (fault_intensity / 0.48) ** 2
+                            if fault_intensity > 0 else 0.0)
             if pump["running"]:
                 pump["health_factor"] = max(0.35, pump.get("health_factor", 1.0) - damage_per_s)
             pump["condition_factor"] = pump["health_factor"] * degradation
@@ -699,6 +719,8 @@ class MineWaterNetwork:
             else:
                 pump["speed_command_pct"] = pump["manual_speed_pct"] * utility_factor
             if not pump["enabled"]:
+                pump["speed_command_pct"] = 0.0
+            if pump["mechanical_trip_latched"]:
                 pump["speed_command_pct"] = 0.0
             ramp = pump["ramp_pct_per_s"]
             if pump["running"]:
@@ -1085,6 +1107,7 @@ class MineWaterNetwork:
                 "%", 0, 100)
             add(asset, "pump_condition", pump["condition_factor"] * 100.0, "%", 0, 100)
             add(asset, "pump_health", pump.get("health_factor", 1.0) * 100.0, "%", 0, 100)
+            add(asset, "pump_trip", float(pump.get("mechanical_trip_latched", False)), "bool", 0, 1)
             add(asset, "pump_head", pump["pump_head_m"], "m", 0, 200, 0.006)
             add(asset, "motor_current", pump["current_a"], "A", 0, 800, 0.01)
             add(asset, "motor_power", pump["power_kw"], "kW", 0, 800, 0.01)

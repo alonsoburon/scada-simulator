@@ -48,6 +48,9 @@ class FactoryProcessModel:
             raise ValueError(f"Unknown target area: {area}")
         valid_assets = (set(asset for assets in self.areas.values() for asset in assets)
                         if area == "Whole factory" else set(self.areas.get(area, [])))
+        if name == "Mechanical degradation" and area in ("Water supply network", "Whole factory"):
+            valid_assets.update({"Intake pump", "Process feed pump", "Reclaim pump",
+                                 "Concentrator reclaim pump"})
         if target_asset is not None and target_asset not in valid_assets:
             raise ValueError(f"Unknown target asset {target_asset!r} in {area}")
         if name == "Electrical fault" and area != "Grid distribution":

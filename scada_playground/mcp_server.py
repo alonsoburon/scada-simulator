@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from protocol_faults import FAULT_MODES, PROTOCOLS
 from scenarios import SCENARIOS
 from concentrator import CopperConcentrator
+from water_network import MineWaterNetwork
 
 
 ROOT = Path(__file__).resolve().parent
@@ -369,6 +370,9 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     Mechanical degradation in a modeled concentrator area may target one equipment asset;
     that asset's condition, PLC protection, and matching generic area signals are affected
     without mechanically degrading its neighboring equipment. Omit target_asset for an area-wide fault.
+    In Water supply network, Mechanical degradation may target Intake pump, Process feed pump,
+    Reclaim pump, or Concentrator reclaim pump. Large faults trip the selected running pump;
+    disable it, allow coastdown, clear the event, then use maintain_water_pump to reset and repair it.
     Signal drift biases one analog measurement; Signal freeze holds its last value and
     marks its quality BAD. Both accept target_tag, and freeze affects the water-level
     controller when targeting one of its level transmitters.
@@ -405,6 +409,7 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                 or target_asset not in {"District zone A", "District zone B", "District zone C"}):
             raise ValueError("Water main leak requires Water distribution and a named district zone target_asset")
         if incident_name == "Mechanical degradation" and target_asset:
+            is_water_pump = target_asset in MineWaterNetwork.PUMPS
             equipment = next((key for key, (label, _tag)
                               in CopperConcentrator.MAINTAINABLE_EQUIPMENT.items()
                               if target_asset.casefold() in {
@@ -413,7 +418,11 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
                                     CopperConcentrator.EQUIPMENT_TARGET_ALIASES.get(key, ()))
                               }), None)
             modeled_areas = set(CopperConcentrator.MAINTENANCE_AREAS.values())
-            if target_area == "Whole factory" or target_area in modeled_areas:
+            if target_area == "Water supply network" and not is_water_pump:
+                raise ValueError("Water supply network mechanical faults must target a named water pump")
+            if target_area == "Whole factory" and is_water_pump:
+                pass
+            elif target_area == "Whole factory" or target_area in modeled_areas:
                 if equipment is None:
                     raise ValueError("target_asset must identify a named process asset")
                 if target_asset.casefold() == equipment.casefold():

@@ -177,6 +177,45 @@ class MineWaterNetworkTests(unittest.TestCase):
         self.assertEqual(self.state["links"]["process_feed"]["check_valve_state"], "CLOSED")
         self.assertGreater(initial_delay, 1)
 
+    def test_targeted_mechanical_fault_degrades_only_named_pump(self):
+        fault = {"name": "Mechanical degradation", "area": "Water supply network",
+                 "target_asset": "Reclaim pump", "severity": "Medium", "duration": 120,
+                 "started": 0}
+        self.model.advance(self.state, 1, [fault])
+
+        reclaim = self.state["pumps"]["Reclaim pump"]
+        self.assertAlmostEqual(reclaim["condition_factor"], 0.72, places=3)
+        self.assertGreater(reclaim["vibration_mm_s"], 3.0)
+        self.assertFalse(reclaim["mechanical_trip_latched"])
+        for name, pump in self.state["pumps"].items():
+            if name != "Reclaim pump":
+                self.assertEqual(pump["condition_factor"], 1.0, name)
+                self.assertEqual(pump["health_factor"], 1.0, name)
+
+    def test_large_targeted_fault_trips_after_delay_and_requires_isolated_maintenance(self):
+        fault = {"name": "Mechanical degradation", "area": "Water supply network",
+                 "target_asset": "Process feed pump", "severity": "Large", "duration": 120,
+                 "started": 0}
+        pump = self.state["pumps"]["Process feed pump"]
+        for second in (1, 2):
+            self.model.advance(self.state, second, [fault])
+            self.assertFalse(pump["mechanical_trip_latched"])
+        self.model.advance(self.state, 3, [fault])
+        self.assertTrue(pump["mechanical_trip_latched"])
+        self.assertFalse(pump["running"])
+        self.assertGreater(pump["speed_pct"], 0.0)  # rotor inertia, not an instantaneous stop
+
+        pump["enabled"] = False
+        for second in range(4, 100):
+            self.model.advance(self.state, second, [fault])
+        self.assertLess(pump["speed_pct"], 1.0)
+        with self.assertRaisesRegex(ValueError, "active mechanical fault"):
+            self.model.maintain_pump(self.state, "Process feed pump", fault_active=True)
+        previous_health = self.model.maintain_pump(self.state, "Process feed pump")
+        self.assertLess(previous_health, 1.0)
+        self.assertFalse(pump["mechanical_trip_latched"])
+        self.assertEqual(pump["health_factor"], 1.0)
+
     def test_rapid_pump_trip_creates_a_damped_water_hammer_pressure_wave(self):
         outage = {"name": "Utility loss", "area": "Water supply network", "severity": "Large"}
         initial_inventory = self.model.total_inventory_m3(self.state)

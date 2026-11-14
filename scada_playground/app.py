@@ -718,6 +718,8 @@ def maintain_water_pump(sim: dict, pump_name: str) -> float:
     """Repair a water pump after fault clearance and physical coastdown."""
     fault_active = any(event.name == "Mechanical degradation"
                        and event.area in ("Water supply network", "Whole factory")
+                       and (event.target_asset is None
+                            or event.target_asset.casefold() == pump_name.casefold())
                        for event in sim["events"])
     previous = WATER_MODEL.maintain_pump(sim["water_network"], pump_name,
                                          fault_active=fault_active)
@@ -1147,6 +1149,13 @@ def advance(force: bool = False) -> None:
             for key, link in water["links"].items() if WATER_MODEL.LINKS[key]["pump"]),
             "Estimated absolute pressure reached the water vapor-pressure floor; column-separation risk", "HIGH"),
     }
+    for pump_name, pump in water["pumps"].items():
+        if pump.get("mechanical_trip_latched"):
+            alarm_key = f"water_pump_trip_{pump_name.lower().replace(' ', '_')}"
+            conditions[alarm_key] = (
+                "Water supply network", True,
+                f"{pump_name} tripped on sustained high vibration; isolate, allow coastdown, then inspect",
+                "CRITICAL")
     prior_states = sim.setdefault("water_alarm_states", {})
     for alarm_key, (area, active, message, severity) in conditions.items():
         was_active = prior_states.get(alarm_key, False)
@@ -1514,6 +1523,8 @@ with st.sidebar:
         eligible = [CONCENTRATOR_MODEL.EQUIPMENT_TARGET_ALIASES.get(key, (label,))[0]
                     for key, (label, _tag) in equipment.items()
                     if target == "Whole factory" or CONCENTRATOR_MODEL.MAINTENANCE_AREAS[key] == target]
+        if target in ("Whole factory", "Water supply network"):
+            eligible.extend(WATER_MODEL.PUMPS)
         target_asset_label = st.selectbox(
             "Affected equipment", ["All equipment in target area", *eligible],
             help="Choose a single process asset to isolate the fault; leave the area-wide option for a broader event.")
@@ -1683,6 +1694,7 @@ def render_dashboard():
             st.markdown("**Pump condition and maintenance**")
             pump_condition_rows = [{"Pump": pump_name,
                                     "Health": f"{pump.get('health_factor', 1.0) * 100:.1f}%",
+                                    "Protection": "TRIPPED" if pump.get("mechanical_trip_latched") else "READY",
                                     "Enabled": "Yes" if pump["enabled"] else "No",
                                     "Speed": f"{pump['speed_pct']:.1f}%"}
                                    for pump_name, pump in water["pumps"].items()]
@@ -1691,7 +1703,10 @@ def render_dashboard():
                 key=f"water_maintenance_pump_{sim['simulation_id']}")
             selected_pump = water["pumps"][maintenance_pump]
             water_fault_active = any(event.name == "Mechanical degradation"
-                and event.area in ("Water supply network", "Whole factory") for event in sim["events"])
+                and event.area in ("Water supply network", "Whole factory")
+                and (event.target_asset is None
+                     or event.target_asset.casefold() == maintenance_pump.casefold())
+                for event in sim["events"])
             pump_isolated = (not selected_pump["enabled"] and not selected_pump["running"]
                              and selected_pump["speed_pct"] < 1.0)
             if st.button("Maintain water pump", disabled=not pump_isolated or water_fault_active,
@@ -1898,7 +1913,7 @@ def render_dashboard():
             st.plotly_chart(wastewater_fig, width="stretch")
         else:
             st.info("Start or single-step the factory to build level and flow trends.")
-        st.markdown("**Fault drills:** inject Medium Mechanical degradation or Utility loss in Water supply network and follow tank levels, pump-linked flows, and unmet demand. A Process upset raises demand and reduces recovery.")
+        st.markdown("**Fault drills:** target Medium Mechanical degradation at one water pump to compare reduced head, rising vibration, and persistent condition loss against healthy peers. Target Large degradation to exercise the three-scan vibration trip, delayed hydraulic response, critical alarm, coastdown, and isolated maintenance. Area-wide degradation and Utility loss still affect the shared circuit; a Process upset raises demand and reduces recovery.")
     with tabs[2]:
         plant = sim["concentrator"]
         control = sim["process_control"]
