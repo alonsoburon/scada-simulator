@@ -665,6 +665,8 @@ def apply_scenario_action(sim: dict, step: ScenarioStep) -> None:
                 voltage_pu=power["voltage_pu"], frequency_hz=power["frequency_hz"])
         else:
             PLANT_CONTROLLER.request(control, process_action)
+    elif step.action == "maintain_equipment":
+        maintain_process_equipment(sim, params["target_asset"])
     elif step.action == "cip_start":
         started = UTILITY_MODEL.CIP_MODEL.start(
             sim["plant_utilities"]["cip"], params.get("target_unit", "pasteurizer_01"), sim["tick"])
@@ -1884,6 +1886,7 @@ def render_dashboard():
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
         st.caption(f"Mine block {plant['mine_block_index']} · {plant['mine_block_domain'].replace('_', ' ')} · grade {plant['mine_block_grade_pct']:.2f}% Cu · hardness {plant['mine_block_hardness_factor']:.2f} pu → mill feed {plant['ore_hardness_factor']:.2f} pu · excavated {plant['mine_block_mined_t']:.0f}/{plant['mine_block_target_t']:.0f} t ({plant['mine_block_remaining_t']:.0f} t remaining)")
+        st.caption(f"Tailings storage {plant['tailings_storage_inventory_t']/1_000_000:.2f}/{plant['tailings_storage_capacity_t']/1_000_000:.2f} Mt · retained pore water {plant['tailings_storage_water_inventory_m3']/1_000:.0f}k m³ · decant pond {plant['tailings_pond_inventory_m3']:.0f}/{plant['tailings_pond_capacity_m3']:.0f} m³ · decant return {plant['tailings_decant_water_m3h']:.0f} m³/h · pump load {plant['tailings_decant_pump_power_mw']:.3f} MW · pond spill {plant['tailings_pond_spill_m3']:.3f} m³/scan")
         st.caption(f"Mill feed size classes · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · breakage/pass {plant['coarse_breakage_per_pass']*100:.0f}% coarse, {plant['intermediate_breakage_per_pass']*100:.0f}% intermediate · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. Motor starts add a decaying electrical load to the mine grid, so large drives can disturb voltage, frequency, and reserves. These aggregate transients are illustrative, not a certified motor-start or protection study. The factory timeline must be running or single-stepped for sequences to progress.")
