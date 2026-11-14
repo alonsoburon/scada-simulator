@@ -218,6 +218,7 @@ class HaulTruckFleet:
                                   "tire_temperature_c": 60.0 + (index % 4) * 1.5,
                                   "brake_temperature_c": 65.0 + (index % 5) * 2.0}
         return {"sim_seconds": 0, "trucks": truck_states, "last_delivery_t": 0.0,
+                "last_mined_t": 0.0, "cumulative_mined_t": 0.0,
                 "last_delivery_copper_t": 0.0, "delivery_grade_pct": 0.0,
                 "cumulative_delivery_t": 0.0, "recent_deliveries_t": [], "delivery_rate_tph": 0.0,
                 "cumulative_delivery_copper_t": 0.0, "average_delivery_grade_pct": 0.0,
@@ -250,6 +251,7 @@ class HaulTruckFleet:
         state["sim_seconds"] = sim_seconds
         ore_grade_pct = min(1.2, max(0.25, ore_grade_pct))
         for key, default in (("last_delivery_copper_t", 0.0), ("delivery_grade_pct", 0.0),
+                             ("last_mined_t", 0.0), ("cumulative_mined_t", 0.0),
                              ("cumulative_delivery_copper_t", 0.0),
                              ("average_delivery_grade_pct", 0.0)):
             state.setdefault(key, default)
@@ -309,6 +311,7 @@ class HaulTruckFleet:
 
         deliveries = 0.0
         delivery_copper_t = 0.0
+        mined_t = 0.0
         for unit, truck in state["trucks"].items():
             old_phase = truck["phase_s"]
             old_frame = truck["frame"]
@@ -365,6 +368,7 @@ class HaulTruckFleet:
             loaded_delta_t = (max(0.0, truck["frame"]["payload_t"] - old_frame["payload_t"])
                               if old_frame["cycle_state"] == "loading" else 0.0)
             if loaded_delta_t > 0.0:
+                mined_t += loaded_delta_t
                 truck["loading_ore_t"] += loaded_delta_t
                 truck["loading_copper_t"] += loaded_delta_t * ore_grade_pct / 100.0
                 truck["payload_copper_remaining_t"] += loaded_delta_t * ore_grade_pct / 100.0
@@ -426,6 +430,8 @@ class HaulTruckFleet:
 
         state["last_delivery_t"] = deliveries
         state["last_delivery_copper_t"] = delivery_copper_t
+        state["last_mined_t"] = mined_t
+        state["cumulative_mined_t"] += mined_t
         state["delivery_grade_pct"] = (100.0 * delivery_copper_t / deliveries
                                         if deliveries > 1e-9 else 0.0)
         state["cumulative_delivery_t"] += deliveries
@@ -585,6 +591,8 @@ class HaulTruckFleet:
                     "active_truck": (self.truck_names.index(state["active_shovel_truck"]) + 1
                                      if state.get("active_shovel_truck") in self.truck_names else 0,
                                      "truck_id", 0, self.TRUCK_COUNT),
+                    "ore_rate": (state.get("last_mined_t", 0.0) * 3_600.0, "t/h", 0, 3_500),
+                    "cumulative_ore_mined": (state.get("cumulative_mined_t", 0.0), "t", 0, 1e9),
                 }),
                 ("Crusher tip dispatch", {
                     "queue_length": (state.get("tip_queue_length", 0), "trucks", 0, self.TRUCK_COUNT),
@@ -625,6 +633,8 @@ class HaulTruckFleet:
                 "active_shovel_truck": state.get("active_shovel_truck"),
                 "active_tip_truck": state.get("active_tip_truck"),
                 "delivery_rate_tph": state["delivery_rate_tph"],
+                "last_mined_t": state.get("last_mined_t", 0.0),
+                "cumulative_mined_t": state.get("cumulative_mined_t", 0.0),
                 "last_delivery_t": state["last_delivery_t"],
                 "last_delivery_copper_t": state.get("last_delivery_copper_t", 0.0),
                 "delivery_grade_pct": state.get("delivery_grade_pct", 0.0),

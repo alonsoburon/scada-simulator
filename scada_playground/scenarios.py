@@ -74,8 +74,8 @@ SCENARIOS = {
     "concentrator-mill-degradation": ScenarioDefinition(
         scenario_id="concentrator-mill-degradation",
         name="Hard ore and grinding circuit degradation",
-        description="Ore hardness increases naturally while a mechanical fault degrades grinding; power, circulating load, product size, recovery, water demand, and stockpiles interact.",
-        duration_seconds=5_400,
+        description="Irregular geometallurgical domains change truck-load grade and blended mill hardness while mechanical and power faults propagate through grind, recovery, water demand, and finite stockpiles.",
+        duration_seconds=14_400,
         steps=(
             ScenarioStep(300, "incident", {"incident_name": "Mechanical degradation", "severity": "Medium",
                                              "target_area": "Grinding and flotation", "duration_seconds": 2_400}),
@@ -84,6 +84,7 @@ SCENARIOS = {
         ),
         expected_observations=(
             "The harder ore signal changes mill energy requirement and P80 with residence-time lag.",
+            "Geological domains have seeded, variable-tonnage blocks with correlated copper grade and hardness; block progress follows ore loaded at the shovel and pauses during dispatch holds, while mill hardness blends more slowly.",
             "Truck payloads retain the grade blended while each shovel loads them; deliveries reach ROM with travel and tipping delay, so a new block grade cannot teleport into the stockpile.",
             "Mine block grade changes at the ROM stockpile while the blended flotation feed grade moves more slowly as copper-bearing ore turns over through ROM, crushed-ore, and SAG buffers.",
             "Six well-mixed flotation cells hold copper between scans; changes in grind, air, reagent, and residence time alter the kinetic rate before concentrate and tailings assays settle.",

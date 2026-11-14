@@ -15,6 +15,18 @@ class CopperConcentrator:
     BALL_SPECIFIC_ENERGY_KWH_T = 5.15
     FLOTATION_CELL_COUNT = 6
     FLOTATION_BANK_VOLUME_M3 = 540.0
+    GEOLOGICAL_DOMAINS = (
+        # name, weight, mean Cu grade, grade scatter, hardness, hardness scatter
+        ("weathered", 0.14, 0.59, 0.10, 0.84, 0.08),
+        ("altered_low_grade", 0.21, 0.46, 0.07, 0.96, 0.10),
+        ("standard_porphyry", 0.39, 0.65, 0.09, 1.00, 0.10),
+        ("silicified_hard", 0.17, 0.72, 0.10, 1.31, 0.08),
+        ("high_grade_breccia", 0.09, 0.91, 0.11, 1.17, 0.11),
+    )
+    GEOLOGICAL_DOMAIN_CODES = {domain[0]: code for code, domain in enumerate(GEOLOGICAL_DOMAINS)}
+    MIN_BLOCK_TONNAGE_T = 500.0
+    MAX_BLOCK_TONNAGE_T = 2_200.0
+    ORE_BLEND_RESIDENCE_S = 1_800
     AREA_ASSETS = {
         "Open-pit mining": ["Pit sector A"],
         "Crushing and screening": ["Primary crusher", "Ore conveyors"],
@@ -70,6 +82,11 @@ class CopperConcentrator:
             "crushed_copper_inventory_t": 3_200.0 * 0.0062,
             "sag_bin_copper_inventory_t": 410.0 * 0.0062,
             "mine_block_grade_pct": 0.62, "cumulative_mine_copper_received_t": 0.0,
+            "mine_block_index": 0, "mine_block_domain": "standard_porphyry",
+            "mine_block_domain_code": self.GEOLOGICAL_DOMAIN_CODES["standard_porphyry"],
+            "mine_block_start_s": 0, "mine_block_target_t": 900.0,
+            "mine_block_mined_t": 0.0, "mine_block_remaining_t": 900.0,
+            "mine_block_hardness_factor": 1.0,
             "cumulative_rom_discharge_t": 0.0, "initial_crushed_stockpile_t": 3_200.0,
             "cumulative_crushed_ore_t": 0.0, "cumulative_sag_feeder_t": 0.0,
             "initial_sag_bin_t": 410.0, "cumulative_sag_processed_t": 0.0,
@@ -162,7 +179,10 @@ class CopperConcentrator:
         keys = ("tailings_thickener_capacity_t", "concentrate_thickener_inventory_t",
                     "rom_copper_inventory_t", "crushed_copper_inventory_t",
                     "sag_bin_copper_inventory_t", "mine_block_grade_pct",
-                    "cumulative_mine_copper_received_t",
+                    "cumulative_mine_copper_received_t", "mine_block_index",
+                    "mine_block_domain", "mine_block_domain_code", "mine_block_start_s",
+                    "mine_block_target_t", "mine_block_mined_t", "mine_block_remaining_t",
+                    "mine_block_hardness_factor",
                     "flotation_cell_copper_inventory_t", "flotation_copper_inventory_t",
                     "flotation_copper_product_tph", "cumulative_flotation_copper_feed_t",
                     "cumulative_flotation_copper_product_t", "cumulative_flotation_copper_tailings_t",
@@ -346,6 +366,34 @@ class CopperConcentrator:
     def _smooth(old: float, requested: float, seconds: int = 90) -> float:
         return old + (requested - old) / max(seconds, 1)
 
+    def _advance_geological_blocks(self, state: dict, sim_seconds: int, seed: int,
+                                   excavated_t: float) -> None:
+        """Advance mine domains by tonnes actually loaded at the shovel."""
+        block_progress_t = state["mine_block_mined_t"] + max(0.0, excavated_t)
+        while block_progress_t >= state["mine_block_target_t"]:
+            block_progress_t -= state["mine_block_target_t"]
+            block_index = state["mine_block_index"] + 1
+            rng = random.Random(seed + block_index * 1_000_003)
+            domain = rng.choices(
+                self.GEOLOGICAL_DOMAINS,
+                weights=[item[1] for item in self.GEOLOGICAL_DOMAINS], k=1)[0]
+            domain_name, _weight, grade_mean, grade_sd, hardness_mean, hardness_sd = domain
+            block_start = sim_seconds
+            target_tonnage = rng.uniform(self.MIN_BLOCK_TONNAGE_T, self.MAX_BLOCK_TONNAGE_T)
+            state.update({
+                "mine_block_index": block_index,
+                "mine_block_domain": domain_name,
+                "mine_block_domain_code": self.GEOLOGICAL_DOMAIN_CODES[domain_name],
+                "mine_block_start_s": block_start,
+                "mine_block_target_t": target_tonnage,
+                "mine_block_grade_pct": min(1.2, max(0.25, rng.gauss(grade_mean, grade_sd))),
+                "mine_block_hardness_factor": min(1.42, max(0.78,
+                    rng.gauss(hardness_mean, hardness_sd))),
+            })
+        state["mine_block_mined_t"] = block_progress_t
+        state["mine_block_remaining_t"] = max(0.0,
+            state["mine_block_target_t"] - block_progress_t)
+
     @staticmethod
     def _motor_current_a(power_mw: float, voltage_kv: float = 6.6,
                          power_factor: float = 0.90, efficiency: float = 0.95) -> float:
@@ -432,10 +480,17 @@ class CopperConcentrator:
                 water_shortage_m3h: float = 0.0, seed: int = 17,
                 mine_delivery_t: float | None = None,
                 mine_delivery_copper_t: float | None = None,
+                mine_excavated_t: float | None = None,
                 power_available_fraction: float | None = None,
                 equipment_available: dict[str, bool] | None = None) -> None:
         """Advance coupled ore, comminution, flotation, water and power balances."""
         self.migrate(state)
+        previous_sim_seconds = state.get("sim_seconds", sim_seconds - 1)
+        elapsed_s = max(0, sim_seconds - previous_sim_seconds)
+        if mine_excavated_t is None:
+            # Standalone process experiments use a nominal mine source; the
+            # integrated run supplies the actual tonnes loaded at the shovel.
+            mine_excavated_t = 1_120.0 * elapsed_s / 3_600.0
         state["sim_seconds"] = sim_seconds
         state["noise_seed"] = seed
         equipment_available = equipment_available or {
@@ -451,19 +506,14 @@ class CopperConcentrator:
         # determine what returns. Water shortage constrains throughput separately.
         state["water_specific_m3_t"] = 0.90
 
-        # Ore competency changes slowly: harder ore requires more energy per tonne.
-        state["ore_hardness_factor"] = min(1.42, max(0.78,
-            1.0 + 0.12 * math.sin(sim_seconds / 1_800) + 0.05 * math.sin(sim_seconds / 317 + 0.8)))
+        # New blocks change feed grade at the shovel; hardness blends into the
+        # mill over the stockpile/circuit residence time rather than teleporting.
+        self._advance_geological_blocks(state, sim_seconds, seed, mine_excavated_t)
+        state["ore_hardness_factor"] = min(1.42, max(0.78, self._smooth(
+            state["ore_hardness_factor"], state["mine_block_hardness_factor"],
+            self.ORE_BLEND_RESIDENCE_S)))
         state["ore_hardness_kwh_t"] = 17.0 * state["ore_hardness_factor"]
-        # Open-pit mining advances through geometallurgical blocks. Small seeded
-        # within-block variation represents local grade scatter while remaining
-        # exactly reproducible for a given simulation seed and timestamp.
-        grade_blocks_pct = (0.44, 0.72, 0.53, 0.91, 0.39, 0.63, 0.82, 0.48)
-        block_index = (sim_seconds // 1_800) % len(grade_blocks_pct)
-        block_rng = random.Random(seed + sim_seconds // 1_800)
-        mine_grade_pct = min(1.2, max(0.25,
-            grade_blocks_pct[block_index] + block_rng.gauss(0.0, 0.025)))
-        state["mine_block_grade_pct"] = mine_grade_pct
+        mine_grade_pct = state["mine_block_grade_pct"]
         crushing_wear = self._severity(events, "Mechanical degradation", ("Crushing and screening",))
         grinding_wear = self._severity(events, "Mechanical degradation", ("Grinding and flotation",))
         concentrate_wear = self._severity(events, "Mechanical degradation", ("Concentrate handling",))
@@ -964,6 +1014,16 @@ class CopperConcentrator:
             "Open-pit mining": {
                 "Pit sector A": {"ore_rate": (state["rom_feed_tph"], "t/h", 0, 2_000),
                     "ore_grade": (state["mine_block_grade_pct"], "% Cu", 0.2, 1.2),
+                    "ore_block_id": (state["mine_block_index"], "block", 0, 100_000),
+                    "ore_domain_code": (state["mine_block_domain_code"], "enum", 0,
+                                         len(self.GEOLOGICAL_DOMAINS) - 1),
+                    "block_hardness_factor": (state["mine_block_hardness_factor"], "pu", 0.5, 1.5),
+                    "block_mined": (state["mine_block_mined_t"], "t", 0,
+                                    self.MAX_BLOCK_TONNAGE_T),
+                    "block_target": (state["mine_block_target_t"], "t", 0,
+                                     self.MAX_BLOCK_TONNAGE_T),
+                    "block_remaining": (state["mine_block_remaining_t"], "t", 0,
+                                        self.MAX_BLOCK_TONNAGE_T),
                     "rom_stockpile_grade": (100.0 * state["rom_copper_inventory_t"]
                                              / max(state["rom_stockpile_t"], 1e-9), "% Cu", 0.0, 1.2),
                     "rom_stockpile": (state["rom_stockpile_t"], "t", 0, 45_000),
@@ -1069,7 +1129,7 @@ class CopperConcentrator:
                     tag = f"{area.lower().replace(' ', '_')}.{asset.lower().replace(' ', '_')}.{signal}"
                     stable_id = sum((i + 1) * ord(char) for i, char in enumerate(tag))
                     rng = random.Random(state["noise_seed"] * 1_000_003 + state["sim_seconds"] * 9_176 + stable_id)
-                    noise = (0.0 if units in ("bool", "cycles") else
+                    noise = (0.0 if units in ("bool", "cycles", "enum", "block") else
                              rng.gauss(0.0, max(high-low, 1e-9) *
                                        (0.0015 if signal in ("product_p80", "copper_recovery") else 0.002)))
                     value = truth + noise

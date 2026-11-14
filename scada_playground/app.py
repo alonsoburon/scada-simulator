@@ -1073,6 +1073,7 @@ def advance(force: bool = False) -> None:
                                water_shortage_m3h=prior_water_shortage,
                                seed=sim["seed"], mine_delivery_t=mine_delivery_t,
                                mine_delivery_copper_t=sim["haulage"]["last_delivery_copper_t"],
+                               mine_excavated_t=sim["haulage"]["last_mined_t"],
                                power_available_fraction=sim["power_network"]["process_power_fraction"],
                                equipment_available=equipment_available)
     CONCENTRATE_LOGISTICS_MODEL.advance(
@@ -1868,7 +1869,7 @@ def render_dashboard():
         plant = sim["concentrator"]
         control = sim["process_control"]
         st.subheader("Copper concentrator · ore-to-tailings process circuit")
-        st.caption("Crusher and mill power limits, ore hardness, finite buffers, per-pass breakage across three size classes, cyclone reject recirculation, first-order flotation kinetics, separate concentrate and tailings solids balances, cyclic filter-press batches, mine-water availability, and power demand evolve together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
+        st.caption("Variable-tonnage geological domains change ore grade on new truck loads, and a dispatch hold pauses mine-block progress. Existing stockpiles blend grade before flotation, while hardness blends into the mill with a residence-time lag; power limits, grind size, recovery, water, and finite product buffers respond together. These are simplified supervisory dynamics, not a calibrated comminution or metallurgical model.")
         metric_cols = st.columns(6)
         metric_values = [
             ("Plant feed", f"{plant['plant_feed_tph']:.0f} t/h"),
@@ -1880,6 +1881,7 @@ def render_dashboard():
         ]
         for col, (label, value) in zip(metric_cols, metric_values):
             col.metric(label, value)
+        st.caption(f"Mine block {plant['mine_block_index']} · {plant['mine_block_domain'].replace('_', ' ')} · grade {plant['mine_block_grade_pct']:.2f}% Cu · hardness {plant['mine_block_hardness_factor']:.2f} pu → mill feed {plant['ore_hardness_factor']:.2f} pu · excavated {plant['mine_block_mined_t']:.0f}/{plant['mine_block_target_t']:.0f} t ({plant['mine_block_remaining_t']:.0f} t remaining)")
         st.caption(f"Mill feed size classes · coarse {plant['grind_coarse_fraction']*100:.1f}% · intermediate {plant['grind_intermediate_fraction']*100:.1f}% · fine {plant['grind_fine_fraction']*100:.1f}% · breakage/pass {plant['coarse_breakage_per_pass']*100:.0f}% coarse, {plant['intermediate_breakage_per_pass']*100:.0f}% intermediate · cyclone overflow {plant['cyclone_overflow_fraction']*100:.1f}% · circulating load {plant['circulating_load_ratio']*100:.0f}% · flotation residence {plant['flotation_residence_time_min']:.1f} min")
         with st.expander("Process PLC sequence · simulated equipment controls", expanded=True):
             st.caption("This teaching controller sequences process motors, checks utility permissives, and latches simulated equipment trips. Motor starts add a decaying electrical load to the mine grid, so large drives can disturb voltage, frequency, and reserves. These aggregate transients are illustrative, not a certified motor-start or protection study. The factory timeline must be running or single-stepped for sequences to progress.")
