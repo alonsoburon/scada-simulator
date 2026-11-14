@@ -1,6 +1,7 @@
 """A deterministic, local-only synthetic factory for SCADA learning."""
 from __future__ import annotations
 
+import math
 import random
 import time
 import json
@@ -47,7 +48,7 @@ AREAS = {
     "Grid distribution": ["Distribution incomer", "Feeder north", "Feeder south", "Feeder east", "Feeder west", "Capacitor bank"],
     "Water supply network": ["Reservoir north", "Reservoir south", "Trunk main A", "Trunk main B", "Booster station"],
     "Water distribution": ["District zone A", "District zone B", "District zone C", "Elevated tank", "Leak monitoring"],
-    "Mobile fleet": [f"Haul truck {i:02}" for i in range(1, 13)] + [f"Service truck {i:02}" for i in range(1, 5)] + [f"Site bus {i:02}" for i in range(1, 4)],
+    "Mobile fleet": [f"Haul truck {i:02}" for i in range(1, 13)] + [f"Service truck {i:02}" for i in range(1, 5)] + [f"Site bus {i:02}" for i in range(1, 4)] + ["Mine fuel bay"],
     "Site buildings": ["Control room", "Workshop", "Warehouse", "Laboratory", "Substation building", "Pump house", "Office block", "Gatehouse"],
     "Inbound logistics": ["Truck scale", "Unloading bay", "Conveyor 01", "Conveyor 02", "Dust collector"],
     "Bulk receiving": ["Silo A", "Silo B", "Silo C", "Silo D", "Silo E",
@@ -800,6 +801,19 @@ def process_mcp_commands() -> list[tuple[str, dict]]:
                 previous = maintain_water_pump(sim, target_asset)
                 message = (f"Maintenance completed on {target_asset}; pump condition restored "
                            f"from {previous * 100:.1f}% to 100%.")
+            elif action == "deliver_mine_fuel":
+                target_asset = command.get("target_asset", "")
+                delivery_l = float(command.get("fuel_delivery_l", 0.0))
+                fuel_bay = sim["haulage"]
+                if command.get("target_area") != "Mobile fleet" or target_asset != "Mine fuel bay":
+                    raise ValueError("Fuel delivery requires Mobile fleet and the Mine fuel bay")
+                if not math.isfinite(delivery_l) or delivery_l <= 0.0:
+                    raise ValueError("Fuel delivery quantity must be positive and finite")
+                headroom_l = fuel_bay["fuel_bay_capacity_l"] - fuel_bay["fuel_bay_inventory_l"]
+                if delivery_l > headroom_l + 1e-6:
+                    raise ValueError(f"Delivery exceeds fuel tank headroom ({max(0.0, headroom_l):.0f} L)")
+                fuel_bay["fuel_bay_inventory_l"] += delivery_l
+                message = f"Received {delivery_l:.0f} L at the pit fuel bay."
             elif action == "process_control":
                 control = sim["process_control"]
                 process_action = command.get("process_action", "").upper()
@@ -1266,7 +1280,7 @@ def advance(force: bool = False) -> None:
         low_fuel = tag["value"] < 18
         recovered = tag["value"] > 30
         was_active = haulage_alarm_states.get(alarm_key, False)
-        message = f"{tag['unit']} fuel reserve low; refuel at shovel queue"
+        message = f"{tag['unit']} fuel reserve low; refuel at the pit fuel bay"
         if low_fuel and not was_active:
             sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
                 "severity": "HIGH", "message": message, "state": "ACTIVE / UNACK"})
@@ -1275,6 +1289,24 @@ def advance(force: bool = False) -> None:
             sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
                 "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
             haulage_alarm_states[alarm_key] = False
+    fuel_bay_empty = (sim["haulage"].get("fuel_bay_inventory_l", 0.0) <= 1e-6
+                      and (bool(sim["haulage"].get("fuel_bay_queue"))
+                           or sim["haulage"].get("fuel_bay_active_truck") is not None))
+    fuel_starved_trucks = [name for name, truck in sim["haulage"].get("trucks", {}).items()
+                           if truck.get("fuel_starved")]
+    for alarm_key, active, message in (
+            ("fuel_bay_empty", fuel_bay_empty,
+             "Mine fuel bay inventory exhausted while trucks are queued for refueling"),
+            ("fuel_starved", bool(fuel_starved_trucks),
+             "Haul truck out of fuel and immobilized: " + ", ".join(fuel_starved_trucks))):
+        was_active = haulage_alarm_states.get(alarm_key, False)
+        if active and not was_active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
+                "severity": "CRITICAL", "message": message, "state": "ACTIVE / UNACK"})
+        elif was_active and not active:
+            sim["alarms"].insert(0, {"time": sim["tick"], "area": "Mobile fleet",
+                "severity": "INFO", "message": f"{message} cleared", "state": "CLEARED"})
+        haulage_alarm_states[alarm_key] = active
     power_alarm_states = sim.setdefault("power_alarm_states", {})
     power_state = sim["power_network"]
     power_conditions = {
@@ -2110,6 +2142,22 @@ def render_dashboard():
         fleet_metrics[3].metric("Committed ore", f"{committed_ore_t:.0f} t")
         fleet_metrics[4].metric("ROM stockpile", f"{sim['concentrator']['rom_stockpile_t']:.0f} t",
                                 "dispatch held" if fleet_summary["rom_dispatch_paused"] else "dispatch ready")
+        fuel_state = sim["haulage"]
+        fuel_cols = st.columns(2)
+        fuel_cols[0].metric("Mine diesel", f"{fuel_state['fuel_bay_inventory_l']:.0f} L",
+                            f"{100 * fuel_state['fuel_bay_inventory_l'] / fuel_state['fuel_bay_capacity_l']:.1f}% of tank")
+        with fuel_cols[1].form(f"deliver_mobile_fuel_{sim['simulation_id']}"):
+            delivery_l = st.number_input("Receive diesel at pit fuel bay (L)", min_value=0.0,
+                max_value=float(fuel_state["fuel_bay_capacity_l"]), value=5_000.0, step=500.0)
+            deliver_fuel = st.form_submit_button("Receive fuel delivery")
+        if deliver_fuel:
+            received = min(delivery_l, fuel_state["fuel_bay_capacity_l"]
+                           - fuel_state["fuel_bay_inventory_l"])
+            if received <= 0:
+                st.warning("The site fuel tank is already full.")
+            else:
+                fuel_state["fuel_bay_inventory_l"] += received
+                st.success(f"Received {received:.0f} L into the finite site tank.")
         st.caption("Fleet GPS is streamed on the live map above. This view lists the vehicle process and instrumentation tags.")
         st.subheader("Vehicle telemetry")
         st.dataframe(fleet[~fleet.sensor.str.startswith("gps_")][["tag", "value", "units", "quality", "last_change"]],

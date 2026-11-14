@@ -31,6 +31,9 @@ class HaulTruckFleet:
     SERVICE_BRAKE_POWER_SHARE = 0.18
     BRAKE_SYSTEM_HEAT_CAPACITY_KJ_C = 3_000.0
     BRAKE_COOLING_TIME_S = 900.0
+    FUEL_BAY_CAPACITY_L = 60_000.0
+    FUEL_BAY_REFUEL_RATE_L_S = 7.5
+    FUEL_RESERVE_TRIGGER_PCT = 15.0
     STATE_CODE = {"pit_queue": 1, "loading": 2, "travel_loaded": 3,
                   "tip_queue": 4, "dumping": 5, "travel_empty": 6}
 
@@ -110,6 +113,8 @@ class HaulTruckFleet:
 
     @classmethod
     def _fuel_rate_lph(cls, frame: dict) -> float:
+        if frame.get("state", "").startswith(("Refueling", "Fuel bay empty", "Stopped")):
+            return 0.0
         speed = frame["speed_kmh"]
         if speed <= 2.0:
             return cls.IDLE_FUEL_LPH
@@ -123,7 +128,7 @@ class HaulTruckFleet:
 
     @classmethod
     def _engine_load_pct(cls, frame: dict) -> float:
-        if frame.get("state", "").startswith("Refueling"):
+        if frame.get("state", "").startswith(("Refueling", "Fuel bay empty", "Stopped")):
             return 0.0
         speed = frame["speed_kmh"]
         if speed <= 2.0:
@@ -207,8 +212,9 @@ class HaulTruckFleet:
                                   "loading_ore_t": loading_ore_t,
                                   "loading_copper_t": loading_copper_t,
                                   "engine_hours": 0.0, "fuel_used_l": 0.0,
-                                  "fuel_capacity_l": 4_500.0, "refuel_remaining_s": 0,
-                                  "refuels_completed": 0,
+                                  "fuel_capacity_l": 4_500.0,
+                                  "refuels_completed": 0, "fuel_starved": False,
+                                  "cumulative_fuel_consumed_l": 0.0,
                                   "position_latitude": frame["latitude"],
                                   "position_longitude": frame["longitude"],
                                   "shovel_arrival_s": shovel_arrival,
@@ -222,6 +228,10 @@ class HaulTruckFleet:
                 "last_delivery_copper_t": 0.0, "delivery_grade_pct": 0.0,
                 "cumulative_delivery_t": 0.0, "recent_deliveries_t": [], "delivery_rate_tph": 0.0,
                 "cumulative_delivery_copper_t": 0.0, "average_delivery_grade_pct": 0.0,
+                "fuel_bay_capacity_l": self.FUEL_BAY_CAPACITY_L,
+                "fuel_bay_inventory_l": self.FUEL_BAY_CAPACITY_L,
+                "fuel_bay_total_dispensed_l": 0.0,
+                "fuel_bay_active_truck": None, "fuel_bay_queue": [],
                 "rom_dispatch_paused": False, "measured_mobility_factor": 1.0,
                 "shovel_queue_length": 0, "tip_queue_length": 0,
                 "active_shovel_truck": None, "active_tip_truck": None}
@@ -231,6 +241,17 @@ class HaulTruckFleet:
         severity_factor = {"Small": 0.18, "Medium": 0.42, "Large": 0.78}
         return max((severity_factor[event["severity"]] for event in events
                     if event["name"] == incident and event["area"] in (area, "Whole factory")), default=0.0)
+
+    def migrate(self, state: dict) -> None:
+        """Add shared fueling-bay state to an already running browser session."""
+        state.setdefault("fuel_bay_capacity_l", self.FUEL_BAY_CAPACITY_L)
+        state.setdefault("fuel_bay_inventory_l", self.FUEL_BAY_CAPACITY_L)
+        state.setdefault("fuel_bay_total_dispensed_l", 0.0)
+        state.setdefault("fuel_bay_active_truck", None)
+        state.setdefault("fuel_bay_queue", [])
+        for truck in state.get("trucks", {}).values():
+            truck.setdefault("fuel_starved", False)
+            truck.setdefault("cumulative_fuel_consumed_l", truck.get("fuel_used_l", 0.0))
 
     @staticmethod
     def _dumped_within_cycle(unit: str, cycle: list[dict], phase: float) -> float:
@@ -248,6 +269,7 @@ class HaulTruckFleet:
     def advance(self, state: dict, sim_seconds: int, events: list[dict], rom_inventory_t: float,
                 ore_grade_pct: float = 0.62) -> float:
         """Advance trucks and report this tick's ROM delivery tonnes and copper mass."""
+        self.migrate(state)
         state["sim_seconds"] = sim_seconds
         ore_grade_pct = min(1.2, max(0.25, ore_grade_pct))
         for key, default in (("last_delivery_copper_t", 0.0), ("delivery_grade_pct", 0.0),
@@ -272,6 +294,25 @@ class HaulTruckFleet:
         state["rom_dispatch_paused"] = paused_rom
         state["projected_rom_inventory_t"] = projected_rom_t
         state["measured_mobility_factor"] = mobility
+
+        # One metered nozzle serves the FIFO queue at the pit-side fuel bay.
+        # Refueling transfers diesel from a finite site tank into the truck tank.
+        active_fuel_truck = state.get("fuel_bay_active_truck")
+        if active_fuel_truck not in state["trucks"] or (active_fuel_truck and
+                state["trucks"][active_fuel_truck]["fuel_used_l"] <= 1e-6):
+            active_fuel_truck = None
+        fuel_candidates = sorted(
+            (unit for unit, truck in state["trucks"].items()
+             if truck["frame"]["cycle_state"] == "pit_queue"
+             and truck["fuel_used_l"] >= truck["fuel_capacity_l"]
+                 * (1.0 - self.FUEL_RESERVE_TRIGGER_PCT / 100.0)),
+            key=lambda unit: (state["trucks"][unit].get("shovel_arrival_s")
+                              if state["trucks"][unit].get("shovel_arrival_s") is not None
+                              else float("inf"), unit))
+        if active_fuel_truck is None and fuel_candidates:
+            active_fuel_truck = fuel_candidates[0]
+        state["fuel_bay_active_truck"] = active_fuel_truck
+        state["fuel_bay_queue"] = [unit for unit in fuel_candidates if unit != active_fuel_truck]
 
         # Older open browser sessions predate queue timestamps; seed those
         # timestamps from their saved cycle phase before forming queue order.
@@ -324,11 +365,12 @@ class HaulTruckFleet:
             truck.setdefault("loading_copper_t", 0.0)
             truck.setdefault("payload_copper_remaining_t", old_frame.get("payload_t", 0.0) * 0.0062)
             at_shovel = old_frame["cycle_state"] in ("pit_queue", "loading")
-            refueling = truck["refuel_remaining_s"] > 0
-            if not refueling and old_frame["cycle_state"] == "pit_queue" and truck["fuel_used_l"] >= truck["fuel_capacity_l"] * 0.85:
-                truck["refuel_remaining_s"] = 600
-                refueling = True
-            progress = 0.0 if refueling or (paused_rom and at_shovel) else shovel_rate if old_frame["cycle_state"] == "loading" else 1.0
+            refueling = active_fuel_truck == unit
+            waiting_fuel_bay = unit in state["fuel_bay_queue"]
+            fuel_starved = truck.get("fuel_starved", False)
+            progress = (0.0 if refueling or waiting_fuel_bay or fuel_starved
+                        or (paused_rom and at_shovel) else
+                        shovel_rate if old_frame["cycle_state"] == "loading" else 1.0)
             if old_frame["cycle_state"] == "loading" and unit != active_shovel:
                 progress = 0.0
             elif old_frame["cycle_state"] == "dumping" and unit != active_tip:
@@ -341,11 +383,6 @@ class HaulTruckFleet:
                     progress = 0.0
             if old_frame["cycle_state"] in ("travel_loaded", "travel_empty"):
                 progress *= mobility
-            if refueling:
-                truck["refuel_remaining_s"] = max(0, truck["refuel_remaining_s"] - 1)
-                if truck["refuel_remaining_s"] == 0:
-                    truck["fuel_used_l"] = 0.0
-                    truck["refuels_completed"] += 1
             cycle = self.cycles[unit]
             period = cycle[-1]["end"]
             new_unwrapped = old_phase + progress
@@ -405,17 +442,46 @@ class HaulTruckFleet:
                 truck["tip_arrival_s"] = None
                 truck["dump_queue_since_s"] = None
             if refueling:
-                truck["frame"]["state"] = "Refueling at mine fuel bay"
+                dispensed_l = min(self.FUEL_BAY_REFUEL_RATE_L_S,
+                                  truck["fuel_used_l"], state["fuel_bay_inventory_l"])
+                truck["fuel_used_l"] = max(0.0, truck["fuel_used_l"] - dispensed_l)
+                state["fuel_bay_inventory_l"] -= dispensed_l
+                state["fuel_bay_total_dispensed_l"] += dispensed_l
+                if dispensed_l > 0.0:
+                    truck["fuel_starved"] = False
+                if truck["fuel_used_l"] <= 1e-6:
+                    truck["fuel_used_l"] = 0.0
+                    truck["refuels_completed"] += 1
+                    state["fuel_bay_active_truck"] = None
+                truck["frame"]["state"] = ("Refueling at pit fuel bay" if state["fuel_bay_inventory_l"] > 0
+                                             else "Fuel bay empty · awaiting delivery")
+                truck["frame"]["speed_kmh"] = 0.0
+                truck["frame"]["payload_t"] = 0.0
+            elif waiting_fuel_bay:
+                truck["frame"]["state"] = "Waiting for pit fuel bay"
+                truck["frame"]["speed_kmh"] = 0.0
+                truck["frame"]["payload_t"] = 0.0
+            elif fuel_starved:
+                truck["frame"]["state"] = "Stopped · out of fuel"
                 truck["frame"]["speed_kmh"] = 0.0
                 truck["frame"]["payload_t"] = 0.0
             truck["total_delivered_t"] += delta
             truck["total_delivered_copper_t"] += copper_delta_t
             cycle_state = truck["frame"]["cycle_state"]
-            engine_running = (cycle_state != "pit_queue" or not paused_rom) and not refueling
+            engine_running = ((cycle_state != "pit_queue" or not paused_rom)
+                              and not refueling and not fuel_starved)
             if engine_running:
                 truck["engine_hours"] += 1 / 3600
                 fuel_rate_lph = self._fuel_rate_lph(truck["frame"])
-                truck["fuel_used_l"] += fuel_rate_lph / 3600.0
+                fuel_consumed_l = min(fuel_rate_lph / 3600.0,
+                                      max(0.0, truck["fuel_capacity_l"] - truck["fuel_used_l"]))
+                truck["fuel_used_l"] += fuel_consumed_l
+                truck["cumulative_fuel_consumed_l"] += fuel_consumed_l
+                if truck["fuel_used_l"] >= truck["fuel_capacity_l"] - 1e-6:
+                    truck["fuel_used_l"] = truck["fuel_capacity_l"]
+                    truck["fuel_starved"] = True
+                    truck["frame"]["state"] = "Stopped · out of fuel"
+                    truck["frame"]["speed_kmh"] = 0.0
             speed = truck["frame"]["speed_kmh"]
             truck["tire_temperature_c"] += (58 + speed * .24 - truck["tire_temperature_c"]) / 300.0
             grade = truck["frame"].get("road_grade_pct", 0.0) / 100.0
@@ -562,10 +628,12 @@ class HaulTruckFleet:
                 "payload_target": (frame["payload_target_t"], "t", 0, 250),
                 "road_grade": (frame.get("road_grade_pct", 0.0), "%", -20, 20),
                 "engine_load": (self._engine_load_pct(frame), "%", 0, 100),
-                "fuel_rate": ((0.0 if frame["state"].startswith(("Standby", "Refueling")) else
+                "fuel_rate": ((0.0 if frame["state"].startswith(
+                                    ("Standby", "Refueling", "Fuel bay empty", "Stopped")) else
                                self._fuel_rate_lph(frame)), "L/h", 0, 1_000),
                 "fuel_level": (max(0.0, 100.0 - truck["fuel_used_l"] / fuel_capacity * 100), "%", 0, 100),
-                "refuel_status": (float(truck["refuel_remaining_s"] > 0), "bool", 0, 1),
+                "refuel_status": (float(state.get("fuel_bay_active_truck") == unit), "bool", 0, 1),
+                "fuel_starved": (float(truck.get("fuel_starved", False)), "bool", 0, 1),
                 "refuels_completed": (truck["refuels_completed"], "count", 0, 100_000),
                 "engine_hours": (truck["engine_hours"], "h", 0, 100_000),
                 "tire_temperature": (truck["tire_temperature_c"], "°C", 0, 180),
@@ -599,6 +667,22 @@ class HaulTruckFleet:
                     "active_truck": (self.truck_names.index(state["active_tip_truck"]) + 1
                                      if state.get("active_tip_truck") in self.truck_names else 0,
                                      "truck_id", 0, self.TRUCK_COUNT),
+                }),
+                ("Mine fuel bay", {
+                    "tank_inventory": (state.get("fuel_bay_inventory_l", 0.0), "L", 0,
+                                       state.get("fuel_bay_capacity_l", self.FUEL_BAY_CAPACITY_L)),
+                    "tank_level": (100.0 * state.get("fuel_bay_inventory_l", 0.0)
+                                   / max(state.get("fuel_bay_capacity_l", self.FUEL_BAY_CAPACITY_L), 1.0),
+                                   "%", 0, 100),
+                    "dispensing_flow": (self.FUEL_BAY_REFUEL_RATE_L_S * 3_600.0
+                                        if state.get("fuel_bay_active_truck")
+                                        and state.get("fuel_bay_inventory_l", 0.0) > 0 else 0.0,
+                                        "L/h", 0, self.FUEL_BAY_REFUEL_RATE_L_S * 3_600.0),
+                    "queue_length": (len(state.get("fuel_bay_queue", [])), "trucks", 0, self.TRUCK_COUNT),
+                    "active_truck": (self.truck_names.index(state["fuel_bay_active_truck"]) + 1
+                                     if state.get("fuel_bay_active_truck") in self.truck_names else 0,
+                                     "truck_id", 0, self.TRUCK_COUNT),
+                    "fuel_dispensed_total": (state.get("fuel_bay_total_dispensed_l", 0.0), "L", 0, 1e9),
                 })):
             for sensor, (value, units, low, high) in values.items():
                 rows.append({"tag": f"mobile_fleet.{asset.lower().replace(' ', '_')}.{sensor}",
@@ -641,4 +725,16 @@ class HaulTruckFleet:
                 "cumulative_delivery_t": state["cumulative_delivery_t"],
                 "cumulative_delivery_copper_t": state.get("cumulative_delivery_copper_t", 0.0),
                 "average_delivery_grade_pct": state.get("average_delivery_grade_pct", 0.0),
+                "fuel_bay_capacity_l": state.get("fuel_bay_capacity_l", HaulTruckFleet.FUEL_BAY_CAPACITY_L),
+                "fuel_bay_inventory_l": state.get("fuel_bay_inventory_l", HaulTruckFleet.FUEL_BAY_CAPACITY_L),
+                "fuel_bay_level_pct": (100.0 * state.get("fuel_bay_inventory_l", 0.0)
+                                       / max(state.get("fuel_bay_capacity_l", HaulTruckFleet.FUEL_BAY_CAPACITY_L), 1.0)),
+                "fuel_bay_total_dispensed_l": state.get("fuel_bay_total_dispensed_l", 0.0),
+                "fuel_bay_active_truck": state.get("fuel_bay_active_truck"),
+                "fuel_bay_queue": list(state.get("fuel_bay_queue", [])),
+                "fuel_bay_flow_l_min": (HaulTruckFleet.FUEL_BAY_REFUEL_RATE_L_S * 60.0
+                                         if state.get("fuel_bay_active_truck")
+                                         and state.get("fuel_bay_inventory_l", 0.0) > 0.0 else 0.0),
+                "fuel_starved_trucks": [name for name, truck in state["trucks"].items()
+                                         if truck.get("fuel_starved", False)],
                 "mean_mobility_factor": state["measured_mobility_factor"]}

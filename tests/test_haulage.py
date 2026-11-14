@@ -107,7 +107,7 @@ class HaulTruckFleetTests(unittest.TestCase):
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
         self.assertIn("mobile_fleet.haul_truck_01.road_grade", tags)
 
-    def test_trucks_refuel_at_the_shovel_queue_before_running_dry(self):
+    def test_trucks_refuel_at_pit_bay_before_running_dry(self):
         # At the modeled duty cycle a 4,500 L tank reaches the 85% service
         # threshold after about 27 h, then needs ten minutes at the pit bay.
         self.run_ticks(self.state, 108_000)
@@ -116,6 +116,90 @@ class HaulTruckFleetTests(unittest.TestCase):
         tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
         self.assertIn("mobile_fleet.haul_truck_01.refuel_status", tags)
         self.assertIn("mobile_fleet.haul_truck_01.fuel_level", tags)
+        self.assertIn("mobile_fleet.mine_fuel_bay.tank_inventory", tags)
+
+    def test_shared_pit_fuel_bay_dispenses_finite_inventory_in_fifo_order(self):
+        first, second = "Haul truck 01", "Haul truck 02"
+        for index, unit in enumerate((first, second)):
+            truck = self.state["trucks"][unit]
+            pit_queue = next(segment for segment in self.model.cycles[unit]
+                             if segment["kind"] == "pit_queue")
+            truck["phase_s"] = pit_queue["start"]
+            truck["frame"] = self.model._frame(unit, pit_queue["start"])
+            truck["fuel_used_l"] = truck["fuel_capacity_l"] * 0.85
+            truck["cumulative_fuel_consumed_l"] = truck["fuel_used_l"]
+            truck["shovel_arrival_s"] = index + 1
+        self.state["fuel_bay_inventory_l"] = 10_000.0
+        initial_fuel_inventory = (self.state["fuel_bay_inventory_l"]
+                                  + sum(truck["fuel_capacity_l"] - truck["fuel_used_l"]
+                                        for truck in self.state["trucks"].values())
+                                  + sum(truck["cumulative_fuel_consumed_l"]
+                                        for truck in self.state["trucks"].values()))
+
+        self.model.advance(self.state, 1, [], 18_000.0)
+        self.assertEqual(self.state["fuel_bay_active_truck"], first)
+        self.assertEqual(self.state["fuel_bay_queue"], [second])
+        self.assertEqual(self.state["trucks"][second]["refuels_completed"], 0)
+        for tick in range(2, 511):
+            self.model.advance(self.state, tick, [], 18_000.0)
+        self.assertEqual(self.state["trucks"][first]["refuels_completed"], 1)
+        self.assertIsNone(self.state["fuel_bay_active_truck"])
+        self.model.advance(self.state, 511, [], 18_000.0)
+        self.assertEqual(self.state["fuel_bay_active_truck"], second)
+
+        final_fuel_inventory = (self.state["fuel_bay_inventory_l"]
+                                + sum(truck["fuel_capacity_l"] - truck["fuel_used_l"]
+                                      for truck in self.state["trucks"].values())
+                                + sum(truck["cumulative_fuel_consumed_l"]
+                                      for truck in self.state["trucks"].values()))
+        self.assertAlmostEqual(final_fuel_inventory, initial_fuel_inventory, places=6)
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertIn("mobile_fleet.mine_fuel_bay.tank_inventory", tags)
+        self.assertEqual(tags["mobile_fleet.mine_fuel_bay.queue_length"]["value"], 0)
+
+    def test_empty_truck_tank_immobilizes_vehicle_until_towed_to_fuel_bay(self):
+        unit = "Haul truck 01"
+        truck = self.state["trucks"][unit]
+        loaded_travel = next(segment for segment in self.model.cycles[unit]
+                             if segment["kind"] == "travel_loaded")
+        truck["phase_s"] = loaded_travel["start"] + 5.0
+        truck["frame"] = self.model._frame(unit, truck["phase_s"])
+        truck["fuel_used_l"] = truck["fuel_capacity_l"] - 1e-6
+        self.model.advance(self.state, 1, [], 18_000.0)
+        self.assertTrue(truck["fuel_starved"])
+        stopped_phase = truck["phase_s"]
+        self.assertIn("out of fuel", truck["frame"]["state"].lower())
+        self.model.advance(self.state, 2, [], 18_000.0)
+        self.assertEqual(truck["phase_s"], stopped_phase)
+        self.assertEqual(truck["frame"]["speed_kmh"], 0.0)
+
+    def test_empty_site_fuel_tank_holds_truck_at_bay_without_fabricating_flow(self):
+        unit = "Haul truck 01"
+        truck = self.state["trucks"][unit]
+        pit_queue = next(segment for segment in self.model.cycles[unit]
+                         if segment["kind"] == "pit_queue")
+        truck["phase_s"] = pit_queue["start"]
+        truck["frame"] = self.model._frame(unit, pit_queue["start"])
+        truck["fuel_used_l"] = truck["fuel_capacity_l"] * 0.85
+        self.state["fuel_bay_inventory_l"] = 0.0
+        self.model.advance(self.state, 1, [], 18_000.0)
+        self.assertEqual(self.state["fuel_bay_active_truck"], unit)
+        self.assertEqual(truck["frame"]["state"], "Fuel bay empty · awaiting delivery")
+        tags = {tag["tag"]: tag for tag in self.model.telemetry(self.state)}
+        self.assertEqual(tags["mobile_fleet.mine_fuel_bay.dispensing_flow"]["value"], 0.0)
+        self.assertEqual(tags[f"mobile_fleet.haul_truck_01.fuel_rate"]["value"], 0.0)
+
+    def test_old_fleet_snapshot_migrates_to_finite_fuel_bay(self):
+        legacy = self.model.initialize()
+        for key in ("fuel_bay_capacity_l", "fuel_bay_inventory_l", "fuel_bay_total_dispensed_l",
+                    "fuel_bay_active_truck", "fuel_bay_queue"):
+            legacy.pop(key)
+        for truck in legacy["trucks"].values():
+            truck.pop("fuel_starved")
+            truck.pop("cumulative_fuel_consumed_l")
+        self.model.migrate(legacy)
+        self.assertEqual(legacy["fuel_bay_inventory_l"], self.model.FUEL_BAY_CAPACITY_L)
+        self.assertTrue(all("fuel_starved" in truck for truck in legacy["trucks"].values()))
 
     def test_shared_shovel_and_tip_queues_serve_one_truck_and_separate_gps_positions(self):
         for unit in self.model.truck_names:

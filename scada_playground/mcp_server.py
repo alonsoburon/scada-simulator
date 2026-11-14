@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -351,12 +352,12 @@ def submit_command(command: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_alarms", "inject_incident",
                                      "reset_feeder_protection", "maintain_equipment",
-                                     "maintain_water_pump"],
+                                     "maintain_water_pump", "deliver_mine_fuel"],
                        incident_name: str = "", severity: Literal["Small", "Medium", "Large"] = "Small",
                        target_area: str = "Whole factory", duration_seconds: int = 0,
                        target_asset: str = "", fault_location_pct: float = 90.0,
                        primary_breaker_failure: bool = False,
-                       target_tag: str = "") -> dict[str, Any]:
+                       target_tag: str = "", fuel_delivery_l: float = 0.0) -> dict[str, Any]:
     """Control the synthetic simulator: start, stop, reset, acknowledge alarms, inject incidents,
     manually reset a locked-out distribution feeder after its fault has cleared, or maintain a
     stopped process asset or isolated water pump after its active mechanical fault has cleared.
@@ -381,10 +382,13 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
     must be STOPPED and its mechanical fault cleared before maintenance is allowed.
     For maintain_water_pump, target_asset must be one of the named mine-water pumps; disable it,
     allow it to coast to zero speed, and clear its mechanical fault first.
+    For deliver_mine_fuel, target_area must be Mobile fleet, target_asset must be Mine fuel bay,
+    and fuel_delivery_l must be a positive quantity that fits in the site tank.
     No physical device can be controlled.
     """
     allowed = {"start", "stop", "reset", "acknowledge_alarms", "inject_incident",
-               "reset_feeder_protection", "maintain_equipment", "maintain_water_pump"}
+               "reset_feeder_protection", "maintain_equipment", "maintain_water_pump",
+               "deliver_mine_fuel"}
     if action not in allowed:
         raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
     if action == "inject_incident":
@@ -460,12 +464,22 @@ def control_simulation(action: Literal["start", "stop", "reset", "acknowledge_al
         pumps = data.get("water_network", {}).get("pumps", {})
         if target_asset not in pumps:
             raise ValueError("maintain_water_pump requires a named pump in target_asset")
+    if action == "deliver_mine_fuel":
+        if target_area != "Mobile fleet" or target_asset != "Mine fuel bay":
+            raise ValueError("deliver_mine_fuel requires Mobile fleet and target_asset='Mine fuel bay'")
+        if not math.isfinite(fuel_delivery_l) or fuel_delivery_l <= 0.0:
+            raise ValueError("fuel_delivery_l must be a positive finite quantity")
+        fuel = snapshot().get("haulage", {})
+        remaining = fuel.get("fuel_bay_capacity_l", 0.0) - fuel.get("fuel_bay_inventory_l", 0.0)
+        if fuel_delivery_l > remaining + 1e-6:
+            raise ValueError(f"Fuel delivery exceeds site tank headroom ({max(0.0, remaining):.0f} L)")
     return submit_command({"action": action, "incident_name": incident_name,
                            "severity": severity, "target_area": target_area,
                            "duration_seconds": duration_seconds, "target_asset": target_asset or None,
                            "fault_location_pct": fault_location_pct,
                            "primary_breaker_failure": primary_breaker_failure,
-                           "target_tag": target_tag or None})
+                           "target_tag": target_tag or None,
+                           "fuel_delivery_l": fuel_delivery_l})
 
 
 @mcp.tool()
