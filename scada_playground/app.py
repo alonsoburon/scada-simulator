@@ -22,6 +22,7 @@ from protocol_faults import FAULT_MODES, PROTOCOLS, ProtocolFaultInjector
 from scenarios import SCENARIOS, ScenarioRunner, ScenarioStep
 from water_network import MineWaterNetwork
 from concentrator import CopperConcentrator
+from concentrate_logistics import ConcentrateLogistics
 from haulage import HaulTruckFleet
 from power_network import MinePowerNetwork
 from plant_controller import PlantController
@@ -200,6 +201,7 @@ def fleet_motion(unit: str, sim_seconds: int) -> tuple[float, float, float, floa
 PROCESS_MODEL = FactoryProcessModel(AREAS, INCIDENTS, fleet_motion)
 WATER_MODEL = MineWaterNetwork()
 CONCENTRATOR_MODEL = CopperConcentrator()
+CONCENTRATE_LOGISTICS_MODEL = ConcentrateLogistics()
 HAULAGE_MODEL = HaulTruckFleet(FLEET_ROUTES, distance_km)
 POWER_MODEL = MinePowerNetwork()
 UTILITY_MODEL = FactoryUtilities()
@@ -251,6 +253,7 @@ def initialize(seed: int = 17) -> None:
         # discard the generic placeholder tags before publishing its asset tree.
         tags = [tag for tag in tags if tag["area"] not in {"Wastewater", "Water distribution", "Chilled water"}]
         concentrator_state = CONCENTRATOR_MODEL.initialize()
+        CONCENTRATE_LOGISTICS_MODEL.initialize(concentrator_state)
         process_control_state = PLANT_CONTROLLER.initialize()
         haulage_state = HAULAGE_MODEL.initialize()
         utility_state = UTILITY_MODEL.initialize()
@@ -267,6 +270,8 @@ def initialize(seed: int = 17) -> None:
         ventilation_state = VENTILATION_MODEL.initialize()
         VENTILATION_MODEL.advance(ventilation_state, 0, [], seed=seed)
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.update((area, asset) for area, assets in CONCENTRATE_LOGISTICS_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
@@ -282,7 +287,9 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update((area, asset) for area, assets in BATCH_MODEL.AREA_ASSETS.items()
                               for asset in assets)
         tags = [tag for tag in tags if (tag["area"], tag["unit"]) not in modeled_assets]
-        modeled_tags = CONCENTRATOR_MODEL.telemetry(concentrator_state) + HAULAGE_MODEL.telemetry(haulage_state, seed)
+        modeled_tags = (CONCENTRATOR_MODEL.telemetry(concentrator_state)
+                        + CONCENTRATE_LOGISTICS_MODEL.telemetry(concentrator_state, seed)
+                        + HAULAGE_MODEL.telemetry(haulage_state, seed))
         for tag in modeled_tags:
             tag["dynamic_model"] = True
         tags.extend(modeled_tags)
@@ -368,6 +375,7 @@ def initialize(seed: int = 17) -> None:
             sim["process_control"] = PLANT_CONTROLLER.initialize()
         PLANT_CONTROLLER.migrate(sim["process_control"])
         CONCENTRATOR_MODEL.migrate(sim["concentrator"])
+        CONCENTRATE_LOGISTICS_MODEL.initialize(sim["concentrator"])
         if "haulage" not in sim:
             sim["haulage"] = HAULAGE_MODEL.initialize()
         if "plant_utilities" not in sim:
@@ -395,6 +403,8 @@ def initialize(seed: int = 17) -> None:
             sim["mine_ventilation"] = VENTILATION_MODEL.initialize()
             VENTILATION_MODEL.advance(sim["mine_ventilation"], sim.get("tick", 0), [], seed=sim["seed"])
         modeled_assets = {(area, asset) for area, assets in CONCENTRATOR_MODEL.AREA_ASSETS.items() for asset in assets}
+        modeled_assets.update((area, asset) for area, assets in CONCENTRATE_LOGISTICS_MODEL.AREA_ASSETS.items()
+                              for asset in assets)
         modeled_assets.add(("Concentrate handling", "Thickener"))  # legacy generic asset name
         modeled_assets.update(("Mobile fleet", unit) for unit in HAULAGE_MODEL.truck_names)
         modeled_assets.update(("Mobile fleet", asset) for asset in
@@ -410,7 +420,9 @@ def initialize(seed: int = 17) -> None:
         modeled_assets.update((area, asset) for area, assets in BATCH_MODEL.AREA_ASSETS.items()
                               for asset in assets)
         sim["tags"] = [tag for tag in sim["tags"] if (tag["area"], tag["unit"]) not in modeled_assets]
-        modeled_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"]) + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])
+        modeled_tags = (CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+                        + CONCENTRATE_LOGISTICS_MODEL.telemetry(sim["concentrator"], sim["seed"])
+                        + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"]))
         for tag in modeled_tags:
             tag["dynamic_model"] = True
             sim["tags"].append(tag)
@@ -484,7 +496,8 @@ def publish_snapshot() -> dict:
                           if t["area"] == "Mobile fleet"
                           and t["unit"].rsplit(" ", 1)[0] in FLEET_ROUTES})
     water_tags, water_diagram = WATER_MODEL.telemetry(sim["water_network"])
-    concentrator_tags = CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+    concentrator_tags = (CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+                         + CONCENTRATE_LOGISTICS_MODEL.telemetry(sim["concentrator"], sim["seed"]))
     power_tags = POWER_MODEL.telemetry(sim["power_network"])
     utility_tags = UTILITY_MODEL.telemetry(sim["plant_utilities"], sim["seed"])
     chilled_tags = CHILLED_MODEL.telemetry(sim["chilled_water"], sim["seed"])
@@ -1062,6 +1075,9 @@ def advance(force: bool = False) -> None:
                                mine_delivery_copper_t=sim["haulage"]["last_delivery_copper_t"],
                                power_available_fraction=sim["power_network"]["process_power_fraction"],
                                equipment_available=equipment_available)
+    CONCENTRATE_LOGISTICS_MODEL.advance(
+        sim["concentrator"], sim["tick"], concentrator_events,
+        power_available_fraction=sim["power_network"]["process_power_fraction"])
     WATER_MODEL.advance(sim["water_network"], sim["tick"], water_events, seed=sim["seed"],
                         concentrator_demand_m3h=sim["concentrator"]["gross_process_water_m3h"],
                         concentrator_reclaim_m3h=sim["concentrator"]["concentrator_reclaim_m3h"],
@@ -1389,6 +1405,7 @@ def advance(force: bool = False) -> None:
     ventilation_by_tag = {tag["tag"]: tag for tag in ventilation_tags}
     concentrator_by_tag = {tag["tag"]: tag for tag in
                            CONCENTRATOR_MODEL.telemetry(sim["concentrator"])
+                           + CONCENTRATE_LOGISTICS_MODEL.telemetry(sim["concentrator"], sim["seed"])
                            + HAULAGE_MODEL.telemetry(sim["haulage"], sim["seed"])}
     for tag in sim["tags"]:
         if tag["tag"] in water_by_tag:
@@ -1924,7 +1941,7 @@ def render_dashboard():
             st.dataframe(pd.DataFrame(equipment_rows), hide_index=True, width="stretch")
             st.caption("Permissive: " + control["permissive_reason"])
         st.caption(f"ROM stockpile {plant['rom_stockpile_t']:.0f} t · crushed ore {plant['crushed_stockpile_t']:.0f} t · SAG feed bin {plant['sag_bin_t']:.0f} t · tailings thickener {plant['tailings_thickener_inventory_t']:.0f} t solids + {plant['tailings_thickener_water_inventory_m3']:.0f} m³ water · curtailed mine feed {plant['rom_feed_curtailed_tph']:.1f} t/h · water shortage {plant['fresh_water_shortage_m3h']:.1f} m³/h")
-        st.caption(f"Concentrate thickener {plant['concentrate_thickener_inventory_t']:.1f}/{plant['concentrate_thickener_capacity_t']:.0f} t · filter press {plant['filter_press_phase'].lower()} ({plant['filter_press_batch_t']:.2f}/{plant['filter_press_batch_capacity_t']:.1f} t batch) · cake stockpile {plant['concentrate_cake_inventory_t']:.1f}/{plant['concentrate_cake_capacity_t']:.0f} t · concentrate shipped {plant['cumulative_concentrate_shipped_t']:.1f} t")
+        st.caption(f"Concentrate thickener {plant['concentrate_thickener_inventory_t']:.1f}/{plant['concentrate_thickener_capacity_t']:.0f} t · filter press {plant['filter_press_phase'].lower()} ({plant['filter_press_batch_t']:.2f}/{plant['filter_press_batch_capacity_t']:.1f} t batch) · cake stockpile {plant['concentrate_cake_inventory_t']:.1f}/{plant['concentrate_cake_capacity_t']:.0f} t solids · dry silo {plant['loadout_silo_inventory_t']:.1f}/{plant['loadout_silo_capacity_t']:.0f} t solids · train {plant['rail_train_state'].lower()} ({plant['rail_train_inventory_t']:.0f}/{plant['rail_train_capacity_t']:.0f} t) · shipped {plant['cumulative_concentrate_shipped_t']:.1f} t solids")
         flow_stages = [
             ("ROM feed", plant["rom_feed_tph"], "#277da1"),
             ("Crusher", plant["crushed_ore_tph"], "#4c78a8"),

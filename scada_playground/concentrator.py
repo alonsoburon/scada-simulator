@@ -519,11 +519,14 @@ class CopperConcentrator:
         concentrate_capacity_t = state["concentrate_thickener_capacity_t"]
         concentrate_sink_ready = (power_factor > 0.05 and equipment_available.get("concentrate_thickener", True)
                                   and equipment_available.get("filter_press", True))
-        concentrate_backpressure = 1.0
-        if not concentrate_sink_ready:
-            concentrate_backpressure = min(1.0, max(0.0,
-                (0.94 * concentrate_capacity_t - state["concentrate_thickener_inventory_t"])
-                / max(0.14 * concentrate_capacity_t, 1.0)))
+        concentrate_backpressure = min(1.0, max(0.0,
+            (0.94 * concentrate_capacity_t - state["concentrate_thickener_inventory_t"])
+            / max(0.14 * concentrate_capacity_t, 1.0)))
+        downstream_blocked = (state.get("filter_press_phase") == "DISCHARGING"
+                              and state.get("concentrate_cake_inventory_t", 0.0)
+                              >= state.get("concentrate_cake_capacity_t", 0.0) - 1e-6)
+        if not concentrate_sink_ready or downstream_blocked:
+            concentrate_backpressure = 0.0
         plant_target *= min(water_factor, power_factor, tailings_backpressure,
                             concentrate_backpressure)
 
@@ -725,7 +728,7 @@ class CopperConcentrator:
                 cake_room_t = max(0.0, state["concentrate_cake_capacity_t"]
                                   - state["concentrate_cake_inventory_t"])
                 cake_rate = min(650.0, state["filter_press_batch_t"] / dt_h,
-                                (cake_room_t / dt_h) + 26.0)
+                                cake_room_t / dt_h)
                 state["filter_press_cake_tph"] = cake_rate
                 batch_grade_fraction = (state["filter_press_batch_copper_inventory_t"]
                                         / max(state["filter_press_batch_t"], 1e-9))
@@ -764,23 +767,21 @@ class CopperConcentrator:
             + press_feed_copper_tph * dt_h)
         state["concentrate_thickener_inventory_t"] = min(concentrate_capacity_t, max(0.0,
             state["concentrate_thickener_inventory_t"] + (concentrate - press_feed) * dt_h))
-        concentrate_shipped = min(26.0,
-            (state["concentrate_cake_inventory_t"] + state["filter_press_cake_tph"] * dt_h) / dt_h)
-        state["concentrate_shipped_tph"] = concentrate_shipped
         cake_solids_before_shipping = (state["concentrate_cake_inventory_t"]
                                        + state["filter_press_cake_tph"] * dt_h)
         cake_copper_before_shipping = (state["concentrate_cake_copper_inventory_t"]
                                        + press_cake_copper_tph * dt_h)
-        shipped_copper_t = min(cake_copper_before_shipping,
-                               concentrate_shipped * dt_h * cake_copper_before_shipping
-                               / max(cake_solids_before_shipping, 1e-9))
+        press_cake_t = state["filter_press_cake_tph"] * dt_h
+        press_cake_copper_t = press_cake_copper_tph * dt_h
         state["concentrate_cake_copper_inventory_t"] = max(
-            0.0, cake_copper_before_shipping - shipped_copper_t)
+            0.0, cake_copper_before_shipping)
         state["concentrate_cake_inventory_t"] = min(state["concentrate_cake_capacity_t"], max(0.0,
-            state["concentrate_cake_inventory_t"]
-            + (state["filter_press_cake_tph"] - concentrate_shipped) * dt_h))
-        state["cumulative_concentrate_shipped_t"] += concentrate_shipped * dt_h
-        state["cumulative_concentrate_copper_shipped_t"] += shipped_copper_t
+            cake_solids_before_shipping))
+        state["cumulative_filter_press_cake_t"] = (
+            state.get("cumulative_filter_press_cake_t", 0.0) + press_cake_t)
+        state["cumulative_filter_press_cake_copper_t"] = (
+            state.get("cumulative_filter_press_cake_copper_t", 0.0) + press_cake_copper_t)
+        state["concentrate_shipped_tph"] = 0.0
 
         # Tailings are a separate solids stream. A stopped thickener/pump train
         # fills its finite inventory, which eventually backpressures flotation.

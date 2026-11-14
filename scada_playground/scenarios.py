@@ -438,6 +438,24 @@ SCENARIOS = {
             "After the second fault clears, the replay simulates an operator incomer reset and re-energizes the distribution bus without clearing the trip history.",
         ),
     ),
+    "concentrate-rail-outage-backpressure": ScenarioDefinition(
+        scenario_id="concentrate-rail-outage-backpressure",
+        name="Concentrate rail outage and process backpressure",
+        description="A prolonged rail-loadout outage fills the dry-product silo, backs up wet cake and thickener inventories, and eventually constrains flotation until export recovers.",
+        duration_seconds=345_600,
+        steps=(ScenarioStep(300, "incident", {"incident_name": "Utility loss", "severity": "Large",
+                                                 "target_area": "Concentrate handling",
+                                                 "target_asset": "Rail loadout",
+                                                 "duration_seconds": 259_200}),),
+        expected_observations=(
+            "Rail service loss prevents loading/departure while the dryer and filter press continue filling finite inventories.",
+            "The loadout silo fills first; dryer discharge then stops and filter cake accumulates in the stockpile.",
+            "When cake storage fills, the press cannot discharge and its batch pauses; concentrate thickener inventory rises and limits recovery from flotation.",
+            "The reduced concentrate sink backs up into flotation, lowering feed and recovery while tailings and water balances continue responding.",
+            "After the rail outage clears, the train loads and departs; silo and cake inventories drain in sequence and production recovers with transport delay.",
+            "Compare dry product, wet cake, train manifest, shipped copper, and concentrate inventories to audit the solids and copper balances.",
+        ),
+    ),
 }
 
 
