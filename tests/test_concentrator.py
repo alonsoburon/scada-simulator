@@ -9,7 +9,8 @@ class CopperConcentratorTests(unittest.TestCase):
         self.state = self.model.initialize()
 
     def advance(self, seconds, events=None, **kwargs):
-        for tick in range(1, seconds + 1):
+        first_tick = self.state.get("sim_seconds", 0) + 1
+        for tick in range(first_tick, first_tick + seconds):
             self.model.advance(self.state, tick, events or [], **kwargs)
 
     def test_normal_operation_respects_capacity_and_metal_balance(self):
@@ -53,12 +54,30 @@ class CopperConcentratorTests(unittest.TestCase):
         self.advance(1_200)
         stockout_recovery = self.state["copper_recovery_pct"]
         self.assertEqual(self.state["reagent_dose_l_h"], 0.0)
+        starved_collector = self.state["flotation_cell_collector_factor"][:]
         self.model.receive_flotation_reagent(self.state, 5_000.0)
         self.advance(1)
         self.assertGreater(self.state["reagent_dose_l_h"], 200.0)
         self.assertLess(self.state["copper_recovery_pct"], 88.0)
+        self.assertGreater(self.state["flotation_cell_collector_factor"][0], starved_collector[0])
+        self.assertGreater(self.state["flotation_cell_collector_factor"][-1],
+                           self.state["flotation_cell_collector_factor"][0])
         self.advance(900)
         self.assertGreater(self.state["copper_recovery_pct"], stockout_recovery + 20.0)
+
+    def test_collector_starvation_front_moves_through_cells_with_residence_lag(self):
+        self.state["reagent_inventory_l"] = 0.0
+        self.advance(60)
+        collector = self.state["flotation_cell_collector_factor"]
+        self.assertEqual(len(collector), self.model.FLOTATION_CELL_COUNT)
+        self.assertLess(collector[0], 0.85)
+        self.assertGreater(collector[-1], 0.98)
+        self.assertLess(collector[0], collector[-1])
+        self.assertAlmostEqual(self.state["history"][-1]["collector_availability_cell_01"],
+                               100.0 * collector[0])
+        tags = {row["sensor"]: row for row in self.model.telemetry(self.state)}
+        self.assertAlmostEqual(tags["collector_availability_cell_01"]["value"],
+                               100.0 * collector[0], delta=0.15)
 
     def test_flotation_reagent_inventory_conserves_stock_and_delivery_is_bounded(self):
         initial = self.state["reagent_inventory_l"]
@@ -90,13 +109,17 @@ class CopperConcentratorTests(unittest.TestCase):
 
     def test_legacy_concentrator_state_adds_finite_reagent_inventory(self):
         legacy = self.model.initialize()
+        legacy["history"] = [{"time": 15}]
         for key in ("reagent_inventory_l", "reagent_tank_capacity_l", "reagent_consumed_l",
                     "reagent_delivery_total_l", "reagent_dose_l_h", "reagent_requested_l_h",
                     "reagent_pump_condition", "reagent_pump_flow_factor"):
             legacy.pop(key)
+        legacy.pop("flotation_cell_collector_factor")
         self.model.migrate(legacy)
         self.assertEqual(legacy["reagent_inventory_l"], self.model.FLOTATION_REAGENT_INITIAL_L)
         self.assertEqual(legacy["reagent_tank_capacity_l"], self.model.FLOTATION_REAGENT_TANK_CAPACITY_L)
+        self.assertEqual(legacy["flotation_cell_collector_factor"], [1.0] * self.model.FLOTATION_CELL_COUNT)
+        self.assertEqual(legacy["history"][0]["collector_availability_cell_06"], 100.0)
 
     def test_conveyor_jam_is_buffered_before_reaching_mill_feed(self):
         self.advance(300)

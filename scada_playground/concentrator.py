@@ -177,6 +177,7 @@ class CopperConcentrator:
             "reagent_dose_l_h": 245.0, "reagent_requested_l_h": 245.0,
             "reagent_pump_condition": 1.0, "reagent_pump_flow_factor": 1.0,
             "flotation_copper_product_tph": 870.0 * 0.0062 * 0.88,
+            "flotation_cell_collector_factor": [1.0] * self.FLOTATION_CELL_COUNT,
             "cumulative_flotation_copper_feed_t": 0.0,
             "cumulative_flotation_copper_product_t": 0.0,
             "cumulative_flotation_copper_tailings_t": 0.0,
@@ -235,6 +236,7 @@ class CopperConcentrator:
                     "reagent_delivery_total_l", "reagent_dose_l_h", "reagent_requested_l_h",
                     "reagent_pump_condition", "reagent_pump_flow_factor",
                     "flotation_copper_product_tph", "cumulative_flotation_copper_feed_t",
+                    "flotation_cell_collector_factor",
                     "cumulative_flotation_copper_product_t", "cumulative_flotation_copper_tailings_t",
                     "concentrate_thickener_copper_inventory_t", "filter_press_batch_copper_inventory_t",
                     "concentrate_cake_copper_inventory_t", "cumulative_concentrate_copper_produced_t",
@@ -301,6 +303,10 @@ class CopperConcentrator:
             sample.setdefault("copper_feed_grade_pct", 0.62)
             sample.setdefault("mine_block_grade_pct", 0.62)
             sample.setdefault("flotation_copper_inventory_t", 0.9)
+            sample.setdefault("reagent_inventory_l", self.FLOTATION_REAGENT_INITIAL_L)
+            sample.setdefault("reagent_dose_l_h", 245.0)
+            for index in range(self.FLOTATION_CELL_COUNT):
+                sample.setdefault(f"collector_availability_cell_{index + 1:02d}", 100.0)
             for key in ("grind_coarse_fraction", "grind_intermediate_fraction", "grind_fine_fraction",
                         "cyclone_overflow_fraction", "circulating_load_ratio", "flotation_residence_time_min",
                         "coarse_breakage_per_pass", "intermediate_breakage_per_pass"):
@@ -537,7 +543,7 @@ class CopperConcentrator:
                 coarse_breakage, intermediate_breakage)
 
     def _advance_flotation_bank(self, state: dict, feed_solids_tph: float,
-                                feed_grade_fraction: float, kinetic_rate_per_min: float,
+                                feed_grade_fraction: float, kinetic_rates_per_min: list[float],
                                 dt_h: float) -> tuple[float, float]:
         """Advance a six-cell copper balance; return concentrate Cu, tail Cu and recovery."""
         cell_solids_inventory_t = (
@@ -546,13 +552,13 @@ class CopperConcentrator:
             / self.FLOTATION_CELL_COUNT)
         copper_inventory = state["flotation_cell_copper_inventory_t"]
         feed_copper_tph = feed_solids_tph * feed_grade_fraction
-        cell_k_per_h = max(0.0, kinetic_rate_per_min) * 60.0
         downstream_copper_tph = feed_copper_tph
         product_copper_tph = 0.0
         next_inventory = []
-        for inventory_t in copper_inventory:
+        for inventory_t, cell_rate_per_min in zip(copper_inventory, kinetic_rates_per_min):
             tailings_tph = (max(0.0, feed_solids_tph) * inventory_t
                             / max(cell_solids_inventory_t, 1e-9))
+            cell_k_per_h = max(0.0, cell_rate_per_min) * 60.0
             froth_tph = cell_k_per_h * inventory_t
             available_copper_t = inventory_t + downstream_copper_tph * dt_h
             requested_out_t = (tailings_tph + froth_tph) * dt_h
@@ -867,12 +873,25 @@ class CopperConcentrator:
         state["reagent_consumed_l"] += reagent_consumed_l
         pulp_flow_m3h = cyclone_overflow * (1.0 / 2.7 + state["water_specific_m3_t"])
         state["flotation_residence_time_min"] = min(90.0, 540.0 * 60.0 / max(pulp_flow_m3h, 1.0))
+        # Collector concentration moves through the six well-mixed cells in
+        # series. Each compartment uses its physical pulp residence time; a
+        # dose loss therefore reaches the final cell and product gradually.
+        prior_collector = state["flotation_cell_collector_factor"][:]
+        target_collector = min(1.12, max(0.0,
+            reagent / (self.FLOTATION_REAGENT_DOSE_L_T * max(cyclone_overflow, 1.0))))
+        cell_tau_s = (state["flotation_residence_time_min"] * 60.0
+                      / self.FLOTATION_CELL_COUNT)
+        collector_response = -math.expm1(-elapsed_s / max(cell_tau_s, 1.0))
+        for index in range(self.FLOTATION_CELL_COUNT):
+            inlet = target_collector if index == 0 else prior_collector[index - 1]
+            old = prior_collector[index]
+            state["flotation_cell_collector_factor"][index] = min(1.12, max(0.0,
+                old + (inlet - old) * collector_response))
         product_fine_share = product_size_fractions[0]
         size_floatability = min(1.15, max(0.65, 0.80 + 0.40 * product_fine_share / 0.486))
         air_factor = min(1.15, max(0.0, flotation_air / 540.0))
-        reagent_dose_l_t = reagent / max(cyclone_overflow, 1.0)
-        reagent_factor = min(1.12, max(0.05, (reagent_dose_l_t / self.FLOTATION_REAGENT_DOSE_L_T) ** 0.30))
-        kinetic_rate_per_min = 0.10 * size_floatability * air_factor * reagent_factor * state["flotation_condition"]
+        kinetic_rate_per_min = (0.10 * size_floatability * air_factor
+                                * state["flotation_condition"])
         cell_residence_min = state["flotation_residence_time_min"] / self.FLOTATION_CELL_COUNT
         kinetic_recovery = 100.0 * (1.0 - (1.0 + kinetic_rate_per_min * cell_residence_min) **
                                     -self.FLOTATION_CELL_COUNT)
@@ -889,9 +908,12 @@ class CopperConcentrator:
         adjusted_kinetic_rate_per_min = (
             target_cell_recovery / max(1.0 - target_cell_recovery, 1e-9)
             / cell_residence_h / 60.0)
+        cell_kinetic_rates_per_min = [
+            adjusted_kinetic_rate_per_min * collector_factor ** 0.30
+            for collector_factor in state["flotation_cell_collector_factor"]]
         recovered_copper_tph, tailings_copper_tph, recovery = self._advance_flotation_bank(
             state, cyclone_overflow, state["copper_feed_grade_pct"] / 100.0,
-            adjusted_kinetic_rate_per_min, dt_h)
+            cell_kinetic_rates_per_min, dt_h)
         state["concentrate_grade_pct"] = min(30.0, max(15.0,
             25.0 - max(0.0, state["p80_microns"] - 150) * 0.03))
         concentrate = recovered_copper_tph / max(state["concentrate_grade_pct"] / 100.0, 1e-9)
@@ -1197,6 +1219,11 @@ class CopperConcentrator:
                 "mine_block_grade_pct": state["mine_block_grade_pct"],
                 "copper_recovery_pct": state["copper_recovery_pct"], "p80_microns": state["p80_microns"],
                 "flotation_copper_inventory_t": state["flotation_copper_inventory_t"],
+                "reagent_inventory_l": state["reagent_inventory_l"],
+                "reagent_dose_l_h": state["reagent_dose_l_h"],
+                **{f"collector_availability_cell_{index + 1:02d}":
+                   100.0 * state["flotation_cell_collector_factor"][index]
+                   for index in range(self.FLOTATION_CELL_COUNT)},
                 "tailings_thickener_inventory_t": state["tailings_thickener_inventory_t"],
                 "tailings_thickener_water_inventory_m3": state["tailings_thickener_water_inventory_m3"],
                 "grind_coarse_fraction": state["grind_coarse_fraction"],
@@ -1288,6 +1315,9 @@ class CopperConcentrator:
                     "copper_recovery": (state["copper_recovery_pct"], "%", 0, 100),
                     "copper_inventory": (state["flotation_copper_inventory_t"], "t Cu", 0, 10),
                     "copper_product_rate": (state["flotation_copper_product_tph"], "t Cu/h", 0, 25),
+                    **{f"collector_availability_cell_{index + 1:02d}": (
+                        100.0 * state["flotation_cell_collector_factor"][index], "%", 0, 120)
+                       for index in range(self.FLOTATION_CELL_COUNT)},
                     "concentrate_grade": (state["concentrate_grade_pct"], "%", 0, 40),
                     "concentrate_rate": (state["concentrate_tph"], "t/h", 0, 100),
                     "air_flow": (state["flotation_air_nm3_min"], "Nm³/min", 0, 1_000),

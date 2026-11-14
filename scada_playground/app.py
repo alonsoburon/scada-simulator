@@ -2120,6 +2120,30 @@ def render_dashboard():
                                                 xaxis_title="Simulated seconds",
                                                 uirevision="concentrator-flotation-metal-balance")
                 st.plotly_chart(flotation_balance, width="stretch")
+                reagent_trend = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                    vertical_spacing=0.14, specs=[[{"secondary_y": True}], [{}]],
+                    subplot_titles=("Collector tank inventory and pump dose",
+                                    "Effective collector availability through the six cells"))
+                reagent_trend.add_trace(go.Scatter(x=history.time, y=history.reagent_inventory_l,
+                    name="Tank inventory", line={"color": "#277da1"}), row=1, col=1)
+                reagent_trend.add_trace(go.Scatter(x=history.time, y=history.reagent_dose_l_h,
+                    name="Actual dose", line={"color": "#e07a5f"}),
+                    row=1, col=1, secondary_y=True)
+                cell_colors = ["#277da1", "#f2a541", "#43aa8b", "#9b5de5", "#e07a5f", "#6c757d"]
+                for index, color in enumerate(cell_colors, start=1):
+                    cell_key = f"collector_availability_cell_{index:02d}"
+                    reagent_trend.add_trace(go.Scatter(x=history.time, y=history[cell_key],
+                        name=f"Cell {index:02d}", line={"color": color}), row=2, col=1)
+                reagent_trend.update_yaxes(title_text="Tank inventory (L)", row=1, col=1,
+                                           secondary_y=False)
+                reagent_trend.update_yaxes(title_text="Dose (L/h)", row=1, col=1,
+                                           secondary_y=True)
+                reagent_trend.update_yaxes(title_text="Collector availability (%)", range=[0, 120],
+                                           row=2, col=1)
+                reagent_trend.update_xaxes(title_text="Simulated seconds", row=2, col=1)
+                reagent_trend.update_layout(height=560, legend={"orientation": "h", "y": -0.16},
+                    uirevision="flotation-collector-transport-trend")
+                st.plotly_chart(reagent_trend, width="stretch")
                 size_trend = go.Figure()
                 for key, label, color in (
                     ("grind_coarse_fraction", "Coarse", "#277da1"),
