@@ -19,6 +19,13 @@ class UndergroundVentilationTests(unittest.TestCase):
         self.assertEqual(self.model.telemetry(self.state, 17),
                          self.model.telemetry(other, 17))
 
+    def test_fan_electrical_load_includes_motor_and_aerodynamic_losses(self):
+        expected = sum(
+            fan["flow_m3s"] * self.state["network_pressure_pa"] / 1_000.0
+            / (self.model.FAN_AERODYNAMIC_EFFICIENCY * self.model.FAN_MOTOR_EFFICIENCY)
+            for fan in self.state["fans"].values() if fan["running"])
+        self.assertAlmostEqual(self.state["fan_power_kw"], expected, places=6)
+
     def test_feeder_loss_drops_airflow_before_gas_and_temperature_drift(self):
         temperatures = [zone["temperature_c"]
                         for zone in self.state["branches"].values()]

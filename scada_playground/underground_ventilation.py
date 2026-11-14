@@ -31,6 +31,8 @@ class UndergroundVentilation:
     FAN_CURVE_PA_PER_Q2 = 0.12
     FAN_MAX_FLOW_M3S = 125.0
     FAN_RATED_KW = 1_100.0
+    FAN_AERODYNAMIC_EFFICIENCY = 0.76
+    FAN_MOTOR_EFFICIENCY = 0.94
     COMMON_RESISTANCE = 0.035
     DIESEL_AIR_RATE_M3S_PER_KW = 0.06
     FAN_FLOW_CONTROL_MARGIN = 0.95
@@ -186,8 +188,10 @@ class UndergroundVentilation:
             # Keep aerodynamic flow separate from the motor's energized state.
             fan["flow_m3s"] = (total_flow / len(air_moving_fans)
                                if fan["speed_pct"] > 0.5 else 0.0)
-            # Fan shaft input is Q*DeltaP/efficiency; scale by condition/VFD.
-            fan["power_kw"] = (fan["flow_m3s"] * pressure / 1000.0 / 0.76
+            # Electrical input includes aerodynamic and motor losses. A fan
+            # coasting with its motor de-energized contributes airflow, not load.
+            fan["power_kw"] = (fan["flow_m3s"] * pressure / 1000.0
+                               / (self.FAN_AERODYNAMIC_EFFICIENCY * self.FAN_MOTOR_EFFICIENCY)
                                if fan["running"] else 0.0)
             total_kw += fan["power_kw"]
         state["fan_power_kw"] = total_kw
